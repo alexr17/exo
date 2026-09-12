@@ -35,6 +35,7 @@ fn live_provider_secret(provider: &str, secret_name: &str) -> Option<String> {
 
 fn make_e2b_request(thread_id: &str, sandbox_id: &str) -> SandboxRequest {
     SandboxRequest {
+        egress_proxy: None,
         sandbox_id: sandbox_id.into(),
         scope: Some(SandboxScope::Thread {
             thread_id: thread_id.into(),
@@ -44,7 +45,7 @@ fn make_e2b_request(thread_id: &str, sandbox_id: &str) -> SandboxRequest {
             resources: Default::default(),
             mounts: Vec::new(),
             durable_file_systems: Vec::new(),
-            network: SandboxNetworkPolicy::Enabled,
+            network: SandboxNetworkPolicy::Unrestricted,
             default_workdir: "/home/user".into(),
         },
         lifecycle: SandboxLifecycleConfig {
@@ -85,6 +86,7 @@ fn sprites_config_from_env() -> Option<SpritesConfig> {
 
 fn make_sprites_request(thread_id: &str, sandbox_id: &str) -> SandboxRequest {
     SandboxRequest {
+        egress_proxy: None,
         sandbox_id: sandbox_id.into(),
         scope: Some(SandboxScope::Thread {
             thread_id: thread_id.into(),
@@ -94,7 +96,7 @@ fn make_sprites_request(thread_id: &str, sandbox_id: &str) -> SandboxRequest {
             resources: Default::default(),
             mounts: Vec::new(),
             durable_file_systems: Vec::new(),
-            network: SandboxNetworkPolicy::Enabled,
+            network: SandboxNetworkPolicy::Unrestricted,
             default_workdir: "/home/sprite".into(),
         },
         lifecycle: SandboxLifecycleConfig {

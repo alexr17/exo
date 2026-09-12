@@ -421,6 +421,7 @@ impl ManagedSandboxBackend for SmolvmSandboxBackend {
     }
 
     async fn acquire(&self, request: SandboxRequest) -> Result<Arc<dyn ManagedSandboxHandle>> {
+        request.reject_egress_proxy()?;
         reject_unsupported_spec(&request.spec)?;
         match self.resolve_mode(&request).await {
             SmolvmExecutionMode::Warm => {
@@ -462,6 +463,7 @@ impl ManagedSandboxBackend for SmolvmSandboxBackend {
         request: SandboxRequest,
         payload: SnapshotPayload,
     ) -> Result<Arc<dyn ManagedSandboxHandle>> {
+        request.reject_egress_proxy()?;
         if payload.format != SnapshotFormat::SmolvmMachinePack {
             bail!(
                 "smolvm backend cannot restore snapshot format {}",
@@ -736,7 +738,7 @@ fn resolve_cwd(command: &SandboxCommand, spec: &SandboxSpec) -> String {
 
 /// Mounts and network policy, shared by the create/run paths.
 fn configure_spec_args(process: &mut Command, spec: &SandboxSpec) {
-    if spec.network == SandboxNetworkPolicy::Enabled {
+    if spec.network == SandboxNetworkPolicy::Unrestricted {
         process.arg("--net");
     }
     for mount in &spec.mounts {
@@ -840,7 +842,7 @@ fn reject_unsupported_spec(spec: &SandboxSpec) -> Result<()> {
         bail!(
             "smolvm cannot use registry image '{}' in a network-disabled sandbox: \
              it resolves registry references over the machine's network, even for \
-             cached images. Either set SandboxNetworkPolicy::Enabled, or supply the \
+             cached images. Either set SandboxNetworkPolicy::Unrestricted, or supply the \
              image locally (a `docker save` tar path or an unpacked rootfs dir), \
              which keeps the sandbox fully network-isolated.",
             spec.image
@@ -1018,6 +1020,7 @@ mod tests {
 
     fn test_request(idle_ttl: Option<Duration>) -> SandboxRequest {
         SandboxRequest {
+            egress_proxy: None,
             sandbox_id: "s".into(),
             scope: Some(SandboxScope::Agent {
                 agent_id: "a".into(),
@@ -1100,7 +1103,7 @@ mod tests {
         assert!(err.contains("network-disabled"), "unexpected error: {err}");
 
         // Fine once the sandbox is allowed network...
-        spec.network = SandboxNetworkPolicy::Enabled;
+        spec.network = SandboxNetworkPolicy::Unrestricted;
         assert!(reject_unsupported_spec(&spec).is_ok());
 
         // ...and a local archive is fine while staying isolated.

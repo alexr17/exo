@@ -86,6 +86,7 @@ fn request(
     idle_ttl: Option<Duration>,
 ) -> SandboxRequest {
     SandboxRequest {
+        egress_proxy: None,
         sandbox_id: tag.into(),
         scope: Some(SandboxScope::Agent {
             agent_id: "smolvm-live".into(),
@@ -389,7 +390,7 @@ async fn snapshot_round_trip_preserves_guest_state() {
         .acquire(request(
             image.clone(),
             &workspace,
-            SandboxNetworkPolicy::Enabled,
+            SandboxNetworkPolicy::Unrestricted,
             "snap-source",
             ttl,
         ))
@@ -415,7 +416,7 @@ async fn snapshot_round_trip_preserves_guest_state() {
             request(
                 image,
                 &workspace,
-                SandboxNetworkPolicy::Enabled,
+                SandboxNetworkPolicy::Unrestricted,
                 "snap-restored",
                 ttl,
             ),

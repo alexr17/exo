@@ -6,6 +6,7 @@ license.workspace = true
 rust-version.workspace = true
 
 [features]
+egress-proxy = ["executor/egress-proxy"]
 default = []
 aws-agentcore = ["executor/aws-agentcore"]
 firecracker = ["executor/firecracker"]

@@ -90,6 +90,27 @@ pub struct SandboxBackendRegistration {
 }
 
 impl SandboxBackendRegistration {
+    #[cfg(feature = "egress-proxy")]
+    pub fn with_egress(self, policy: crate::EgressPolicy) -> Self {
+        Self::from_factory(self.provider, self.is_local, move |inner| {
+            let factory = self.factory.clone();
+            let policy = policy.clone();
+            Box::pin(async move {
+                let backend = factory(inner).await?;
+                let resolver = Arc::new(LocalEgressResolver {
+                    storage: inner.storage.clone(),
+                    cipher: inner.secret_cipher.clone(),
+                    bindings: policy.credentials,
+                });
+                Ok(Arc::new(crate::egress::EgressSandboxBackend::new(
+                    backend,
+                    policy.networking,
+                    resolver,
+                )) as Arc<dyn ManagedSandboxBackend>)
+            })
+        })
+    }
+
     pub fn from_builtin_provider(provider: SandboxProvider) -> Result<Self> {
         match provider.as_str() {
             "apple_container" => Ok(Self::apple_container()),
@@ -4422,6 +4443,7 @@ fn sandbox_request(
     provider_state: Option<Value>,
 ) -> SandboxRequest {
     SandboxRequest {
+        egress_proxy: None,
         sandbox_id: sandbox_id.to_string(),
         scope: Some(match owner {
             SandboxOwner::Agent(agent_id) => SandboxScope::Agent {
@@ -4449,7 +4471,7 @@ fn sandbox_request(
                 .collect(),
             durable_file_systems: sandbox.durable_file_systems.clone(),
             network: if sandbox.enable_networking {
-                SandboxNetworkPolicy::Enabled
+                SandboxNetworkPolicy::Unrestricted
             } else {
                 SandboxNetworkPolicy::Disabled
             },
@@ -4822,6 +4844,47 @@ fn build_secret_cipher(
         SecretBackendChoice::Static(key) => Arc::new(StaticSecretKeyProvider::new(key)),
     };
     Ok(SecretCipher::new(provider))
+}
+
+#[cfg(feature = "egress-proxy")]
+struct LocalEgressResolver {
+    storage: BasicObjectStore,
+    cipher: SecretCipher,
+    bindings: Vec<crate::EgressCredentialBinding>,
+}
+
+#[cfg(feature = "egress-proxy")]
+#[async_trait]
+impl crate::egress::EgressCredentialResolver for LocalEgressResolver {
+    async fn bindings(
+        &self,
+        _identity: &crate::egress::EgressIdentity,
+    ) -> Result<Vec<crate::EgressCredentialBinding>> {
+        Ok(self.bindings.clone())
+    }
+
+    async fn resolve(
+        &self,
+        _identity: &crate::egress::EgressIdentity,
+        binding_name: &str,
+        _destination: &crate::egress::EgressDestination,
+    ) -> Result<String> {
+        let stored = self
+            .storage
+            .list_json_matching_suffix::<StoredSecret>(Path::new("secrets"), ".json")
+            .await?;
+        let mut matches = stored.into_iter().filter(|s| {
+            s.metadata.name == binding_name || s.metadata.id.to_string() == binding_name
+        });
+        let record = matches.next().context("egress credential not found")?;
+        if matches.next().is_some() {
+            bail!("egress credential reference is ambiguous; use its id");
+        }
+        match self.cipher.decrypt_secret(&record.secret)? {
+            Secret::Key { value } => Ok(value),
+            Secret::Oauth { .. } => bail!("egress credential must be an API key"),
+        }
+    }
 }
 
 #[cfg(test)]

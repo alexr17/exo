@@ -26,6 +26,17 @@ const OUTPUT_DRAIN_GRACE: Duration = Duration::from_secs(2);
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "operation", rename_all = "snake_case")]
 pub enum FirecrackerBridgeRequest {
+    #[cfg(feature = "egress-proxy")]
+    EgressCreate { allowed_hosts: Vec<String> },
+    #[cfg(feature = "egress-proxy")]
+    EgressBind {
+        listener_id: String,
+        source: std::net::Ipv4Addr,
+    },
+    #[cfg(feature = "egress-proxy")]
+    EgressAccept { listener_id: String, tls: bool },
+    #[cfg(feature = "egress-proxy")]
+    EgressClose { listener_id: String },
     ResolveImage {
         config: FirecrackerConfig,
         image: String,
@@ -81,6 +92,10 @@ pub enum FirecrackerBridgeRequest {
 
 impl FirecrackerBridgeRequest {
     fn is_stream(&self) -> bool {
+        #[cfg(feature = "egress-proxy")]
+        if matches!(self, Self::EgressAccept { .. }) {
+            return true;
+        }
         matches!(self, Self::StartProcess { .. } | Self::ConnectTcp { .. })
     }
 }
@@ -88,11 +103,17 @@ impl FirecrackerBridgeRequest {
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "result", rename_all = "snake_case")]
 pub enum FirecrackerBridgeResponse {
+    #[cfg(feature = "egress-proxy")]
+    Egress {
+        listener_id: String,
+        endpoints: crate::SandboxEgressProxy,
+    },
     Image(crate::ResolvedSandboxImage),
     Handle {
         id: String,
         provider_state: Option<Value>,
         effective_image: Option<String>,
+        source_ipv4: Option<std::net::Ipv4Addr>,
     },
     Exec {
         output: SandboxCommandOutput,
@@ -169,10 +190,22 @@ enum BridgeStreamInput {
 
 #[derive(Default)]
 struct BridgeBackendCache {
+    #[cfg(feature = "egress-proxy")]
+    egress: Mutex<HashMap<String, Arc<dyn crate::egress::EgressTransport>>>,
     backends: Mutex<HashMap<FirecrackerConfig, Arc<FirecrackerSandboxBackend>>>,
 }
 
 impl BridgeBackendCache {
+    #[cfg(feature = "egress-proxy")]
+    async fn egress(&self, id: &str) -> Result<Arc<dyn crate::egress::EgressTransport>> {
+        self.egress
+            .lock()
+            .await
+            .get(id)
+            .cloned()
+            .context("egress listener not found")
+    }
+
     async fn backend(&self, config: FirecrackerConfig) -> Result<Arc<FirecrackerSandboxBackend>> {
         let mut backends = self.backends.lock().await;
         if let Some(backend) = backends.get(&config) {
@@ -304,6 +337,42 @@ async fn handle_request(
     backends: &BridgeBackendCache,
 ) -> Result<FirecrackerBridgeResponse> {
     match request {
+        #[cfg(feature = "egress-proxy")]
+        FirecrackerBridgeRequest::EgressCreate { allowed_hosts } => {
+            let mut listeners = backends.egress.lock().await;
+            anyhow::ensure!(listeners.len() < 256, "too many egress listeners");
+            let listener: Arc<dyn crate::egress::EgressTransport> =
+                Arc::new(crate::egress::LocalEgressTransport::for_hosts(&allowed_hosts).await?);
+            let endpoints = listener.endpoints();
+            let listener_id = uuid::Uuid::new_v4().to_string();
+            listeners.insert(listener_id.clone(), listener);
+            Ok(FirecrackerBridgeResponse::Egress {
+                listener_id,
+                endpoints,
+            })
+        }
+        #[cfg(feature = "egress-proxy")]
+        FirecrackerBridgeRequest::EgressBind {
+            listener_id,
+            source,
+        } => {
+            backends
+                .egress(&listener_id)
+                .await?
+                .bind_source(source)
+                .await?;
+            Ok(FirecrackerBridgeResponse::Unit)
+        }
+        #[cfg(feature = "egress-proxy")]
+        FirecrackerBridgeRequest::EgressClose { listener_id } => {
+            if let Some(listener) = backends.egress.lock().await.remove(&listener_id) {
+                listener.close();
+            }
+            Ok(FirecrackerBridgeResponse::Unit)
+        }
+        #[cfg(feature = "egress-proxy")]
+        FirecrackerBridgeRequest::EgressAccept { .. } => bail!("egress accept requires a stream"),
+
         FirecrackerBridgeRequest::ResolveImage { config, image } => {
             Ok(FirecrackerBridgeResponse::Image(
                 backends
@@ -319,6 +388,7 @@ async fn handle_request(
                 id: handle.id().to_string(),
                 provider_state: handle.provider_state(),
                 effective_image: handle.effective_image(),
+                source_ipv4: handle.egress_source_ipv4(),
             })
         }
         FirecrackerBridgeRequest::Exec {
@@ -350,6 +420,7 @@ async fn handle_request(
                 id: handle.id().to_string(),
                 provider_state: handle.provider_state(),
                 effective_image: handle.effective_image(),
+                source_ipv4: handle.egress_source_ipv4(),
             })
         }
         FirecrackerBridgeRequest::AcquireFromSnapshot {
@@ -376,6 +447,7 @@ async fn handle_request(
                 id: handle.id().to_string(),
                 provider_state: handle.provider_state(),
                 effective_image: handle.effective_image(),
+                source_ipv4: handle.egress_source_ipv4(),
             })
         }
         FirecrackerBridgeRequest::Snapshot { config, request } => {
@@ -423,6 +495,18 @@ async fn open_stream(
         bail!("duplicate Firecracker bridge stream id {id}");
     }
     match request {
+        #[cfg(feature = "egress-proxy")]
+        FirecrackerBridgeRequest::EgressAccept { listener_id, tls } => {
+            let listener = backends.egress(&listener_id).await?;
+            let mut input_receiver = input_receiver;
+            let stream = tokio::select! {
+                stream = listener.accept(tls) => stream?,
+                _ = input_receiver.recv() => { streams.lock().await.remove(&id); return Ok(()); }
+            };
+            send_server_frame(writer, &FirecrackerBridgeServerFrame::StreamOpened { id }).await?;
+            proxy_tcp(id, stream, input_receiver, writer).await?;
+        }
+
         FirecrackerBridgeRequest::StartProcess {
             config,
             request,

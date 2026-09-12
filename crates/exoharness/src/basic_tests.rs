@@ -669,6 +669,7 @@ async fn local_process_contract_handle(
         Arc::new(crate::LocalProcessSandboxBackend::new());
     backend
         .acquire(SandboxRequest {
+            egress_proxy: None,
             sandbox_id: sandbox_id.to_string(),
             scope: Some(SandboxScope::Thread {
                 thread_id: Uuid7::now().to_string(),
@@ -678,7 +679,7 @@ async fn local_process_contract_handle(
                 resources: Default::default(),
                 mounts: Vec::new(),
                 durable_file_systems: Vec::new(),
-                network: SandboxNetworkPolicy::Enabled,
+                network: SandboxNetworkPolicy::Unrestricted,
                 default_workdir: tempdir.path().display().to_string(),
             },
             lifecycle: SandboxLifecycleConfig::default(),
@@ -870,6 +871,7 @@ fn provider_contract_request(
     default_workdir: &str,
 ) -> SandboxRequest {
     SandboxRequest {
+        egress_proxy: None,
         sandbox_id: format!("{provider}-{contract}-contract"),
         scope: Some(SandboxScope::Thread {
             thread_id: Uuid7::now().to_string(),
@@ -879,7 +881,7 @@ fn provider_contract_request(
             resources: Default::default(),
             mounts: Vec::new(),
             durable_file_systems: Vec::new(),
-            network: SandboxNetworkPolicy::Enabled,
+            network: SandboxNetworkPolicy::Unrestricted,
             default_workdir: default_workdir.to_string(),
         },
         lifecycle: SandboxLifecycleConfig {

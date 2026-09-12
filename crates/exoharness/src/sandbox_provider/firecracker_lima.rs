@@ -86,6 +86,7 @@ impl LimaFirecrackerSandboxBackend {
         id: String,
         provider_state: Option<serde_json::Value>,
         effective_image: Option<String>,
+        source_ipv4: Option<std::net::Ipv4Addr>,
     ) -> Result<Arc<dyn ManagedSandboxHandle>> {
         let effective_image = effective_image
             .context("Firecracker Lima bridge did not return a resolved image for its handle")?;
@@ -95,6 +96,7 @@ impl LimaFirecrackerSandboxBackend {
             id,
             provider_state,
             effective_image: Some(effective_image),
+            source_ipv4,
             request,
             backend: self.client(),
         }))
@@ -107,6 +109,30 @@ impl LimaFirecrackerSandboxBackend {
 
 #[async_trait]
 impl ManagedSandboxBackend for LimaFirecrackerSandboxBackend {
+    #[cfg(feature = "egress-proxy")]
+    async fn egress_transport(
+        &self,
+        allowed_hosts: &[String],
+    ) -> Result<Arc<dyn crate::egress::EgressTransport>> {
+        let connection = self.bridge.connection().await?;
+        let FirecrackerBridgeResponse::Egress {
+            listener_id,
+            endpoints,
+        } = connection
+            .request(FirecrackerBridgeRequest::EgressCreate {
+                allowed_hosts: allowed_hosts.to_vec(),
+            })
+            .await?
+        else {
+            bail!("Lima bridge did not return egress listeners");
+        };
+        Ok(Arc::new(LimaEgressTransport::new(
+            connection,
+            listener_id,
+            endpoints,
+        )))
+    }
+
     fn is_local(&self) -> bool {
         true
     }
@@ -138,6 +164,7 @@ impl ManagedSandboxBackend for LimaFirecrackerSandboxBackend {
                 id: format!("firecracker-lima-oneshot:{sequence}"),
                 provider_state: None,
                 effective_image: None,
+                source_ipv4: None,
                 request,
                 backend: self.client(),
             }));
@@ -152,11 +179,12 @@ impl ManagedSandboxBackend for LimaFirecrackerSandboxBackend {
             id,
             provider_state,
             effective_image,
+            source_ipv4,
         } = response
         else {
             bail!("Firecracker Lima bridge returned the wrong response to acquire");
         };
-        self.bound_handle(request, id, provider_state, effective_image)
+        self.bound_handle(request, id, provider_state, effective_image, source_ipv4)
     }
 
     async fn attach(
@@ -213,11 +241,12 @@ impl ManagedSandboxBackend for LimaFirecrackerSandboxBackend {
             id,
             provider_state,
             effective_image,
+            source_ipv4,
         } = response
         else {
             bail!("Firecracker Lima bridge returned the wrong response to fork");
         };
-        self.bound_handle(target, id, provider_state, effective_image)
+        self.bound_handle(target, id, provider_state, effective_image, source_ipv4)
     }
 
     async fn acquire_from_snapshot(
@@ -240,15 +269,17 @@ impl ManagedSandboxBackend for LimaFirecrackerSandboxBackend {
             id,
             provider_state,
             effective_image,
+            source_ipv4,
         } = response
         else {
             bail!("Firecracker Lima bridge returned the wrong response to snapshot restore");
         };
-        self.bound_handle(request, id, provider_state, effective_image)
+        self.bound_handle(request, id, provider_state, effective_image, source_ipv4)
     }
 }
 
 struct LimaFirecrackerSandboxHandle {
+    source_ipv4: Option<std::net::Ipv4Addr>,
     id: String,
     provider_state: Option<serde_json::Value>,
     effective_image: Option<String>,
@@ -258,6 +289,10 @@ struct LimaFirecrackerSandboxHandle {
 
 #[async_trait]
 impl ManagedSandboxHandle for LimaFirecrackerSandboxHandle {
+    fn egress_source_ipv4(&self) -> Option<std::net::Ipv4Addr> {
+        self.source_ipv4
+    }
+
     fn id(&self) -> &str {
         &self.id
     }
@@ -450,11 +485,15 @@ impl LimaBridgeManager {
             .arg("--manifest-path")
             .arg(source_root.join("Cargo.toml"))
             .arg("--package")
-            .arg("exo")
+            .arg("exoharness")
             .arg("--features")
-            .arg("firecracker")
-            .arg("--bin")
-            .arg("exo");
+            .arg(if cfg!(feature = "egress-proxy") {
+                "firecracker,egress-proxy"
+            } else {
+                "firecracker"
+            })
+            .arg("--example")
+            .arg("firecracker-bridge");
         self.run_checked(&mut command, "building the Exo Firecracker bridge in Lima")
             .await?;
         // Copy the unprivileged build output to a root-owned path and execute
@@ -476,7 +515,7 @@ impl LimaBridgeManager {
             .arg("root")
             .arg("-m")
             .arg("0755")
-            .arg(target_dir.join("debug/exo"))
+            .arg(target_dir.join("debug/examples/firecracker-bridge"))
             .arg(BRIDGE_INSTALL_PATH);
         self.run_checked(
             &mut install,
@@ -1300,5 +1339,117 @@ fn send_bridge_frame_on_drop(
                 });
             }
         }
+    }
+}
+
+#[cfg(feature = "egress-proxy")]
+struct LimaEgressTransport {
+    connection: Arc<LimaBridgeConnection>,
+    listener_id: String,
+    endpoints: crate::SandboxEgressProxy,
+    http: Mutex<mpsc::Receiver<Result<BoxSandboxTcpStream>>>,
+    https: Mutex<mpsc::Receiver<Result<BoxSandboxTcpStream>>>,
+    cancel: tokio_util::sync::CancellationToken,
+}
+
+#[cfg(feature = "egress-proxy")]
+impl LimaEgressTransport {
+    fn new(
+        connection: Arc<LimaBridgeConnection>,
+        listener_id: String,
+        endpoints: crate::SandboxEgressProxy,
+    ) -> Self {
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let receive = |tls| {
+            let (sender, receiver) = mpsc::channel(8);
+            let connection = connection.clone();
+            let listener_id = listener_id.clone();
+            let cancel = cancel.clone();
+            tokio::spawn(async move {
+                loop {
+                    let operation = async {
+                        let permit = sender.reserve().await.context("egress receiver closed")?;
+                        let stream = connection
+                            .connect_tcp(FirecrackerBridgeRequest::EgressAccept {
+                                listener_id: listener_id.clone(),
+                                tls,
+                            })
+                            .await;
+                        let failed = stream.is_err();
+                        permit.send(stream.map(|s| Box::pin(s) as BoxSandboxTcpStream));
+                        anyhow::ensure!(!failed, "egress bridge accept failed");
+                        Ok::<_, anyhow::Error>(())
+                    };
+                    tokio::select! {
+                        _ = cancel.cancelled() => break,
+                        result = operation => if result.is_err() { cancel.cancel(); break; }
+                    }
+                }
+            });
+            Mutex::new(receiver)
+        };
+        let http = receive(false);
+        let https = receive(true);
+        let cleanup_connection = connection.clone();
+        let cleanup_id = listener_id.clone();
+        let cleanup_cancel = cancel.clone();
+        tokio::spawn(async move {
+            cleanup_cancel.cancelled().await;
+            if let Err(error) = cleanup_connection
+                .request(FirecrackerBridgeRequest::EgressClose {
+                    listener_id: cleanup_id,
+                })
+                .await
+            {
+                tracing::debug!(%error, "egress listener cleanup failed after bridge closure");
+            }
+        });
+        Self {
+            connection,
+            listener_id,
+            endpoints,
+            http,
+            https,
+            cancel,
+        }
+    }
+}
+
+#[cfg(feature = "egress-proxy")]
+#[async_trait]
+impl crate::egress::EgressTransport for LimaEgressTransport {
+    fn endpoints(&self) -> crate::SandboxEgressProxy {
+        self.endpoints
+    }
+    async fn bind_source(&self, source: std::net::Ipv4Addr) -> Result<()> {
+        match self
+            .connection
+            .request(FirecrackerBridgeRequest::EgressBind {
+                listener_id: self.listener_id.clone(),
+                source,
+            })
+            .await?
+        {
+            FirecrackerBridgeResponse::Unit => Ok(()),
+            _ => bail!("Lima bridge did not bind egress source"),
+        }
+    }
+    async fn accept(&self, tls: bool) -> Result<BoxSandboxTcpStream> {
+        let receiver = if tls { &self.https } else { &self.http };
+        tokio::select! {
+            biased;
+            _ = self.cancel.cancelled() => bail!("egress bridge closed"),
+            stream = async { receiver.lock().await.recv().await } => stream.context("egress bridge closed")?,
+        }
+    }
+    fn close(&self) {
+        self.cancel.cancel();
+    }
+}
+
+#[cfg(feature = "egress-proxy")]
+impl Drop for LimaEgressTransport {
+    fn drop(&mut self) {
+        self.cancel.cancel();
     }
 }

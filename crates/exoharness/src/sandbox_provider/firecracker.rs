@@ -145,22 +145,17 @@ static ONE_SHOT_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 // within this process.
 static TEMPORARY_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 /// Controls whether Firecracker attaches a network device. The sandbox's
 /// [`SandboxNetworkPolicy`] independently controls what egress the firewall permits.
 pub enum FirecrackerNetworkDevicePolicy {
     /// Attach a network device only when the sandbox requests enabled networking.
+    #[default]
     EnabledSandboxes,
     /// Attach a network device to every sandbox, including network-disabled sandboxes that
     /// need host-to-guest connectivity. Their configured egress restrictions still apply.
     AllSandboxes,
-}
-
-impl Default for FirecrackerNetworkDevicePolicy {
-    fn default() -> Self {
-        Self::EnabledSandboxes
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -805,6 +800,11 @@ impl FirecrackerSandboxBackend {
         template_key: String,
         lifecycle: SnapshotTemplateLifecycle,
     ) -> Result<CapturedSnapshot> {
+        if request.egress_proxy.is_some() {
+            bail!(
+                "proxied Firecracker snapshots require a fresh egress binding; not implemented yet"
+            );
+        }
         if !request.spec.durable_file_systems.is_empty() {
             bail!("Firecracker snapshotting does not support durable filesystems")
         }
@@ -898,6 +898,11 @@ impl FirecrackerSandboxBackend {
         spec_hash: String,
         machine_id: String,
     ) -> Result<Arc<dyn ManagedSandboxHandle>> {
+        if request.egress_proxy.is_some() {
+            bail!(
+                "proxied Firecracker snapshots require a fresh egress binding; not implemented yet"
+            );
+        }
         let template_key = manifest.template_key.clone();
         let restore = async {
             manifest.validate()?;
@@ -1076,6 +1081,18 @@ impl FirecrackerSandboxBackend {
             .shared
             .ensure_machine(&request, &target_machine_id, &spec_hash)
             .await?;
+        if let Some(proxy) = request.egress_proxy {
+            let network = machine.record.network();
+            tokio::task::spawn_blocking(move || {
+                let rules = format!(
+                    "delete table inet {}\n{}",
+                    network.nft_table,
+                    proxy_network_firewall_rules(&network, proxy)?
+                );
+                run_checked_input("nft", &["-f", "-"], rules.as_bytes())
+            })
+            .await??;
+        }
         if !one_shot {
             self.shared.touch_machine_lease(&target_machine_id).await?;
             self.shared.warm_machines.lock().await.insert(
@@ -1107,6 +1124,16 @@ impl FirecrackerSandboxBackend {
 
 #[async_trait]
 impl ManagedSandboxBackend for FirecrackerSandboxBackend {
+    #[cfg(feature = "egress-proxy")]
+    async fn egress_transport(
+        &self,
+        allowed_hosts: &[String],
+    ) -> Result<Arc<dyn crate::egress::EgressTransport>> {
+        Ok(Arc::new(
+            crate::egress::LocalEgressTransport::for_hosts(allowed_hosts).await?,
+        ))
+    }
+
     fn is_local(&self) -> bool {
         true
     }
@@ -1274,6 +1301,13 @@ struct FirecrackerSandboxHandle {
 
 #[async_trait]
 impl ManagedSandboxHandle for FirecrackerSandboxHandle {
+    fn egress_source_ipv4(&self) -> Option<Ipv4Addr> {
+        self.machine
+            .record
+            .network_enabled
+            .then(|| self.machine.record.network().guest_ip)
+    }
+
     fn id(&self) -> &str {
         &self.id
     }
@@ -1703,7 +1737,7 @@ impl Shared {
         let machine_id = machine_id.to_string();
         let spec_hash = spec_hash.to_string();
         let resolved_image = request.spec.image.clone();
-        let network_enabled = network_device_enabled(&self.config, request.spec.network);
+        let network_enabled = network_device_enabled(&self.config, &request.spec.network);
         let workspace_id = if snapshot.is_none() {
             request
                 .spec
@@ -1783,7 +1817,8 @@ impl Shared {
                     prepare_network(
                         &config,
                         &network,
-                        request.spec.network,
+                        &request.spec.network,
+                        request.egress_proxy,
                         jailer_uid(&config, &record)?,
                     )?;
                 }
@@ -1928,6 +1963,14 @@ impl Shared {
 }
 
 fn prepare_request(mut request: SandboxRequest) -> Result<SandboxRequest> {
+    if let Some(proxy) = request.egress_proxy {
+        if request.spec.network == SandboxNetworkPolicy::Disabled {
+            bail!("disabled networking cannot use an egress proxy");
+        }
+        proxy.validate()?;
+    } else {
+        request.spec.network.reject_limited()?;
+    }
     if request.spec.image.trim().is_empty() {
         request.spec.image = super::default_firecracker_image();
     }
@@ -2347,9 +2390,9 @@ fn hash_runtime_fingerprint(hasher: &mut Sha256, runtime: &FirecrackerRuntimeFin
 
 fn network_device_enabled(
     config: &FirecrackerConfig,
-    sandbox_policy: SandboxNetworkPolicy,
+    sandbox_policy: &SandboxNetworkPolicy,
 ) -> bool {
-    sandbox_policy == SandboxNetworkPolicy::Enabled
+    *sandbox_policy != SandboxNetworkPolicy::Disabled
         || config.network_device_policy == FirecrackerNetworkDevicePolicy::AllSandboxes
 }
 
@@ -2693,7 +2736,8 @@ fn ipv4_add(address: Ipv4Addr, offset: u32) -> Ipv4Addr {
 fn prepare_network(
     config: &FirecrackerConfig,
     network: &NetworkConfig,
-    policy: SandboxNetworkPolicy,
+    policy: &SandboxNetworkPolicy,
+    egress_proxy: Option<crate::SandboxEgressProxy>,
     jailer_uid: u32,
 ) -> Result<()> {
     // Firecracker intentionally delegates TAP routing and firewalling to the host.
@@ -2826,7 +2870,7 @@ fn prepare_network(
         ],
     )?;
 
-    install_network_firewall(config, network, policy)?;
+    install_network_firewall(config, network, policy, egress_proxy)?;
     // Docker and similar host services commonly leave the compatibility
     // FORWARD chain at DROP. An accept verdict in our nftables base chain does
     // not override a later base-chain drop, so admit only this VM's veth there.
@@ -2869,17 +2913,26 @@ fn prepare_network(
 fn install_network_firewall(
     config: &FirecrackerConfig,
     network: &NetworkConfig,
-    policy: SandboxNetworkPolicy,
+    policy: &SandboxNetworkPolicy,
+    egress_proxy: Option<crate::SandboxEgressProxy>,
 ) -> Result<()> {
-    let rules = network_firewall_rules(config, network, policy)?;
+    let rules = network_firewall_rules(config, network, policy, egress_proxy)?;
     run_checked_input("nft", &["-f", "-"], rules.as_bytes())
 }
 
 fn network_firewall_rules(
     config: &FirecrackerConfig,
     network: &NetworkConfig,
-    policy: SandboxNetworkPolicy,
+    policy: &SandboxNetworkPolicy,
+    egress_proxy: Option<crate::SandboxEgressProxy>,
 ) -> Result<String> {
+    if let Some(proxy) = egress_proxy {
+        if *policy == SandboxNetworkPolicy::Disabled {
+            bail!("disabled networking cannot use an egress proxy");
+        }
+        return proxy_network_firewall_rules(network, proxy);
+    }
+    policy.reject_limited()?;
     let mut rules = String::new();
     let table = &network.nft_table;
     let interface = &network.host_veth;
@@ -2932,7 +2985,7 @@ fn network_firewall_rules(
         "add rule inet {table} forward iifname {interface} ip daddr {{ {} }} counter reject",
         BLOCKED_EGRESS_CIDRS.join(", ")
     )?;
-    let final_egress_verdict = if policy == SandboxNetworkPolicy::Enabled {
+    let final_egress_verdict = if *policy == SandboxNetworkPolicy::Unrestricted {
         "accept"
     } else {
         "reject"
@@ -2953,6 +3006,84 @@ fn network_firewall_rules(
         rules,
         "add rule inet {table} postrouting ip saddr {} counter masquerade",
         network.guest_cidr
+    )?;
+    Ok(rules)
+}
+
+fn proxy_network_firewall_rules(
+    network: &NetworkConfig,
+    proxy: crate::SandboxEgressProxy,
+) -> Result<String> {
+    proxy.validate()?;
+    let table = &network.nft_table;
+    let interface = &network.host_veth;
+    let source = network.guest_ip;
+    let mut rules = String::new();
+    writeln!(rules, "add table inet {table}")?;
+    for (chain, kind, priority) in [
+        ("prerouting", "nat", "dstnat"),
+        ("input", "filter", "filter"),
+        ("forward", "filter", "filter"),
+        ("postrouting", "nat", "srcnat"),
+    ] {
+        writeln!(
+            rules,
+            "add chain inet {table} {chain} {{ type {kind} hook {chain} priority {priority}; policy accept; }}"
+        )?;
+    }
+    for (protocol, port, destination) in [
+        ("tcp", 80, proxy.http),
+        ("tcp", 443, proxy.https),
+        ("tcp", 53, proxy.dns),
+        ("udp", 53, proxy.dns),
+    ] {
+        writeln!(
+            rules,
+            "add rule inet {table} prerouting iifname {interface} ip saddr {source} {protocol} dport {port} counter dnat ip to {destination}"
+        )?;
+    }
+    for chain in ["input", "forward"] {
+        writeln!(
+            rules,
+            "add rule inet {table} {chain} iifname {interface} meta nfproto ipv6 counter drop"
+        )?;
+        writeln!(
+            rules,
+            "add rule inet {table} {chain} iifname {interface} ip saddr != {source} counter drop"
+        )?;
+        for (protocol, destination) in [
+            ("tcp", proxy.http),
+            ("tcp", proxy.https),
+            ("tcp", proxy.dns),
+            ("udp", proxy.dns),
+        ] {
+            writeln!(
+                rules,
+                "add rule inet {table} {chain} iifname {interface} ct status dnat ip daddr {} {protocol} dport {} counter accept",
+                destination.ip(),
+                destination.port()
+            )?;
+        }
+        writeln!(
+            rules,
+            "add rule inet {table} {chain} iifname {interface} ct direction reply ct state established,related counter accept"
+        )?;
+        writeln!(
+            rules,
+            "add rule inet {table} {chain} iifname {interface} counter reject"
+        )?;
+    }
+    writeln!(
+        rules,
+        "add rule inet {table} forward oifname {interface} ct state established,related counter accept"
+    )?;
+    writeln!(
+        rules,
+        "add rule inet {table} forward oifname {interface} counter drop"
+    )?;
+    writeln!(
+        rules,
+        "add rule inet {table} postrouting ip saddr {source} counter masquerade"
     )?;
     Ok(rules)
 }

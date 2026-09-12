@@ -73,6 +73,11 @@ const SANDBOX_CLI_AGENT_SLUG: &str = "__exo_sandbox_cli";
     after_help = "Runtime options:\n  --braintrust-api-key <BRAINTRUST_API_KEY>\n  --braintrust-app-url <BRAINTRUST_APP_URL>\n  --braintrust-api-url <BRAINTRUST_API_URL>\n\nThese options are accepted globally, including after subcommands, but are hidden from subcommand help to reduce noise."
 )]
 struct Cli {
+    /// JSON policy for sandbox hosts and credential substitution.
+    #[cfg(feature = "egress-proxy")]
+    #[arg(long, global = true, conflicts_with = "exoharness_url")]
+    egress_policy: Option<PathBuf>,
+
     #[arg(long, global = true, default_value = ".exo")]
     root: PathBuf,
     /// Executor runtime: basic, rlm, typescript, codex, claude-code, cursor, or a TypeScript module path.
@@ -456,11 +461,25 @@ fn build_exo_config(cli: &Cli) -> Result<BasicExoHarnessConfig> {
         .unwrap_or_default();
     #[cfg(not(feature = "firecracker"))]
     let firecracker_spec = FirecrackerBackendSpec::default();
+    let sandbox_backends = default_sandbox_backends(firecracker_spec);
+    #[cfg(feature = "egress-proxy")]
+    let sandbox_backends = match &cli.egress_policy {
+        Some(path) => {
+            let policy: executor::EgressPolicy =
+                serde_json::from_reader(std::fs::File::open(path)?)
+                    .with_context(|| format!("reading egress policy {}", path.display()))?;
+            sandbox_backends
+                .into_iter()
+                .map(|b| b.with_egress(policy.clone()))
+                .collect()
+        }
+        None => sandbox_backends,
+    };
     Ok(BasicExoHarnessConfig {
         root: cli.root.join("exoharness"),
         secret_backend,
         sandbox_default: default_local_sandbox_provider(),
-        sandbox_backends: default_sandbox_backends(firecracker_spec),
+        sandbox_backends,
     })
 }
 

@@ -38,30 +38,33 @@ fn network_device_policy_can_keep_disabled_sandboxes_host_reachable() {
     let mut config = FirecrackerConfig::default();
     assert!(network_device_enabled(
         &config,
-        SandboxNetworkPolicy::Enabled
+        &SandboxNetworkPolicy::Unrestricted
     ));
     assert!(!network_device_enabled(
         &config,
-        SandboxNetworkPolicy::Disabled
+        &SandboxNetworkPolicy::Disabled
     ));
 
     config.network_device_policy = FirecrackerNetworkDevicePolicy::AllSandboxes;
     assert!(network_device_enabled(
         &config,
-        SandboxNetworkPolicy::Enabled
+        &SandboxNetworkPolicy::Unrestricted
     ));
     assert!(network_device_enabled(
         &config,
-        SandboxNetworkPolicy::Disabled
+        &SandboxNetworkPolicy::Disabled
     ));
 }
 
 #[test]
 fn disabled_sandbox_network_rejects_unconfigured_egress() {
-    let mut config = FirecrackerConfig::default();
-    config.allowed_egress_cidrs = vec!["192.0.2.0/24".parse().unwrap()];
+    let config = FirecrackerConfig {
+        allowed_egress_cidrs: vec!["192.0.2.0/24".parse().unwrap()],
+        ..Default::default()
+    };
     let network = network_config(1);
-    let rules = network_firewall_rules(&config, &network, SandboxNetworkPolicy::Disabled).unwrap();
+    let rules =
+        network_firewall_rules(&config, &network, &SandboxNetworkPolicy::Disabled, None).unwrap();
 
     assert!(rules.contains("ip daddr 192.0.2.0/24 counter accept"));
     assert!(rules.contains(&format!(
@@ -78,12 +81,50 @@ fn disabled_sandbox_network_rejects_unconfigured_egress() {
 fn enabled_sandbox_network_accepts_public_egress() {
     let config = FirecrackerConfig::default();
     let network = network_config(1);
-    let rules = network_firewall_rules(&config, &network, SandboxNetworkPolicy::Enabled).unwrap();
+    let rules =
+        network_firewall_rules(&config, &network, &SandboxNetworkPolicy::Unrestricted, None)
+            .unwrap();
 
     assert!(rules.contains(&format!(
         "forward iifname {} counter accept\n",
         network.host_veth
     )));
+}
+
+#[test]
+fn proxy_transport_enforces_egress_independently_of_network_policy() {
+    let config = FirecrackerConfig {
+        allowed_egress_cidrs: vec!["0.0.0.0/0".parse().unwrap()],
+        ..Default::default()
+    };
+    let network = network_config(1);
+    let proxy = crate::SandboxEgressProxy {
+        http: "192.0.2.10:18080".parse().unwrap(),
+        https: "192.0.2.10:18443".parse().unwrap(),
+        dns: "192.0.2.10:1053".parse().unwrap(),
+    };
+    let limited = SandboxNetworkPolicy::Limited {
+        allowed_hosts: vec!["api.notion.com".into()],
+    };
+    assert!(network_firewall_rules(&config, &network, &limited, None).is_err());
+    assert!(
+        network_firewall_rules(
+            &config,
+            &network,
+            &SandboxNetworkPolicy::Disabled,
+            Some(proxy)
+        )
+        .is_err()
+    );
+    for policy in [limited, SandboxNetworkPolicy::Unrestricted] {
+        let rules = network_firewall_rules(&config, &network, &policy, Some(proxy)).unwrap();
+        assert!(rules.contains("tcp dport 443 counter dnat ip to 192.0.2.10:18443"));
+        assert!(rules.contains(&format!(
+            "forward iifname {} counter reject",
+            network.host_veth
+        )));
+        assert!(!rules.contains("ip daddr 0.0.0.0/0 counter accept"));
+    }
 }
 
 #[test]

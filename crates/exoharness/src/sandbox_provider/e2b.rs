@@ -231,6 +231,7 @@ impl ManagedSandboxBackend for E2bSandboxBackend {
     }
 
     async fn acquire(&self, request: SandboxRequest) -> Result<Arc<dyn ManagedSandboxHandle>> {
+        request.reject_egress_proxy()?;
         reject_host_mounts(&request)?;
         let spec_hash = sandbox_spec_hash(&request.spec);
         let key_label = request.sandbox_id.clone();
@@ -282,6 +283,7 @@ impl ManagedSandboxBackend for E2bSandboxBackend {
         request: SandboxRequest,
         payload: SnapshotPayload,
     ) -> Result<Arc<dyn ManagedSandboxHandle>> {
+        request.reject_egress_proxy()?;
         reject_host_mounts(&request)?;
         if payload.format != SnapshotFormat::E2bRef {
             bail!(

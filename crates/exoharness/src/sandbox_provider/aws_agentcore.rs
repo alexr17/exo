@@ -101,6 +101,7 @@ impl ManagedSandboxBackend for AwsAgentCoreSandboxBackend {
     }
 
     async fn acquire(&self, request: SandboxRequest) -> Result<Arc<dyn ManagedSandboxHandle>> {
+        request.reject_egress_proxy()?;
         reject_unsupported_request(&request, self.session_storage_mount_path.as_deref())?;
         let spec_hash = sandbox_spec_hash(&request.spec);
         let runtime_session_id = agentcore_runtime_session_id(&request, &spec_hash);
@@ -554,6 +555,7 @@ mod tests {
 
     fn durable_request(mount_path: &str, mode: FileSystemMountMode) -> SandboxRequest {
         SandboxRequest {
+            egress_proxy: None,
             sandbox_id: "sandbox".to_string(),
             scope: Some(SandboxScope::Thread {
                 thread_id: "thread".to_string(),
@@ -567,7 +569,7 @@ mod tests {
                     mount_path: mount_path.to_string(),
                     mode,
                 }],
-                network: SandboxNetworkPolicy::Enabled,
+                network: SandboxNetworkPolicy::Unrestricted,
                 default_workdir: "/mnt/workspace".to_string(),
             },
             lifecycle: SandboxLifecycleConfig::default(),

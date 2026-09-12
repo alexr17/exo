@@ -6,6 +6,7 @@ license.workspace = true
 rust-version.workspace = true
 
 [features]
+egress-proxy = ["exoharness/egress-proxy"]
 default = []
 aws-agentcore = ["exoharness/aws-agentcore"]
 firecracker = ["exoharness/firecracker"]

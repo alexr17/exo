@@ -124,8 +124,11 @@ impl VercelSandboxBackend {
             timeout: request.lifecycle.idle_ttl.map(duration_to_millis),
             env: HashMap::new(),
             tags,
-            network_policy: match request.spec.network {
-                SandboxNetworkPolicy::Enabled => None,
+            network_policy: match &request.spec.network {
+                SandboxNetworkPolicy::Limited { .. } => {
+                    bail!("Vercel limited networking is not implemented")
+                }
+                SandboxNetworkPolicy::Unrestricted => None,
                 SandboxNetworkPolicy::Disabled => Some(VercelNetworkPolicy {
                     mode: "deny-all".to_string(),
                 }),
@@ -163,6 +166,7 @@ impl ManagedSandboxBackend for VercelSandboxBackend {
     }
 
     async fn acquire(&self, request: SandboxRequest) -> Result<Arc<dyn ManagedSandboxHandle>> {
+        request.reject_egress_proxy()?;
         reject_unsupported_mounts(&request)?;
         let spec_hash = sandbox_spec_hash(&request.spec);
         let sandbox_name = vercel_sandbox_name(&request, &spec_hash);

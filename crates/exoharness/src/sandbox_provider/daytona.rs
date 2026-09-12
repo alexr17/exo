@@ -259,6 +259,7 @@ impl ManagedSandboxBackend for DaytonaSandboxBackend {
     }
 
     async fn acquire(&self, request: SandboxRequest) -> Result<Arc<dyn ManagedSandboxHandle>> {
+        request.reject_egress_proxy()?;
         reject_unsupported_mounts(&request)?;
         let spec_hash = sandbox_spec_hash(&request.spec);
 
@@ -301,6 +302,7 @@ impl ManagedSandboxBackend for DaytonaSandboxBackend {
         request: SandboxRequest,
         payload: SnapshotPayload,
     ) -> Result<Arc<dyn ManagedSandboxHandle>> {
+        request.reject_egress_proxy()?;
         reject_unsupported_mounts(&request)?;
         let snapshot_name = if payload.format == SnapshotFormat::DaytonaRef {
             let manifest: DaytonaSnapshotManifest = serde_json::from_slice(&payload.bytes)
