@@ -687,7 +687,6 @@ fn dns_only_answers_exact_allowed_names() -> Result<()> {
     Ok(())
 }
 
-#[cfg(all(target_os = "linux", feature = "firecracker"))]
 async fn guest(
     handle: &Arc<dyn crate::ManagedSandboxHandle>,
     proxy: &EgressProxy,
@@ -713,10 +712,13 @@ async fn guest(
     Ok(output.stdout)
 }
 
-#[cfg(all(target_os = "linux", feature = "firecracker"))]
 #[tokio::test]
 #[ignore = "requires root, Linux/KVM, and the Exo Firecracker artifact bundle"]
 async fn firecracker_transparent_egress_live() -> Result<()> {
+    ensure!(
+        cfg!(target_os = "linux"),
+        "this smoke test requires Linux/KVM"
+    );
     use crate::{
         FirecrackerConfig, FirecrackerSandboxBackend, ManagedSandboxBackend,
         SandboxLifecycleConfig, SandboxRequest, SandboxResourceShape, SandboxSpec,
@@ -761,13 +763,11 @@ async fn firecracker_transparent_egress_live() -> Result<()> {
             sandbox: one_request.clone(),
             egress_proxy: Some(proxy.endpoints()),
         }).await?;
-        backend.track_egress(one.as_ref(), proxy.transport.clone()).await?;
         let one_source = backend.egress_source(one.as_ref()).await?.context("missing VM egress address")?;
         let two = backend.acquire_request(crate::FirecrackerRequest {
             sandbox: two_request.clone(),
             egress_proxy: Some(other.endpoints()),
         }).await?;
-        backend.track_egress(two.as_ref(), other.transport.clone()).await?;
         let two_source = backend.egress_source(two.as_ref()).await?.context("missing VM egress address")?;
         proxy.bind_source(one_source).await?;
         other.bind_source(two_source).await?;
