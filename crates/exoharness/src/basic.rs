@@ -1080,6 +1080,7 @@ impl ExoHarness for BasicExoHarness {
                     .join(conversation_id.to_string());
                 terminate_running_sandboxes(&BasicScopedSandboxHandle::conversation(
                     self,
+                    *id,
                     conversation_id,
                     conversation_dir,
                 ))
@@ -1099,6 +1100,7 @@ impl ExoHarness for BasicExoHarness {
                     .join(conversation_id.to_string());
                 scopes.push(BasicScopedSandboxHandle::conversation(
                     self,
+                    *id,
                     conversation_id,
                     conversation_dir,
                 ));
@@ -1440,8 +1442,12 @@ impl AgentHandle for BasicAgentHandle {
             return Ok(false);
         }
 
-        let sandbox_handle =
-            BasicScopedSandboxHandle::conversation(&self.harness, *id, conversation_dir.clone());
+        let sandbox_handle = BasicScopedSandboxHandle::conversation(
+            &self.harness,
+            self.record.id,
+            *id,
+            conversation_dir.clone(),
+        );
         // Sandbox creation persists its record under the write lock, so the
         // only way to guarantee no VM outlives its conversation record is to
         // observe "no running sandboxes" while holding that lock and delete
@@ -1715,7 +1721,10 @@ fn paginate_conversation_records(
 #[derive(Debug, Clone, Copy)]
 enum SandboxOwner {
     Agent(AgentId),
-    Conversation(ConversationId),
+    Conversation {
+        agent_id: AgentId,
+        thread_id: ConversationId,
+    },
 }
 
 // Deletion helpers shared by delete_agent and delete_conversation: an owner's
@@ -1830,19 +1839,24 @@ impl<'a> BasicScopedSandboxHandle<'a> {
 
     fn conversation(
         harness: &'a BasicExoHarness,
+        agent_id: AgentId,
         conversation_id: ConversationId,
         conversation_dir: PathBuf,
     ) -> Self {
         Self {
             harness,
             owner_dir: conversation_dir,
-            owner: SandboxOwner::Conversation(conversation_id),
+            owner: SandboxOwner::Conversation {
+                agent_id,
+                thread_id: conversation_id,
+            },
             event_sink: BasicSandboxEventSink::Conversation { conversation_id },
         }
     }
 
     fn turn(
         harness: &'a BasicExoHarness,
+        agent_id: AgentId,
         conversation_id: ConversationId,
         conversation_dir: PathBuf,
         session_id: SessionId,
@@ -1852,7 +1866,10 @@ impl<'a> BasicScopedSandboxHandle<'a> {
         Self {
             harness,
             owner_dir: conversation_dir,
-            owner: SandboxOwner::Conversation(conversation_id),
+            owner: SandboxOwner::Conversation {
+                agent_id,
+                thread_id: conversation_id,
+            },
             event_sink: BasicSandboxEventSink::Turn {
                 conversation_id,
                 session_id,
@@ -2760,6 +2777,7 @@ impl ConversationHandle for BasicConversationHandle {
 
         Ok(Arc::new(BasicTurnHandle {
             harness: self.harness.clone(),
+            agent_id: self.agent_id,
             conversation_dir,
             conversation_id: self.record.id,
             record: turn_record,
@@ -2791,6 +2809,7 @@ impl ConversationHandle for BasicConversationHandle {
         }
         Ok(Arc::new(BasicTurnHandle {
             harness: self.harness.clone(),
+            agent_id: self.agent_id,
             conversation_dir: self.conversation_dir(),
             conversation_id: self.record.id,
             record,
@@ -3162,6 +3181,7 @@ impl BasicSandboxScope for BasicConversationHandle {
     fn sandbox_handle(&self) -> BasicScopedSandboxHandle<'_> {
         BasicScopedSandboxHandle::conversation(
             &self.harness,
+            self.agent_id,
             self.record.id,
             self.conversation_dir(),
         )
@@ -3678,7 +3698,7 @@ fn sandbox_provider_state_key(
     let request = sandbox_request(owner, sandbox_id, sandbox, None);
     let owner_key = match owner {
         SandboxOwner::Agent(agent_id) => format!("agent:{agent_id}"),
-        SandboxOwner::Conversation(thread_id) => format!("thread:{thread_id}"),
+        SandboxOwner::Conversation { thread_id, .. } => format!("thread:{thread_id}"),
     };
     format!(
         "{owner_key}:{sandbox_id}\n{}",
@@ -3694,7 +3714,7 @@ async fn load_sandbox_provider_state(
     provider: SandboxProvider,
     state_key: &str,
 ) -> Result<Option<Value>> {
-    let SandboxOwner::Conversation(_) = owner else {
+    let SandboxOwner::Conversation { .. } = owner else {
         return Ok(None);
     };
     let mut events = load_events(&harness.inner.storage, &owner_dir.join("events"))
@@ -3772,6 +3792,7 @@ async fn require_running_sandbox_process(
 
 struct BasicTurnHandle {
     harness: BasicExoHarness,
+    agent_id: AgentId,
     conversation_dir: PathBuf,
     conversation_id: ConversationId,
     record: TurnRecord,
@@ -3787,6 +3808,7 @@ impl BasicSandboxScope for BasicTurnHandle {
     fn sandbox_handle(&self) -> BasicScopedSandboxHandle<'_> {
         BasicScopedSandboxHandle::turn(
             &self.harness,
+            self.agent_id,
             self.conversation_id,
             self.conversation_dir.clone(),
             self.record.session_id,
@@ -4482,7 +4504,11 @@ fn sandbox_request(
             SandboxOwner::Agent(agent_id) => SandboxScope::Agent {
                 agent_id: agent_id.to_string(),
             },
-            SandboxOwner::Conversation(thread_id) => SandboxScope::Thread {
+            SandboxOwner::Conversation {
+                agent_id,
+                thread_id,
+            } => SandboxScope::Thread {
+                agent_id: agent_id.to_string(),
                 thread_id: thread_id.to_string(),
             },
         }),
@@ -4927,31 +4953,23 @@ impl LocalEgressResolver {
                     agent_id.parse().context("invalid egress agent identity")?;
                 Some(PathBuf::from("agents").join(agent_id.to_string()))
             }
-            Some(SandboxScope::Thread { thread_id }) => {
+            Some(SandboxScope::Thread {
+                agent_id,
+                thread_id,
+            }) => {
+                let agent_id: AgentId =
+                    agent_id.parse().context("invalid egress agent identity")?;
                 let thread_id: ConversationId = thread_id
                     .parse()
                     .context("invalid egress thread identity")?;
-                let suffix = format!("/conversations/{thread_id}/record.json");
-                let keys = self.storage.list_keys(Path::new("agents")).await?;
-                let mut records = keys.iter().filter(|key| {
-                    key.ends_with(&suffix) && Path::new(key).components().count() == 5
-                });
-                let record = records.next().context("egress thread not found")?;
-                anyhow::ensure!(
-                    records.next().is_none(),
-                    "egress thread identity is ambiguous"
-                );
-                let thread_dir = Path::new(record)
-                    .parent()
-                    .context("invalid thread record path")?;
+                let agent_dir = PathBuf::from("agents").join(agent_id.to_string());
+                let thread_dir = agent_dir.join("conversations").join(thread_id.to_string());
+                self.storage
+                    .get_json::<ConversationRecord>(thread_dir.join("record.json"))
+                    .await
+                    .context("egress thread not found")?;
                 directories.push(thread_dir.join("secrets"));
-                Some(
-                    thread_dir
-                        .parent()
-                        .and_then(Path::parent)
-                        .context("invalid thread agent path")?
-                        .to_path_buf(),
-                )
+                Some(agent_dir)
             }
             None => None,
         };
@@ -5095,12 +5113,14 @@ mod egress_resolution_tests {
             ),
             (
                 Some(SandboxScope::Thread {
+                    agent_id: agent.record().id.to_string(),
                     thread_id: first.record().id.to_string(),
                 }),
                 "first",
             ),
             (
                 Some(SandboxScope::Thread {
+                    agent_id: agent.record().id.to_string(),
                     thread_id: second.record().id.to_string(),
                 }),
                 "second",
@@ -5118,6 +5138,7 @@ mod egress_resolution_tests {
         let second_identity = EgressIdentity {
             sandbox_id: "second".into(),
             scope: Some(SandboxScope::Thread {
+                agent_id: agent.record().id.to_string(),
                 thread_id: second.record().id.to_string(),
             }),
         };
@@ -5139,6 +5160,7 @@ mod egress_resolution_tests {
         let mut identity = EgressIdentity {
             sandbox_id: "test".into(),
             scope: Some(SandboxScope::Thread {
+                agent_id: agent.record().id.to_string(),
                 thread_id: inherited.record().id.to_string(),
             }),
         };
@@ -5146,8 +5168,27 @@ mod egress_resolution_tests {
             resolver.resolve(&identity, "token", &destination).await?,
             "agent"
         );
+        let other_agent = harness
+            .new_agent(NewAgentRequest {
+                slug: "other".into(),
+                name: "other".into(),
+            })
+            .await?;
+        identity.scope = Some(SandboxScope::Thread {
+            agent_id: other_agent.record().id.to_string(),
+            thread_id: first.record().id.to_string(),
+        });
+        assert!(
+            resolver
+                .resolve(&identity, "token", &destination)
+                .await
+                .is_err()
+        );
         for thread_id in [Uuid7::now().to_string(), "../../secrets".into()] {
-            identity.scope = Some(SandboxScope::Thread { thread_id });
+            identity.scope = Some(SandboxScope::Thread {
+                agent_id: agent.record().id.to_string(),
+                thread_id,
+            });
             assert!(
                 resolver
                     .resolve(&identity, "token", &destination)

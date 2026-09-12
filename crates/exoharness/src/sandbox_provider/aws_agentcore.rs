@@ -560,6 +560,7 @@ mod tests {
         SandboxRequest {
             sandbox_id: "sandbox".to_string(),
             scope: Some(SandboxScope::Thread {
+                agent_id: "agent-1".into(),
                 thread_id: "thread".to_string(),
             }),
             spec: SandboxSpec {

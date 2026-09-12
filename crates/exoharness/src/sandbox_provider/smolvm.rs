@@ -1145,6 +1145,7 @@ mod tests {
         let mut request = test_request(None);
         let name = machine_name(&request.sandbox_id);
         request.scope = Some(SandboxScope::Thread {
+            agent_id: "agent-1".into(),
             thread_id: "thread".into(),
         });
         assert_eq!(name, machine_name(&request.sandbox_id));

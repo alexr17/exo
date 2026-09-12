@@ -236,6 +236,14 @@ impl BridgeBackendCache {
         request: FirecrackerRequest,
     ) -> Result<Arc<dyn ManagedSandboxHandle>> {
         let backend = self.backend(config).await?;
+        self.acquire_on(&backend, request).await
+    }
+
+    async fn acquire_on(
+        &self,
+        backend: &FirecrackerSandboxBackend,
+        request: FirecrackerRequest,
+    ) -> Result<Arc<dyn ManagedSandboxHandle>> {
         let endpoints = request.egress_proxy;
         let handle = backend.acquire_request(request).await?;
         if let Some(endpoints) = endpoints {
@@ -412,8 +420,8 @@ async fn handle_request(
             ))
         }
         FirecrackerBridgeRequest::Acquire { config, request } => {
-            let backend = backends.backend(config.clone()).await?;
-            let handle = backends.acquire(config, request).await?;
+            let backend = backends.backend(config).await?;
+            let handle = backends.acquire_on(&backend, request).await?;
             let source_ipv4 = backend.egress_source(handle.as_ref()).await?;
             Ok(FirecrackerBridgeResponse::Handle {
                 id: handle.id().to_string(),

@@ -37,6 +37,7 @@ fn make_e2b_request(thread_id: &str, sandbox_id: &str) -> SandboxRequest {
     SandboxRequest {
         sandbox_id: sandbox_id.into(),
         scope: Some(SandboxScope::Thread {
+            agent_id: "agent-1".into(),
             thread_id: thread_id.into(),
         }),
         spec: SandboxSpec {
@@ -87,6 +88,7 @@ fn make_sprites_request(thread_id: &str, sandbox_id: &str) -> SandboxRequest {
     SandboxRequest {
         sandbox_id: sandbox_id.into(),
         scope: Some(SandboxScope::Thread {
+            agent_id: "agent-1".into(),
             thread_id: thread_id.into(),
         }),
         spec: SandboxSpec {

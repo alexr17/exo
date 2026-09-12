@@ -104,21 +104,22 @@ async fn bind_dns(config: &crate::EgressListenConfig) -> io::Result<(TcpListener
     } else {
         config.bind_address
     };
-    for attempt in 0..DNS_BIND_ATTEMPTS {
+    let mut attempt = 0;
+    loop {
+        attempt += 1;
         let tcp = TcpListener::bind((address, config.dns_port)).await?;
         match UdpSocket::bind(tcp.local_addr()?).await {
             Ok(udp) => return Ok((tcp, udp)),
             Err(error)
                 if error.kind() == io::ErrorKind::AddrInUse
                     && config.dns_port == 0
-                    && attempt + 1 < DNS_BIND_ATTEMPTS =>
+                    && attempt < DNS_BIND_ATTEMPTS =>
             {
                 continue;
             }
             Err(error) => return Err(error),
         }
     }
-    unreachable!("last DNS bind attempt returns its error")
 }
 
 impl LocalEgressTransport {
@@ -347,8 +348,6 @@ pub(super) fn dns_response(hosts: &HashSet<String>, bytes: &[u8]) -> Result<Vec<
             0,
             RData::A(A(SYNTHETIC_IP)),
         ));
-    } else if question.query_type() != RecordType::AAAA {
-        response.set_response_code(ResponseCode::Refused);
     }
     Ok(response.to_vec()?)
 }

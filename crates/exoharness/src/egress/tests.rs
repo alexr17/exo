@@ -61,7 +61,7 @@ impl EgressCredentialResolver for TestResolver {
         self.uses.write().await.push((
             identity.sandbox_id.clone(),
             match &identity.scope {
-                Some(crate::SandboxScope::Thread { thread_id }) => thread_id.clone(),
+                Some(crate::SandboxScope::Thread { thread_id, .. }) => thread_id.clone(),
                 _ => bail!("expected thread identity"),
             },
             destination.host.clone(),
@@ -194,7 +194,7 @@ impl ThreadResolver {
         &self,
         identity: &EgressIdentity,
     ) -> Result<&[(EgressCredentialBinding, String)]> {
-        let Some(crate::SandboxScope::Thread { thread_id }) = &identity.scope else {
+        let Some(crate::SandboxScope::Thread { thread_id, .. }) = &identity.scope else {
             bail!("thread scope is required");
         };
         self.credentials
@@ -314,6 +314,7 @@ fn identity(sandbox_id: &str) -> EgressIdentity {
     EgressIdentity {
         sandbox_id: sandbox_id.into(),
         scope: Some(crate::SandboxScope::Thread {
+            agent_id: "agent-1".into(),
             thread_id: format!("thread-{sandbox_id}"),
         }),
     }
@@ -659,7 +660,8 @@ fn dns_only_answers_exact_allowed_names() -> Result<()> {
     for (host, kind, allowed) in [
         ("api.test", RecordType::A, true),
         ("api.test", RecordType::AAAA, true),
-        ("api.test", RecordType::TXT, false),
+        ("api.test", RecordType::TXT, true),
+        ("api.test", RecordType::HTTPS, true),
         ("leak.api.test", RecordType::A, false),
         ("blocked.test", RecordType::A, false),
     ] {
@@ -673,8 +675,6 @@ fn dns_only_answers_exact_allowed_names() -> Result<()> {
             response.response_code(),
             if allowed {
                 ResponseCode::NoError
-            } else if host == "api.test" {
-                ResponseCode::Refused
             } else {
                 ResponseCode::NXDomain
             }
@@ -886,6 +886,7 @@ async fn managed_firecracker_egress_live() -> Result<()> {
     let request = SandboxRequest {
         sandbox_id: "managed-egress-live".into(),
         scope: Some(SandboxScope::Thread {
+            agent_id: "agent-1".into(),
             thread_id: "managed-live".into(),
         }),
         provider_state: None,
@@ -1207,6 +1208,11 @@ async fn quiet_response_stream_survives_past_the_request_io_timeout() -> Result<
         .await?;
     assert_eq!(response.status(), StatusCode::OK);
     assert_eq!(response.chunk().await?.unwrap(), "first\n");
+    // Advance only while the established stream is idle; resume real time before
+    // waiting for OS socket readiness, which Tokio's clock does not simulate.
+    tokio::time::pause();
+    tokio::time::advance(IO_TIMEOUT + Duration::from_secs(1)).await;
+    tokio::time::resume();
     assert_eq!(response.chunk().await?.unwrap(), "last\n");
     assert!(response.chunk().await?.is_none());
     proxy.shutdown().await

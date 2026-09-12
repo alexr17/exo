@@ -671,6 +671,7 @@ async fn local_process_contract_handle(
         .acquire(SandboxRequest {
             sandbox_id: sandbox_id.to_string(),
             scope: Some(SandboxScope::Thread {
+                agent_id: "agent-1".into(),
                 thread_id: Uuid7::now().to_string(),
             }),
             spec: SandboxSpec {
@@ -872,6 +873,7 @@ fn provider_contract_request(
     SandboxRequest {
         sandbox_id: format!("{provider}-{contract}-contract"),
         scope: Some(SandboxScope::Thread {
+            agent_id: "agent-1".into(),
             thread_id: Uuid7::now().to_string(),
         }),
         spec: SandboxSpec {

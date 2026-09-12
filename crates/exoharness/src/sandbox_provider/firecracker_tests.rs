@@ -847,3 +847,184 @@ async fn idle_reap_closes_egress_before_machine_cleanup_can_fail() -> Result<()>
     replacement.close();
     Ok(())
 }
+
+struct DurableStopFixture {
+    _directory: tempfile::TempDir,
+    backend: FirecrackerSandboxBackend,
+    request: SandboxRequest,
+    machine: Machine,
+    listener: UnixListener,
+}
+
+impl DurableStopFixture {
+    async fn new() -> Result<Self> {
+        let directory = tempfile::tempdir_in("/tmp")?;
+        for name in ["manifests", "leases", "slots"] {
+            fs::create_dir(directory.path().join(name))?;
+        }
+        let config = FirecrackerConfig {
+            state_root: directory.path().into(),
+            ..Default::default()
+        };
+        let request = SandboxRequest {
+            sandbox_id: "durable".into(),
+            scope: None,
+            spec: SandboxSpec {
+                image: "/images/test.ext4".into(),
+                resources: Default::default(),
+                mounts: vec![],
+                durable_file_systems: vec![],
+                policy: SandboxNetworkPolicy::Disabled.into(),
+                default_workdir: "/workspace".into(),
+            },
+            lifecycle: Default::default(),
+            provider_state: None,
+        };
+        let record = MachineRecord {
+            machine_id: "fc-durable".into(),
+            spec_hash: sandbox_spec_hash(&request.spec),
+            runtime: test_runtime(),
+            resolved_image: request.spec.image.clone(),
+            slot: 1,
+            network_enabled: false,
+            workspace_id: Some("workspace".into()),
+            idle_ttl_seconds: None,
+            snapshot_template: None,
+            snapshot_network_slot: None,
+        };
+        write_manifest(directory.path(), &record)?;
+        let shared = Arc::new(Shared {
+            config,
+            host_fingerprint: test_host_runtime(),
+            _state_lock: File::create(directory.path().join("backend.lock"))?,
+            warm_machines: Mutex::new(HashMap::from([(
+                request.sandbox_id.clone(),
+                WarmMachineEntry {
+                    egress_proxy: None,
+                    machine_id: record.machine_id.clone(),
+                    spec_hash: record.spec_hash.clone(),
+                    idle_ttl: None,
+                    last_used_at: Instant::now(),
+                },
+            )])),
+            egress_transports: StdMutex::new(HashMap::new()),
+            lifecycle_locks: MachineLifecycleLocks::default(),
+            capacity_gate: Mutex::new(()),
+            starting_machines: Arc::new(StdMutex::new(HashSet::new())),
+        });
+        let machine = machine_from_record(&shared.config, record);
+        fs::create_dir_all(machine.vsock_path.parent().unwrap())?;
+        let listener = UnixListener::bind(&machine.vsock_path)?;
+        // Only liveness reads this PID. The fake guest removes it before a
+        // successful sync reply so cleanup never signals the test process.
+        fs::write(
+            shared.pid_path(&machine.record.machine_id),
+            std::process::id().to_string(),
+        )?;
+        Ok(Self {
+            _directory: directory,
+            backend: FirecrackerSandboxBackend {
+                shared,
+                egress: Arc::new(EgressRuntime::new(None, Arc::new(PublicUpstreamResolver))),
+            },
+            request,
+            machine,
+            listener,
+        })
+    }
+
+    async fn sync_reply(&self, response: GuestResponse) -> Result<()> {
+        let (stream, _) = self.listener.accept().await?;
+        let mut stream = AsyncBufReader::new(stream);
+        let mut handshake = String::new();
+        stream.read_line(&mut handshake).await?;
+        assert_eq!(handshake, "CONNECT 10052\n");
+        stream.get_mut().write_all(b"OK 1073741824\n").await?;
+        let mut stream = stream.into_inner();
+        let length = stream.read_u32().await? as usize;
+        let mut payload = vec![0; length];
+        stream.read_exact(&mut payload).await?;
+        let request: Message<ProtocolGuestRequest<()>> = serde_json::from_slice(&payload)?;
+        assert!(
+            matches!(request.payload, ProtocolGuestRequest::SyncFilesystem { path } if path == "/workspace")
+        );
+        if response.ok {
+            fs::remove_file(
+                self.backend
+                    .shared
+                    .pid_path(&self.machine.record.machine_id),
+            )?;
+        }
+        let payload = serde_json::to_vec(&Message::new(response))?;
+        stream.write_u32(payload.len() as u32).await?;
+        stream.write_all(&payload).await?;
+        Ok(())
+    }
+}
+
+#[tokio::test]
+#[cfg_attr(
+    not(target_os = "linux"),
+    ignore = "uses Linux process liveness; no VM required"
+)]
+async fn terminate_flushes_durable_guest_without_acquiring_a_vm() -> Result<()> {
+    let fixture = DurableStopFixture::new().await?;
+    tokio::time::timeout(Duration::from_secs(2), async {
+        tokio::try_join!(
+            fixture.backend.terminate(fixture.request.clone()),
+            fixture.sync_reply(GuestResponse::ok()),
+        )
+    })
+    .await??;
+    assert!(
+        !fixture
+            .backend
+            .shared
+            .manifest_path(&fixture.machine.record.machine_id)
+            .exists()
+    );
+    assert!(fixture.backend.shared.warm_machines.lock().await.is_empty());
+    Ok(())
+}
+
+#[tokio::test]
+#[cfg_attr(
+    not(target_os = "linux"),
+    ignore = "uses Linux process liveness; no VM required"
+)]
+async fn failed_durable_sync_leaves_the_vm_and_warm_entry_for_retry() -> Result<()> {
+    let fixture = DurableStopFixture::new().await?;
+    let (stop, reply) = tokio::time::timeout(Duration::from_secs(2), async {
+        tokio::join!(
+            fixture.backend.terminate(fixture.request.clone()),
+            fixture.sync_reply(GuestResponse::error("sync failed")),
+        )
+    })
+    .await?;
+    reply?;
+    assert!(format!("{:#}", stop.unwrap_err()).contains("sync failed"));
+    assert!(
+        fixture
+            .backend
+            .shared
+            .pid_path(&fixture.machine.record.machine_id)
+            .exists()
+    );
+    assert!(
+        fixture
+            .backend
+            .shared
+            .manifest_path(&fixture.machine.record.machine_id)
+            .exists()
+    );
+    assert!(
+        fixture
+            .backend
+            .shared
+            .warm_machines
+            .lock()
+            .await
+            .contains_key(&fixture.request.sandbox_id)
+    );
+    Ok(())
+}

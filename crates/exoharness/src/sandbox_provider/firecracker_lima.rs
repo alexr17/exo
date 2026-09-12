@@ -20,7 +20,10 @@ use async_trait::async_trait;
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use bytes::Bytes;
-use futures::future::BoxFuture;
+use futures::{
+    FutureExt,
+    future::{BoxFuture, Shared},
+};
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, BufReader, ReadBuf};
 use tokio::process::Command;
 use tokio::sync::{Mutex, mpsc, oneshot};
@@ -1472,6 +1475,7 @@ struct LimaEgressTransport {
     http: Mutex<mpsc::Receiver<Result<BoxSandboxTcpStream>>>,
     https: Mutex<mpsc::Receiver<Result<BoxSandboxTcpStream>>>,
     cancel: tokio_util::sync::CancellationToken,
+    cleanup: Shared<BoxFuture<'static, Result<(), Arc<anyhow::Error>>>>,
 }
 
 impl LimaEgressTransport {
@@ -1514,14 +1518,26 @@ impl LimaEgressTransport {
         let cleanup_connection = connection.clone();
         let cleanup_id = listener_id.clone();
         let cleanup_cancel = cancel.clone();
-        tokio::spawn(async move {
-            cleanup_cancel.cancelled().await;
-            if let Err(error) = cleanup_connection
+        // Drop and explicit shutdown share one RPC. Shutdown waits for it so a
+        // replacement listener can immediately reuse the same ports.
+        let cleanup = async move {
+            match cleanup_connection
                 .request(FirecrackerBridgeRequest::EgressClose {
                     listener_id: cleanup_id,
                 })
-                .await
+                .await?
             {
+                FirecrackerBridgeResponse::Unit => Ok(()),
+                _ => bail!("Lima bridge did not close egress listener"),
+            }
+        }
+        .map(|result: Result<()>| result.map_err(Arc::new))
+        .boxed()
+        .shared();
+        let background_cleanup = cleanup.clone();
+        tokio::spawn(async move {
+            cleanup_cancel.cancelled().await;
+            if let Err(error) = background_cleanup.await {
                 tracing::debug!(%error, "egress listener cleanup failed after bridge closure");
             }
         });
@@ -1532,6 +1548,7 @@ impl LimaEgressTransport {
             http,
             https,
             cancel,
+            cleanup,
         }
     }
 }
@@ -1564,16 +1581,10 @@ impl crate::egress::EgressTransport for LimaEgressTransport {
     }
     async fn shutdown(&self) -> Result<()> {
         self.cancel.cancel();
-        match self
-            .connection
-            .request(FirecrackerBridgeRequest::EgressClose {
-                listener_id: self.listener_id.clone(),
-            })
-            .await?
-        {
-            FirecrackerBridgeResponse::Unit => Ok(()),
-            _ => bail!("Lima bridge did not close egress listener"),
-        }
+        self.cleanup
+            .clone()
+            .await
+            .map_err(|error| anyhow!("{error:#}"))
     }
 
     fn is_closed(&self) -> bool {
@@ -1587,5 +1598,63 @@ impl crate::egress::EgressTransport for LimaEgressTransport {
 impl Drop for LimaEgressTransport {
     fn drop(&mut self) {
         self.cancel.cancel();
+    }
+}
+
+#[cfg(test)]
+mod egress_cleanup_tests {
+    use super::*;
+    use crate::egress::EgressTransport;
+
+    #[tokio::test]
+    async fn concurrent_shutdown_and_drop_send_one_close_request() -> Result<()> {
+        let (outgoing, mut receiver) = mpsc::channel(8);
+        let connection = Arc::new(LimaBridgeConnection {
+            outgoing,
+            state: Arc::new(LimaBridgeClientState::default()),
+            next_id: AtomicU64::new(1),
+        });
+        let transport = LimaEgressTransport::new(
+            connection.clone(),
+            "listener".into(),
+            crate::SandboxEgressProxy {
+                http: "192.0.2.1:80".parse()?,
+                https: "192.0.2.1:443".parse()?,
+                dns: "192.0.2.1:53".parse()?,
+            },
+        );
+        let respond = async {
+            while let Some(frame) = receiver.recv().await {
+                if let FirecrackerBridgeClientFrame::Request { id, request } = frame
+                    && let FirecrackerBridgeRequest::EgressClose { listener_id } = *request
+                {
+                    assert_eq!(listener_id, "listener");
+                    connection.state.handle_frame(
+                        FirecrackerBridgeServerFrame::Response {
+                            id,
+                            result: Ok(FirecrackerBridgeResponse::Unit),
+                        },
+                        &connection.outgoing,
+                    )?;
+                    return Ok::<_, anyhow::Error>(());
+                }
+            }
+            bail!("bridge closed before listener cleanup")
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            tokio::try_join!(transport.shutdown(), transport.shutdown(), respond)
+        })
+        .await??;
+        drop(transport);
+        tokio::task::yield_now().await;
+        while let Ok(frame) = receiver.try_recv() {
+            if let FirecrackerBridgeClientFrame::Request { request, .. } = frame {
+                assert!(!matches!(
+                    *request,
+                    FirecrackerBridgeRequest::EgressClose { .. }
+                ));
+            }
+        }
+        Ok(())
     }
 }

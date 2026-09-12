@@ -660,14 +660,16 @@ impl FirecrackerSandboxBackend {
             .warm_machines
             .lock()
             .await
-            .remove(request.sandbox_id.as_str())
-            .map(|entry| entry.machine_id)
+            .get(request.sandbox_id.as_str())
+            .map(|entry| entry.machine_id.clone())
             .or(persisted_machine_id)
             .unwrap_or_else(|| {
                 let spec_hash = sandbox_spec_hash(&request.spec);
                 machine_id(request.sandbox_id.as_str(), &spec_hash)
             });
-        self.shared.cleanup_machine(&machine_id, true).await
+        self.shared
+            .stop_machine(&machine_id, &request.spec.default_workdir)
+            .await
     }
 
     #[cfg(all(test, target_os = "linux"))]
@@ -1637,30 +1639,11 @@ impl ManagedSandboxHandle for FirecrackerSandboxHandle {
         if let Some(egress) = &self.egress {
             egress.close();
         }
-        let _lifecycle_guard = self
-            .shared
-            .lifecycle_locks
-            .lock_machine(&self.machine.record.machine_id)
-            .await;
-        if self.machine.record.workspace_id.is_some()
-            && process_running(&self.shared.pid_path(&self.machine.record.machine_id))
-        {
-            // Firecracker's clean-shutdown API is x86-only. On every architecture,
-            // sync the durable filesystem through the guest before terminating the
-            // VMM so completed writes are not stranded in the guest page cache.
-            // https://github.com/firecracker-microvm/firecracker/blob/main/docs/api_requests/actions.md#intel-and-amd-only-sendctrlaltdel
-            GuestClient::new(Arc::clone(&self.shared), self.machine.vsock_path.clone())
-                .sync_filesystem(&self.request.spec.default_workdir)
-                .await
-                .context("syncing Firecracker durable filesystem before stop")?;
-        }
         self.shared
-            .warm_machines
-            .lock()
-            .await
-            .retain(|_, entry| entry.machine_id != self.machine.record.machine_id);
-        self.shared
-            .cleanup_machine(&self.machine.record.machine_id, true)
+            .stop_machine(
+                &self.machine.record.machine_id,
+                &self.request.spec.default_workdir,
+            )
             .await
     }
 
@@ -2075,6 +2058,32 @@ impl Shared {
         })
         .await
         .context("joining Firecracker launch task")?
+    }
+
+    // Both handle.stop() and backend termination (including the Lima bridge)
+    // stop an existing VM here without acquiring or booting it first.
+    async fn stop_machine(self: &Arc<Self>, machine_id: &str, workdir: &str) -> Result<()> {
+        let _lifecycle_guard = self.lifecycle_locks.lock_machine(machine_id).await;
+        self.close_egress(machine_id);
+        if let Some(record) = self.load_machine_record(machine_id).await?
+            && record.workspace_id.is_some()
+            && process_running(&self.pid_path(machine_id))
+        {
+            // Firecracker's clean-shutdown API is x86-only. On every architecture,
+            // sync the durable filesystem through the guest before terminating the
+            // VMM so completed writes are not stranded in the guest page cache.
+            // https://github.com/firecracker-microvm/firecracker/blob/main/docs/api_requests/actions.md#intel-and-amd-only-sendctrlaltdel
+            let machine = machine_from_record(&self.config, record);
+            GuestClient::new(Arc::clone(self), machine.vsock_path)
+                .sync_filesystem(workdir)
+                .await
+                .context("syncing Firecracker durable filesystem before stop")?;
+        }
+        self.warm_machines
+            .lock()
+            .await
+            .retain(|_, entry| entry.machine_id != machine_id);
+        self.cleanup_machine(machine_id, true).await
     }
 
     #[tracing::instrument(name = "firecracker.stop_process", skip_all)]

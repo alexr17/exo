@@ -31,6 +31,7 @@ pub enum SandboxScope {
         agent_id: String,
     },
     Thread {
+        agent_id: String,
         #[serde(alias = "conversation_id")]
         thread_id: String,
     },
@@ -2398,17 +2399,18 @@ mod tests {
     #[test]
     fn thread_scope_uses_thread_id_and_reads_conversation_id() {
         let scope = SandboxScope::Thread {
+            agent_id: "agent-1".into(),
             thread_id: "thread-1".to_string(),
         };
         assert_eq!(
             serde_json::to_value(&scope).unwrap(),
             serde_json::json!({
-                "Thread": { "thread_id": "thread-1" }
+                "Thread": { "agent_id": "agent-1", "thread_id": "thread-1" }
             })
         );
         assert_eq!(
             serde_json::from_value::<SandboxScope>(serde_json::json!({
-                "Thread": { "conversation_id": "thread-1" }
+                "Thread": { "agent_id": "agent-1", "conversation_id": "thread-1" }
             }))
             .unwrap(),
             scope
@@ -2551,6 +2553,7 @@ mod tests {
         let request = SandboxRequest {
             sandbox_id: "sandbox".to_string(),
             scope: Some(SandboxScope::Thread {
+                agent_id: "agent-1".into(),
                 thread_id: "thread".to_string(),
             }),
             spec: SandboxSpec {
@@ -2631,6 +2634,7 @@ mod tests {
         let request = SandboxRequest {
             sandbox_id: "sandbox".to_string(),
             scope: Some(SandboxScope::Thread {
+                agent_id: "agent-1".into(),
                 thread_id: "thread".to_string(),
             }),
             spec: SandboxSpec {
@@ -2724,6 +2728,7 @@ esac
         let request = SandboxRequest {
             sandbox_id: "sandbox".to_string(),
             scope: Some(SandboxScope::Thread {
+                agent_id: "agent-1".into(),
                 thread_id: "thread".to_string(),
             }),
             spec: SandboxSpec {
@@ -2836,6 +2841,7 @@ esac
         let request = SandboxRequest {
             sandbox_id: "sandbox".to_string(),
             scope: Some(SandboxScope::Thread {
+                agent_id: "agent-1".into(),
                 thread_id: "thread".to_string(),
             }),
             spec: SandboxSpec {
