@@ -485,6 +485,8 @@ pub enum EventData {
         file_system_mounts: Vec<FileSystemMount>,
         #[serde(default)]
         durable_file_systems: Vec<DurableFileSystem>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        policy: Option<EgressPolicy>,
         enable_networking: bool,
         idle_seconds: u64,
     },
@@ -675,6 +677,56 @@ pub struct SandboxRecord {
     pub running: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+pub enum SandboxNetworkPolicy {
+    Unrestricted,
+    Disabled,
+    Limited { allowed_hosts: Vec<String> },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EgressPolicy {
+    pub networking: SandboxNetworkPolicy,
+    #[serde(default)]
+    pub credentials: Vec<EgressCredentialBinding>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EgressCredentialBinding {
+    pub name: String,
+    pub environment_variable: String,
+    pub networking: CredentialNetworkPolicy,
+    pub injection_location: CredentialInjectionLocation,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+pub enum CredentialNetworkPolicy {
+    Unrestricted,
+    Limited { allowed_hosts: Vec<String> },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CredentialInjectionLocation {
+    #[serde(default)]
+    pub header: bool,
+    #[serde(default)]
+    pub body: bool,
+}
+
+impl From<SandboxNetworkPolicy> for EgressPolicy {
+    fn from(networking: SandboxNetworkPolicy) -> Self {
+        Self {
+            networking,
+            credentials: Vec::new(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct CreateSandboxRequest {
     #[serde(default)]
@@ -686,6 +738,8 @@ pub struct CreateSandboxRequest {
     pub default_workdir: Option<String>,
     pub file_system_mounts: Option<Vec<FileSystemMount>>,
     pub durable_file_systems: Option<Vec<DurableFileSystem>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub policy: Option<EgressPolicy>,
     pub enable_networking: Option<bool>,
     pub idle_seconds: Option<u64>,
 }

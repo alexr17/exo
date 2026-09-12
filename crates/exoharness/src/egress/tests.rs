@@ -30,10 +30,6 @@ impl TestResolver {
 
 #[async_trait]
 impl EgressCredentialResolver for TestResolver {
-    async fn bindings(&self, _identity: &EgressIdentity) -> Result<Vec<EgressCredentialBinding>> {
-        Ok(policy().credentials)
-    }
-
     async fn resolve(
         &self,
         identity: &EgressIdentity,
@@ -126,7 +122,18 @@ impl Upstream {
         sandbox_id: &str,
         resolver: Arc<dyn EgressCredentialResolver>,
     ) -> Result<EgressProxy> {
-        let mut state = State::bind(identity(sandbox_id), policy().networking, resolver).await?;
+        self.proxy_with_policy(host_ip, sandbox_id, resolver, policy())
+            .await
+    }
+
+    async fn proxy_with_policy(
+        &self,
+        host_ip: Ipv4Addr,
+        sandbox_id: &str,
+        resolver: Arc<dyn EgressCredentialResolver>,
+        policy: EgressPolicy,
+    ) -> Result<EgressProxy> {
+        let mut state = State::new(identity(sandbox_id), policy, resolver)?;
         state.upstream = Some(TestUpstream {
             address: self.config.address,
             ca_pem: self.config.ca_pem.clone(),
@@ -156,14 +163,6 @@ impl ThreadResolver {
 
 #[async_trait]
 impl EgressCredentialResolver for ThreadResolver {
-    async fn bindings(&self, identity: &EgressIdentity) -> Result<Vec<EgressCredentialBinding>> {
-        Ok(self
-            .for_identity(identity)?
-            .iter()
-            .map(|(binding, _)| binding.clone())
-            .collect())
-    }
-
     async fn resolve(
         &self,
         identity: &EgressIdentity,
@@ -201,7 +200,15 @@ async fn threads_select_different_bindings_and_resolve_the_same_name_independent
     });
     let upstream = Upstream::start().await?;
     for (id, expected) in [("one", "authenticated-v1"), ("two", "authenticated-v2")] {
-        let proxy = upstream.proxy(host_ip()?, id, resolver.clone()).await?;
+        let mut policy = policy();
+        policy.credentials = resolver
+            .for_identity(&identity(id))?
+            .iter()
+            .map(|(binding, _)| binding.clone())
+            .collect();
+        let proxy = upstream
+            .proxy_with_policy(host_ip()?, id, resolver.clone(), policy)
+            .await?;
         proxy.bind_source(host_ip()?).await?;
         assert_eq!(
             proxy.environment().contains_key("EXTRA_API_KEY"),
@@ -235,17 +242,28 @@ async fn threads_select_different_bindings_and_resolve_the_same_name_independent
         }
         proxy.shutdown().await?;
     }
+    let mut empty_policy = policy();
+    empty_policy.credentials.clear();
     let empty = upstream
-        .proxy(host_ip()?, "empty", resolver.clone())
+        .proxy_with_policy(host_ip()?, "empty", resolver.clone(), empty_policy)
         .await?;
     assert!(empty.environment().is_empty());
     empty.shutdown().await?;
-    assert!(
-        upstream
-            .proxy(host_ip()?, "unknown", resolver)
-            .await
-            .is_err()
+    let unauthorized = upstream.proxy(host_ip()?, "unknown", resolver).await?;
+    unauthorized.bind_source(host_ip()?).await?;
+    assert_eq!(
+        client(&unauthorized)?
+            .get("https://api.test/auth")
+            .header(
+                "authorization",
+                format!("Bearer {}", unauthorized.environment()["TEST_API_KEY"])
+            )
+            .send()
+            .await?
+            .status(),
+        StatusCode::BAD_GATEWAY
     );
+    unauthorized.shutdown().await?;
     Ok(())
 }
 
@@ -605,8 +623,7 @@ async fn firecracker_transparent_egress_live() -> Result<()> {
     let other = upstream
         .proxy(host_ip()?, "live-two", resolver.clone())
         .await?;
-    let request = |id: &str, proxy: &EgressProxy| SandboxRequest {
-        egress_proxy: Some(proxy.endpoints()),
+    let request = |id: &str| SandboxRequest {
         sandbox_id: id.into(),
         scope: None,
         provider_state: None,
@@ -615,20 +632,20 @@ async fn firecracker_transparent_egress_live() -> Result<()> {
             resources: SandboxResourceShape::new(1, 512).unwrap(),
             mounts: vec![],
             durable_file_systems: vec![],
-            network: policy().networking,
+            policy: policy(),
             default_workdir: "/home/exo/workspace".into(),
         },
         lifecycle: SandboxLifecycleConfig {
             idle_ttl: Some(Duration::from_secs(300)),
         },
     };
-    let one_request = request("egress-live-one", &proxy);
-    let two_request = request("egress-live-two", &other);
+    let one_request = request("egress-live-one");
+    let two_request = request("egress-live-two");
     let result: Result<()> = async {
-        let one = backend.acquire(one_request.clone()).await?;
-        let two = backend.acquire(two_request.clone()).await?;
-        proxy.bind_source(one.egress_source_ipv4().context("missing guest source address")?).await?;
-        other.bind_source(two.egress_source_ipv4().context("missing guest source address")?).await?;
+        let (one, one_source) = backend.acquire_egress(one_request.clone(), proxy.endpoints()).await?;
+        let (two, two_source) = backend.acquire_egress(two_request.clone(), other.endpoints()).await?;
+        proxy.bind_source(one_source).await?;
+        other.bind_source(two_source).await?;
         let setup = r#"
 import os, ssl, urllib.request, urllib.error, socket
 assert os.environ['TEST_API_KEY'].startswith('exo_egress_')
@@ -704,8 +721,8 @@ print('PASS transparent Python and curl HTTPS, anonymous host, wrong host/SNI, D
 #[ignore = "requires Firecracker artifacts; macOS also requires EXO_EGRESS_BRIDGE_BINARY in Lima"]
 async fn managed_firecracker_egress_live() -> Result<()> {
     use crate::{
-        ManagedSandboxBackend, SandboxCommand, SandboxLifecycleConfig, SandboxNetworkPolicy,
-        SandboxRequest, SandboxResourceShape, SandboxScope, SandboxSpec,
+        ManagedSandboxBackend, SandboxCommand, SandboxLifecycleConfig, SandboxRequest,
+        SandboxResourceShape, SandboxScope, SandboxSpec,
     };
     let mut config = crate::FirecrackerConfig::default();
     let state_root = format!(
@@ -727,18 +744,16 @@ async fn managed_firecracker_egress_live() -> Result<()> {
     };
     #[cfg(target_os = "macos")]
     let instance = lima.instance.clone();
-    let raw = crate::firecracker_backend(config, lima).await?;
+    let raw = crate::firecracker_egress_provider(config, lima).await?;
     let upstream = Upstream::start().await?;
     let resolver = TestResolver::new();
     let make_backend = || {
-        let mut backend =
-            EgressSandboxBackend::new(raw.clone(), policy().networking, resolver.clone());
+        let mut backend = FirecrackerEgressBackend::new(raw.clone(), Some(resolver.clone()));
         backend.upstream = Some(upstream.config.clone());
         backend
     };
     let backend = make_backend();
     let request = SandboxRequest {
-        egress_proxy: None,
         sandbox_id: "managed-egress-live".into(),
         scope: Some(SandboxScope::Thread {
             thread_id: "managed-live".into(),
@@ -749,7 +764,7 @@ async fn managed_firecracker_egress_live() -> Result<()> {
             resources: SandboxResourceShape::new(1, 512).unwrap(),
             mounts: vec![],
             durable_file_systems: vec![],
-            network: SandboxNetworkPolicy::Unrestricted,
+            policy: policy(),
             default_workdir: "/home/exo/workspace".into(),
         },
         lifecycle: SandboxLifecycleConfig {
@@ -861,4 +876,40 @@ print('PASS reconnect retains VM files and rejects the previous placeholder')
         ensure!(status.success(), "test state cleanup failed: {state_root}");
     }
     result
+}
+
+#[tokio::test]
+async fn configured_listener_advertises_a_separate_address_and_binds_source() {
+    use super::transport::{EgressTransport, LocalEgressTransport};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let advertised_address = Ipv4Addr::new(192, 0, 2, 2);
+    let transport = LocalEgressTransport::with_config(
+        crate::EgressListenConfig {
+            bind_address: Ipv4Addr::LOCALHOST,
+            advertised_address,
+            http_port: 0,
+            https_port: 0,
+            dns_port: 0,
+        },
+        &["api.example.com".into()],
+    )
+    .await
+    .unwrap();
+    let endpoints = transport.endpoints();
+    for endpoint in [endpoints.http, endpoints.https, endpoints.dns] {
+        assert_eq!(*endpoint.ip(), advertised_address);
+        assert_ne!(endpoint.port(), 0);
+    }
+    transport.bind_source(Ipv4Addr::LOCALHOST).await.unwrap();
+    assert!(transport.bind_source(Ipv4Addr::LOCALHOST).await.is_err());
+    let mut client = tokio::net::TcpStream::connect((Ipv4Addr::LOCALHOST, endpoints.https.port()))
+        .await
+        .unwrap();
+    let mut stream = transport.accept(true).await.unwrap();
+    client.write_all(b"request").await.unwrap();
+    let mut buffer = [0; 7];
+    stream.read_exact(&mut buffer).await.unwrap();
+    assert_eq!(&buffer, b"request");
+    transport.close();
+    assert!(transport.accept(true).await.is_err());
 }

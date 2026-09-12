@@ -178,7 +178,10 @@ impl ManagedSandboxBackend for SpritesSandboxBackend {
     }
 
     async fn acquire(&self, request: SandboxRequest) -> Result<Arc<dyn ManagedSandboxHandle>> {
-        request.reject_egress_proxy()?;
+        request.spec.policy.validate_basic("sprites")?;
+        if request.spec.policy.networking == crate::SandboxNetworkPolicy::Disabled {
+            bail!("Sprites does not support policy.networking.disabled");
+        }
         reject_host_mounts(&request)?;
         let sprite_name = sprite_name_for_request(&request);
         self.ensure_sprite(&sprite_name, &request).await?;
@@ -203,7 +206,10 @@ impl ManagedSandboxBackend for SpritesSandboxBackend {
         request: SandboxRequest,
         payload: SnapshotPayload,
     ) -> Result<Arc<dyn ManagedSandboxHandle>> {
-        request.reject_egress_proxy()?;
+        request.spec.policy.validate_basic("sprites")?;
+        if request.spec.policy.networking == crate::SandboxNetworkPolicy::Disabled {
+            bail!("Sprites does not support policy.networking.disabled");
+        }
         reject_host_mounts(&request)?;
         if payload.format != SnapshotFormat::SpritesRef {
             bail!(

@@ -9,7 +9,7 @@ pub fn default_vercel_image() -> String {
     DEFAULT_VERCEL_IMAGE.to_string()
 }
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -71,6 +71,7 @@ impl VercelSandboxBackend {
     async fn get_sandbox_session(
         &self,
         name: &str,
+        resume: bool,
     ) -> Result<Option<VercelSandboxSessionResponse>> {
         let response = self
             .client
@@ -78,7 +79,7 @@ impl VercelSandboxBackend {
             .query(&[
                 ("teamId", self.team_id.as_str()),
                 ("projectId", self.project_id.as_str()),
-                ("resume", "true"),
+                ("resume", if resume { "true" } else { "false" }),
             ])
             .send()
             .await
@@ -94,6 +95,30 @@ impl VercelSandboxBackend {
         Ok(Some(response.json().await.with_context(|| {
             format!("decoding Vercel sandbox {name}")
         })?))
+    }
+
+    async fn update_network_policy(&self, name: &str, policy: VercelNetworkPolicy) -> Result<()> {
+        let response = self
+            .client
+            .patch(self.api_endpoint(&format!("/v2/sandboxes/{name}")))
+            .query(&[
+                ("teamId", self.team_id.as_str()),
+                ("projectId", self.project_id.as_str()),
+            ])
+            .json(&VercelPolicyUpdate {
+                network_policy: policy,
+            })
+            .send()
+            .await
+            .context("applying Vercel sandbox network policy")?;
+        let status = response.status();
+        if !status.is_success() {
+            bail!(
+                "Vercel network policy update failed ({status}): {}",
+                response.text().await?
+            );
+        }
+        Ok(())
     }
 
     async fn create_sandbox(
@@ -124,15 +149,7 @@ impl VercelSandboxBackend {
             timeout: request.lifecycle.idle_ttl.map(duration_to_millis),
             env: HashMap::new(),
             tags,
-            network_policy: match &request.spec.network {
-                SandboxNetworkPolicy::Limited { .. } => {
-                    bail!("Vercel limited networking is not implemented")
-                }
-                SandboxNetworkPolicy::Unrestricted => None,
-                SandboxNetworkPolicy::Disabled => Some(VercelNetworkPolicy {
-                    mode: "deny-all".to_string(),
-                }),
-            },
+            network_policy: VercelNetworkPolicy::from_policy(&request.spec.policy)?,
         };
 
         let response = self
@@ -166,12 +183,18 @@ impl ManagedSandboxBackend for VercelSandboxBackend {
     }
 
     async fn acquire(&self, request: SandboxRequest) -> Result<Arc<dyn ManagedSandboxHandle>> {
-        request.reject_egress_proxy()?;
+        let network_policy = VercelNetworkPolicy::from_policy(&request.spec.policy)?;
         reject_unsupported_mounts(&request)?;
         let spec_hash = sandbox_spec_hash(&request.spec);
         let sandbox_name = vercel_sandbox_name(&request, &spec_hash);
-        let response = match self.get_sandbox_session(&sandbox_name).await? {
-            Some(existing) => existing,
+        let response = match self.get_sandbox_session(&sandbox_name, false).await? {
+            Some(_) => {
+                self.update_network_policy(&sandbox_name, network_policy)
+                    .await?;
+                self.get_sandbox_session(&sandbox_name, true)
+                    .await?
+                    .context("Vercel sandbox disappeared while resuming")?
+            }
             None => {
                 self.create_sandbox(&request, &sandbox_name, &spec_hash)
                     .await?
@@ -181,7 +204,10 @@ impl ManagedSandboxBackend for VercelSandboxBackend {
         Ok(Arc::new(VercelSandboxHandle {
             id: format!("vercel:{sandbox_name}"),
             sandbox_name,
-            session_id: response.session.id,
+            session_id: response
+                .session
+                .context("Vercel sandbox did not return a running session")?
+                .id,
             request,
             backend: self.handle_backend(),
         }))
@@ -684,18 +710,75 @@ struct VercelCreateSandboxRequest {
     timeout: Option<u64>,
     env: HashMap<String, String>,
     tags: HashMap<String, String>,
-    #[serde(rename = "networkPolicy", skip_serializing_if = "Option::is_none")]
-    network_policy: Option<VercelNetworkPolicy>,
+    #[serde(rename = "networkPolicy")]
+    network_policy: VercelNetworkPolicy,
 }
 
 #[derive(Debug, Serialize)]
 struct VercelNetworkPolicy {
-    mode: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    mode: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    allow: Option<BTreeMap<String, Vec<VercelNetworkRule>>>,
+}
+
+#[derive(Debug, Serialize)]
+struct VercelNetworkRule {
+    transform: Vec<VercelHeaderTransform>,
+}
+
+#[derive(Debug, Serialize)]
+struct VercelHeaderTransform {
+    headers: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Serialize)]
+struct VercelPolicyUpdate {
+    #[serde(rename = "networkPolicy")]
+    network_policy: VercelNetworkPolicy,
+}
+
+impl VercelNetworkPolicy {
+    fn from_policy(policy: &crate::EgressPolicy) -> Result<Self> {
+        if !policy.credentials.is_empty() {
+            bail!(
+                "Vercel does not support policy.credentials placeholder substitution; its native transforms set whole header values"
+            );
+        }
+        match &policy.networking {
+            SandboxNetworkPolicy::Unrestricted => Ok(Self {
+                mode: Some("allow-all"),
+                allow: None,
+            }),
+            SandboxNetworkPolicy::Disabled => Ok(Self {
+                mode: Some("deny-all"),
+                allow: None,
+            }),
+            SandboxNetworkPolicy::Limited { allowed_hosts } => {
+                let mut allow = BTreeMap::new();
+                for host in allowed_hosts {
+                    let host = crate::sandbox::canonical_egress_host(host)?;
+                    allow.insert(
+                        host.clone(),
+                        vec![VercelNetworkRule {
+                            transform: vec![VercelHeaderTransform {
+                                headers: BTreeMap::from([("Host".to_string(), host)]),
+                            }],
+                        }],
+                    );
+                }
+                Ok(Self {
+                    mode: None,
+                    allow: Some(allow),
+                })
+            }
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
 struct VercelSandboxSessionResponse {
-    session: VercelSession,
+    session: Option<VercelSession>,
 }
 
 #[derive(Debug, Deserialize)]

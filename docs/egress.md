@@ -1,6 +1,10 @@
 # Sandbox egress
 
-The egress backend wraps a Firecracker sandbox in a transparent HTTP/HTTPS
+Sandbox policy is part of `SandboxSpec`. Each backend enforces the policy when
+it acquires, attaches, or restores a sandbox, before returning a usable handle.
+Unsupported policies fail with an error identifying the unsupported field.
+
+Firecracker implements credential substitution with a transparent HTTP/HTTPS
 proxy. Programs receive placeholder environment variables; the proxy resolves
 credentials outside the VM and substitutes them on authorized requests.
 
@@ -68,9 +72,6 @@ Binding names are scoped references, not storage IDs. Two threads can both
 request `notion` and resolve different secrets. Implement `EgressCredentialResolver`:
 
 ```rust
-async fn bindings(&self, identity: &EgressIdentity)
-    -> anyhow::Result<Vec<EgressCredentialBinding>>;
-
 async fn resolve(
     &self,
     identity: &EgressIdentity,
@@ -79,7 +80,8 @@ async fn resolve(
 ) -> anyhow::Result<String>;
 ```
 
-Bindings are selected when the proxy starts. Each use is resolved again, so
+The caller selects bindings in `request.spec.policy.credentials`. Each use is
+resolved again, so
 rotation and revocation take effect without replacing the sandbox. Identity
 includes the sandbox ID and agent/thread scope; destination includes the host,
 port, method, and normalized path/query. A vault adapter can pin a binding to a
@@ -89,7 +91,8 @@ resolvers must supply their own authorization. Resolver failures are sanitized
 before returning them to the guest.
 
 ```rust
-let backend = EgressSandboxBackend::new(backend, networking, resolver);
+let backend = firecracker_backend_with_credentials(config, lima, resolver).await?;
+request.spec.policy = policy;
 let sandbox = backend.acquire(request).await?;
 let output = sandbox.exec(&command).await?;
 ```
@@ -110,12 +113,60 @@ and HTTP Host, and does not follow redirects. Requests are bounded to 8 MiB;
 responses stream, including SSE. Allowed upstreams can still return sensitive
 values in their responses.
 
-Listener addresses live in `SandboxRequest.egress_proxy`, outside the spec hash.
-`backend.shutdown()` closes egress while retaining the VM. A fresh wrapper can
-reacquire it with new listeners, trust, and placeholders; existing client
-processes must restart to receive those values. `stop` and `terminate` preserve
-the provider's lifecycle behavior. Source-IP binding assumes local traffic
-before NAT; a hosted relay needs an authenticated sandbox identity.
+`CreateSandboxRequest.policy` supplies the policy through the Exoharness API.
+`BasicExoHarnessConfig.sandbox_policy` supplies a default, including for the
+CLI's `--egress-policy`. The selected policy is persisted with the sandbox and
+included in its spec hash. Changing the default does not rewrite existing
+sandboxes. Binding values and proxy listener addresses are never in the policy.
+
+The Firecracker backend creates its listeners during acquisition. On Linux,
+`FirecrackerConfig.egress_listen` can control where they bind and which address
+the VM uses to reach them:
+
+```rust
+config.egress_listen = Some(EgressListenConfig {
+    bind_address: "0.0.0.0".parse()?,
+    advertised_address: "10.0.0.10".parse()?,
+    http_port: 0,
+    https_port: 0,
+    dns_port: 0,
+});
+```
+
+Use an address routed from the guest network. Zero ports allocate dynamically;
+fixed ports must be unique for each active sandbox on that address. With
+Lima, this configuration applies inside the Linux VM. Without an explicit
+configuration, the local transport selects the host's routed IPv4 address.
+
+`FirecrackerEgressBackend` owns the proxy lifecycle. Its `shutdown()` closes
+egress while retaining the VM. A fresh backend can reacquire it with new
+listeners, trust, and placeholders; existing client processes must restart to
+receive those values. `stop` and `terminate` preserve the provider's lifecycle
+behavior. Low-level callers that already own their proxy can pass endpoints to
+`FirecrackerSandboxBackend::acquire_request(FirecrackerRequest)`.
+
+A hosted backend can implement `ManagedSandboxBackend::acquire` itself: choose
+the sandbox node, establish an authenticated relay to the credential service,
+install routing, and only then return a handle. No proxy hooks are required on
+the shared sandbox traits. The credential service can run inside Loop while
+the node relays opaque streams. Relay authorization must bind the stream to the
+sandbox allocation and its generation; raw source-IP binding is only suitable
+before NAT on a trusted local host. The production relay is not implemented here.
+
+## Other backends
+
+Vercel translates unrestricted, disabled, and exact-host policies to its native
+network policy. Exact-host rules pin the HTTP Host header. Acquisition updates
+an existing sandbox's policy before resuming its session; a failed update prevents
+resume. Placeholder credential bindings are rejected: native header transforms
+set whole values and do not implement Exo's per-request credential resolution.
+A Vercel forwarding adapter would be a separate implementation.
+
+Docker, Apple Containers, smolvm, E2B, and Daytona retain their existing enabled /
+disabled networking support. They reject limited networking and credential
+bindings. Local processes, Sprites, and AWS AgentCore only accept unrestricted
+networking. Docker attachments also reject disabled networking because Exo does
+not control the attached container's network.
 
 ## Current scope
 
@@ -125,8 +176,8 @@ the types but rejected until implemented. Standard ports 80/443 are supported;
 local gateways on other ports need additional transport support. Model
 credential bindings are not inferred automatically.
 
-Apple Containers, smolvm, AWS, snapshots/forks, external attachments, and
-one-shot sandboxes are unsupported. HTTP/2, WebSockets, arbitrary TCP, Git Basic
+Firecracker proxy policies do not yet support snapshots/forks, external
+attachments, or one-shot sandboxes. HTTP/2, WebSockets, arbitrary TCP, Git Basic
 auth encoding, and signed requests are also outside this initial implementation.
 
 ## Tests

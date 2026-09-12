@@ -90,27 +90,6 @@ pub struct SandboxBackendRegistration {
 }
 
 impl SandboxBackendRegistration {
-    #[cfg(feature = "egress-proxy")]
-    pub fn with_egress(self, policy: crate::EgressPolicy) -> Self {
-        Self::from_factory(self.provider, self.is_local, move |inner| {
-            let factory = self.factory.clone();
-            let policy = policy.clone();
-            Box::pin(async move {
-                let backend = factory(inner).await?;
-                let resolver = Arc::new(LocalEgressResolver {
-                    storage: inner.storage.clone(),
-                    cipher: inner.secret_cipher.clone(),
-                    bindings: policy.credentials,
-                });
-                Ok(Arc::new(crate::egress::EgressSandboxBackend::new(
-                    backend,
-                    policy.networking,
-                    resolver,
-                )) as Arc<dyn ManagedSandboxBackend>)
-            })
-        })
-    }
-
     pub fn from_builtin_provider(provider: SandboxProvider) -> Result<Self> {
         match provider.as_str() {
             "apple_container" => Ok(Self::apple_container()),
@@ -159,9 +138,24 @@ impl SandboxBackendRegistration {
         Self::from_factory(
             SandboxProvider::Firecracker,
             cfg!(any(target_os = "linux", target_os = "macos")),
-            move |_| {
+            move |_inner| {
                 let spec = spec.clone();
-                Box::pin(crate::firecracker_backend(spec.config, spec.lima))
+                #[cfg(feature = "egress-proxy")]
+                {
+                    let resolver = Arc::new(LocalEgressResolver {
+                        storage: _inner.storage.clone(),
+                        cipher: _inner.secret_cipher.clone(),
+                    });
+                    Box::pin(crate::firecracker_backend_with_credentials(
+                        spec.config,
+                        spec.lima,
+                        resolver,
+                    ))
+                }
+                #[cfg(not(feature = "egress-proxy"))]
+                {
+                    Box::pin(crate::firecracker_backend(spec.config, spec.lima))
+                }
             },
         )
     }
@@ -422,6 +416,7 @@ pub struct BasicExoHarnessConfig {
     pub secret_backend: SecretBackendChoice,
     /// Default when a caller doesn't request a provider. Must be in `sandbox_backends`.
     pub sandbox_default: SandboxProvider,
+    pub sandbox_policy: Option<crate::EgressPolicy>,
     /// Supported providers; anything not listed is rejected.
     pub sandbox_backends: Vec<SandboxBackendRegistration>,
 }
@@ -436,6 +431,7 @@ struct BasicExoHarnessInner {
     write_lock: AsyncMutex<()>,
     subscribers: Mutex<HashMap<ConversationId, Vec<mpsc::UnboundedSender<Result<Event>>>>>,
     sandbox_registry: HashMap<SandboxProvider, SandboxBackendRegistration>,
+    sandbox_policy: Option<crate::EgressPolicy>,
     /// Backends built (and secrets read) lazily on first use, cached by provider.
     sandbox_backends: AsyncMutex<HashMap<SandboxProvider, Arc<dyn ManagedSandboxBackend>>>,
     running_sandboxes: AsyncMutex<HashMap<SandboxId, Arc<dyn ManagedSandboxHandle>>>,
@@ -919,6 +915,7 @@ impl BasicExoHarness {
             secret_backend,
             sandbox_default,
             sandbox_backends,
+            sandbox_policy,
         } = config;
 
         let mut registry = HashMap::new();
@@ -945,6 +942,7 @@ impl BasicExoHarness {
                 storage,
                 write_lock: AsyncMutex::new(()),
                 subscribers: Mutex::new(HashMap::new()),
+                sandbox_policy,
                 sandbox_registry: registry,
                 sandbox_backends: AsyncMutex::new(cache),
                 running_sandboxes: AsyncMutex::new(HashMap::new()),
@@ -2049,7 +2047,13 @@ impl<'a> BasicScopedSandboxHandle<'a> {
             default_workdir: Some(request.default_workdir.unwrap_or_default()),
             file_system_mounts: Vec::new(),
             durable_file_systems: Vec::new(),
-            enable_networking: true,
+            policy: self.harness.inner.sandbox_policy.clone(),
+            enable_networking: self
+                .harness
+                .inner
+                .sandbox_policy
+                .as_ref()
+                .is_none_or(|policy| policy.networking != SandboxNetworkPolicy::Disabled),
             idle_seconds: 0,
             running: true,
             latest_snapshot_id: None,
@@ -2444,6 +2448,7 @@ impl<'a> BasicScopedSandboxHandle<'a> {
                 default_workdir: sandbox.default_workdir.unwrap_or_default(),
                 file_system_mounts: sandbox.file_system_mounts,
                 durable_file_systems: sandbox.durable_file_systems,
+                policy: sandbox.policy.clone(),
                 enable_networking: sandbox.enable_networking,
                 idle_seconds: sandbox.idle_seconds,
             },
@@ -2566,6 +2571,7 @@ impl<'a> BasicScopedSandboxHandle<'a> {
                 || default_workdir != request.default_workdir.clone().unwrap_or_default()
                 || file_system_mounts != request.file_system_mounts
                 || durable_file_systems != request.durable_file_systems
+                || sandbox.policy != request.policy
                 || enable_networking != request.enable_networking
                 || idle_seconds != request.idle_seconds
             {
@@ -3497,6 +3503,18 @@ async fn prepare_sandbox_request(
         request.image.clone()
     };
 
+    let policy = request
+        .policy
+        .or_else(|| harness.inner.sandbox_policy.clone());
+    if let (Some(policy), Some(enabled)) = (&policy, request.enable_networking)
+        && enabled == matches!(policy.networking, SandboxNetworkPolicy::Disabled)
+    {
+        bail!("enable_networking conflicts with sandbox policy.networking");
+    }
+    let enable_networking = policy
+        .as_ref()
+        .map(|p| p.networking != SandboxNetworkPolicy::Disabled)
+        .unwrap_or(request.enable_networking.unwrap_or(true));
     Ok(PreparedSandboxRequest {
         name: request.name,
         provider: request.provider,
@@ -3505,7 +3523,8 @@ async fn prepare_sandbox_request(
         default_workdir: request.default_workdir,
         file_system_mounts: request.file_system_mounts.unwrap_or_default(),
         durable_file_systems: request.durable_file_systems.unwrap_or_default(),
-        enable_networking: request.enable_networking.unwrap_or(true),
+        policy,
+        enable_networking,
         idle_seconds: request.idle_seconds.unwrap_or(60),
     })
 }
@@ -3539,6 +3558,7 @@ async fn find_matching_stored_sandbox(
             || sandbox.default_workdir != request.default_workdir
             || sandbox.file_system_mounts != request.file_system_mounts
             || sandbox.durable_file_systems != request.durable_file_systems
+            || sandbox.policy != request.policy
             || sandbox.enable_networking != request.enable_networking
             || sandbox.idle_seconds != request.idle_seconds
         {
@@ -3943,6 +3963,8 @@ struct StoredSandbox {
     file_system_mounts: Vec<FileSystemMount>,
     #[serde(default)]
     durable_file_systems: Vec<DurableFileSystem>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    policy: Option<crate::EgressPolicy>,
     enable_networking: bool,
     idle_seconds: u64,
     running: bool,
@@ -3972,6 +3994,7 @@ struct PreparedSandboxRequest {
     default_workdir: Option<String>,
     file_system_mounts: Vec<FileSystemMount>,
     durable_file_systems: Vec<DurableFileSystem>,
+    policy: Option<crate::EgressPolicy>,
     enable_networking: bool,
     idle_seconds: u64,
 }
@@ -3988,6 +4011,7 @@ impl PreparedSandboxRequest {
             default_workdir: self.default_workdir.clone(),
             file_system_mounts: self.file_system_mounts.clone(),
             durable_file_systems: self.durable_file_systems.clone(),
+            policy: self.policy.clone(),
             enable_networking: self.enable_networking,
             idle_seconds: self.idle_seconds,
             running: true,
@@ -4443,7 +4467,6 @@ fn sandbox_request(
     provider_state: Option<Value>,
 ) -> SandboxRequest {
     SandboxRequest {
-        egress_proxy: None,
         sandbox_id: sandbox_id.to_string(),
         scope: Some(match owner {
             SandboxOwner::Agent(agent_id) => SandboxScope::Agent {
@@ -4470,11 +4493,13 @@ fn sandbox_request(
                 })
                 .collect(),
             durable_file_systems: sandbox.durable_file_systems.clone(),
-            network: if sandbox.enable_networking {
-                SandboxNetworkPolicy::Unrestricted
-            } else {
-                SandboxNetworkPolicy::Disabled
-            },
+            policy: sandbox.policy.clone().unwrap_or_else(|| {
+                if sandbox.enable_networking {
+                    SandboxNetworkPolicy::Unrestricted.into()
+                } else {
+                    SandboxNetworkPolicy::Disabled.into()
+                }
+            }),
             default_workdir: sandbox
                 .default_workdir
                 .clone()
@@ -4850,19 +4875,11 @@ fn build_secret_cipher(
 struct LocalEgressResolver {
     storage: BasicObjectStore,
     cipher: SecretCipher,
-    bindings: Vec<crate::EgressCredentialBinding>,
 }
 
 #[cfg(feature = "egress-proxy")]
 #[async_trait]
 impl crate::egress::EgressCredentialResolver for LocalEgressResolver {
-    async fn bindings(
-        &self,
-        _identity: &crate::egress::EgressIdentity,
-    ) -> Result<Vec<crate::EgressCredentialBinding>> {
-        Ok(self.bindings.clone())
-    }
-
     async fn resolve(
         &self,
         _identity: &crate::egress::EgressIdentity,

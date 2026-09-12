@@ -89,7 +89,7 @@ pub use firecracker::{
     DEFAULT_FIRECRACKER_KERNEL, DEFAULT_FIRECRACKER_STATE_ROOT, DEFAULT_IMAGE_SIZE_GIB,
     DEFAULT_JAILER_UID_BASE, DEFAULT_MEMORY_MIB, DEFAULT_NETWORK_BYTES_PER_SECOND,
     DEFAULT_VCPU_COUNT, DEFAULT_WORKSPACE_SIZE_GIB, FirecrackerConfig,
-    FirecrackerNetworkDevicePolicy, FirecrackerSandboxBackend,
+    FirecrackerNetworkDevicePolicy, FirecrackerRequest, FirecrackerSandboxBackend,
 };
 #[cfg(all(not(target_arch = "wasm32"), feature = "firecracker"))]
 pub use firecracker_bridge::run_firecracker_bridge;
@@ -117,7 +117,11 @@ impl Default for FirecrackerLimaConfig {
     }
 }
 
-#[cfg(all(not(target_arch = "wasm32"), feature = "firecracker"))]
+#[cfg(all(
+    not(target_arch = "wasm32"),
+    feature = "firecracker",
+    not(feature = "egress-proxy")
+))]
 pub async fn firecracker_backend(
     config: FirecrackerConfig,
     lima: FirecrackerLimaConfig,
@@ -139,6 +143,64 @@ pub async fn firecracker_backend(
         drop(lima);
         anyhow::bail!("Firecracker sandbox execution is only supported on Linux or macOS with Lima")
     }
+}
+
+#[cfg(all(
+    not(target_arch = "wasm32"),
+    feature = "firecracker",
+    feature = "egress-proxy"
+))]
+pub async fn firecracker_egress_provider(
+    config: FirecrackerConfig,
+    lima: FirecrackerLimaConfig,
+) -> anyhow::Result<Arc<dyn crate::egress::FirecrackerEgressProvider>> {
+    #[cfg(target_os = "linux")]
+    {
+        drop(lima);
+        Ok(Arc::new(FirecrackerSandboxBackend::new(config).await?))
+    }
+    #[cfg(target_os = "macos")]
+    {
+        Ok(Arc::new(
+            firecracker_lima::LimaFirecrackerSandboxBackend::new(config, lima).await?,
+        ))
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        drop((config, lima));
+        anyhow::bail!("Firecracker sandbox execution requires Linux or macOS with Lima")
+    }
+}
+
+#[cfg(all(
+    not(target_arch = "wasm32"),
+    feature = "firecracker",
+    feature = "egress-proxy"
+))]
+pub async fn firecracker_backend(
+    config: FirecrackerConfig,
+    lima: FirecrackerLimaConfig,
+) -> anyhow::Result<FirecrackerBackend> {
+    Ok(Arc::new(crate::egress::FirecrackerEgressBackend::new(
+        firecracker_egress_provider(config, lima).await?,
+        None,
+    )))
+}
+
+#[cfg(all(
+    not(target_arch = "wasm32"),
+    feature = "firecracker",
+    feature = "egress-proxy"
+))]
+pub async fn firecracker_backend_with_credentials(
+    config: FirecrackerConfig,
+    lima: FirecrackerLimaConfig,
+    resolver: Arc<dyn crate::egress::EgressCredentialResolver>,
+) -> anyhow::Result<FirecrackerBackend> {
+    Ok(Arc::new(crate::egress::FirecrackerEgressBackend::new(
+        firecracker_egress_provider(config, lima).await?,
+        Some(resolver),
+    )))
 }
 
 #[cfg(all(test, not(target_arch = "wasm32"), feature = "firecracker"))]

@@ -9,7 +9,7 @@ use std::process::Stdio;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{Context, Result, anyhow, bail, ensure};
 use async_trait::async_trait;
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
@@ -23,6 +23,7 @@ use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 use uuid::Uuid;
 
 use crate::{DurableFileSystem, SandboxAttachment, SandboxId};
+pub use crate::{EgressPolicy, SandboxNetworkPolicy};
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum SandboxScope {
@@ -54,45 +55,17 @@ pub struct SandboxMount {
     pub internal: bool,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
-pub enum SandboxNetworkPolicy {
-    Unrestricted,
-    Disabled,
-    Limited { allowed_hosts: Vec<String> },
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct EgressPolicy {
-    pub networking: SandboxNetworkPolicy,
+pub struct EgressListenConfig {
+    pub bind_address: std::net::Ipv4Addr,
+    pub advertised_address: std::net::Ipv4Addr,
     #[serde(default)]
-    pub credentials: Vec<EgressCredentialBinding>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct EgressCredentialBinding {
-    pub name: String,
-    pub environment_variable: String,
-    pub networking: CredentialNetworkPolicy,
-    pub injection_location: CredentialInjectionLocation,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
-pub enum CredentialNetworkPolicy {
-    Unrestricted,
-    Limited { allowed_hosts: Vec<String> },
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct CredentialInjectionLocation {
+    pub http_port: u16,
     #[serde(default)]
-    pub header: bool,
+    pub https_port: u16,
     #[serde(default)]
-    pub body: bool,
+    pub dns_port: u16,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -136,14 +109,12 @@ pub struct SandboxSpec {
     pub resources: crate::SandboxResourceShape,
     pub mounts: Vec<SandboxMount>,
     pub durable_file_systems: Vec<DurableFileSystem>,
-    pub network: SandboxNetworkPolicy,
+    pub policy: EgressPolicy,
     pub default_workdir: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SandboxRequest {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub egress_proxy: Option<SandboxEgressProxy>,
     pub sandbox_id: SandboxId,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scope: Option<SandboxScope>,
@@ -152,12 +123,15 @@ pub struct SandboxRequest {
     pub provider_state: Option<Value>,
 }
 
-impl SandboxRequest {
-    pub(crate) fn reject_egress_proxy(&self) -> Result<()> {
-        if self.egress_proxy.is_some() {
-            bail!("sandbox provider cannot enforce proxy egress; use Firecracker");
+impl EgressPolicy {
+    pub(crate) fn validate_basic(&self, provider: &str) -> Result<()> {
+        if !self.credentials.is_empty() {
+            bail!("{provider} does not support policy.credentials");
         }
-        self.spec.network.reject_limited()
+        if matches!(self.networking, SandboxNetworkPolicy::Limited { .. }) {
+            bail!("{provider} does not support policy.networking.limited");
+        }
+        Ok(())
     }
 }
 
@@ -271,10 +245,6 @@ impl std::str::FromStr for SnapshotFormat {
 
 #[async_trait]
 pub trait ManagedSandboxHandle: Send + Sync {
-    fn egress_source_ipv4(&self) -> Option<std::net::Ipv4Addr> {
-        None
-    }
-
     fn id(&self) -> &str;
 
     fn provider_state(&self) -> Option<Value> {
@@ -362,14 +332,6 @@ pub struct ResolvedSandboxImage {
 
 #[async_trait]
 pub trait ManagedSandboxBackend: Send + Sync {
-    #[cfg(feature = "egress-proxy")]
-    async fn egress_transport(
-        &self,
-        _allowed_hosts: &[String],
-    ) -> Result<Arc<dyn crate::egress::EgressTransport>> {
-        bail!("sandbox provider cannot enforce proxy egress; use Firecracker")
-    }
-
     fn is_local(&self) -> bool;
 
     /// Formats this backend can consume in `acquire_from_snapshot`.
@@ -379,6 +341,8 @@ pub trait ManagedSandboxBackend: Send + Sync {
         bail!("sandbox backend does not expose image configuration")
     }
 
+    /// Enforce `request.spec.policy` before returning a usable handle. Attach,
+    /// restore, and fork must provide the same guarantee or reject the policy.
     async fn acquire(&self, request: SandboxRequest) -> Result<Arc<dyn ManagedSandboxHandle>>;
     async fn attach(
         &self,
@@ -691,7 +655,10 @@ impl CliContainerSandboxBackend {
             &request.spec.durable_file_systems,
         )?;
         self.ensure_system_started().await?;
-        if matches!(request.spec.network, SandboxNetworkPolicy::Unrestricted) {
+        if matches!(
+            request.spec.policy.networking,
+            SandboxNetworkPolicy::Unrestricted
+        ) {
             self.ensure_default_network_created().await?;
         }
 
@@ -717,7 +684,6 @@ impl CliContainerSandboxBackend {
         )?);
 
         Ok(SandboxRequest {
-            egress_proxy: None,
             sandbox_id: request.sandbox_id,
             scope: request.scope,
             spec: SandboxSpec {
@@ -729,7 +695,7 @@ impl CliContainerSandboxBackend {
                 resources: request.spec.resources,
                 mounts,
                 durable_file_systems: request.spec.durable_file_systems,
-                network: request.spec.network,
+                policy: request.spec.policy,
                 default_workdir: request.spec.default_workdir,
             },
             lifecycle: request.lifecycle,
@@ -783,7 +749,7 @@ impl ManagedSandboxBackend for CliContainerSandboxBackend {
     }
 
     async fn acquire(&self, request: SandboxRequest) -> Result<Arc<dyn ManagedSandboxHandle>> {
-        request.reject_egress_proxy()?;
+        request.spec.policy.validate_basic("container sandbox")?;
         let request = self.prepare_request(request).await?;
 
         if request.lifecycle.idle_ttl.is_none() {
@@ -854,7 +820,11 @@ impl ManagedSandboxBackend for CliContainerSandboxBackend {
         request: SandboxRequest,
         attachment: SandboxAttachment,
     ) -> Result<Arc<dyn ManagedSandboxHandle>> {
-        request.reject_egress_proxy()?;
+        request.spec.policy.validate_basic("container sandbox")?;
+        ensure!(
+            request.spec.policy.networking == SandboxNetworkPolicy::Unrestricted,
+            "Docker attachments cannot enforce policy.networking.disabled"
+        );
         if self.cli != ContainerCliFlavor::Docker {
             bail!("Docker container attachments require the Docker sandbox provider");
         }
@@ -874,7 +844,7 @@ impl ManagedSandboxBackend for CliContainerSandboxBackend {
         request: SandboxRequest,
         payload: SnapshotPayload,
     ) -> Result<Arc<dyn ManagedSandboxHandle>> {
-        request.reject_egress_proxy()?;
+        request.spec.policy.validate_basic("container sandbox")?;
         if request.lifecycle.idle_ttl.is_none() {
             bail!("restore-from-snapshot requires a warm sandbox lifecycle (idle_ttl must be set)");
         }
@@ -1000,7 +970,7 @@ impl ManagedSandboxHandle for OneShotSandboxHandle {
         exec_one_shot(
             &self.container_bin,
             &self.request.spec,
-            network_name_for_policy(&self.request.spec.network),
+            network_name_for_policy(&self.request.spec.policy.networking),
             command,
         )
         .await
@@ -1010,7 +980,7 @@ impl ManagedSandboxHandle for OneShotSandboxHandle {
         start_one_shot_process(
             &self.container_bin,
             &self.request.spec,
-            network_name_for_policy(&self.request.spec.network),
+            network_name_for_policy(&self.request.spec.policy.networking),
             command,
         )
         .await
@@ -1157,7 +1127,11 @@ impl ManagedSandboxBackend for LocalProcessSandboxBackend {
     }
 
     async fn acquire(&self, request: SandboxRequest) -> Result<Arc<dyn ManagedSandboxHandle>> {
-        request.reject_egress_proxy()?;
+        request.spec.policy.validate_basic("local process")?;
+        ensure!(
+            request.spec.policy.networking == SandboxNetworkPolicy::Unrestricted,
+            "local process does not support policy.networking.disabled"
+        );
         if !request.spec.durable_file_systems.is_empty() {
             bail!("local-process sandbox backend does not support durable file systems");
         }
@@ -1446,7 +1420,7 @@ async fn create_named_warm_sandbox(
 
     configure_network_args(
         &mut process,
-        &request.spec.network,
+        &request.spec.policy.networking,
         Some(DEFAULT_ENABLED_NETWORK_NAME),
     )?;
     configure_mount_args(&mut process, &request.spec.mounts);
@@ -1747,7 +1721,7 @@ async fn exec_one_shot(
 
     let mut process = Command::new(container_bin);
     process.arg("run").arg("--rm").arg("--workdir").arg(&cwd);
-    configure_network_args(&mut process, &spec.network, network_name)?;
+    configure_network_args(&mut process, &spec.policy.networking, network_name)?;
     configure_mount_args(&mut process, &spec.mounts);
     configure_env_args(&mut process, &command.env);
     process.arg(&spec.image);
@@ -1779,7 +1753,7 @@ async fn start_one_shot_process(
         .arg("--interactive")
         .arg("--workdir")
         .arg(&cwd);
-    configure_network_args(&mut process, &spec.network, network_name)?;
+    configure_network_args(&mut process, &spec.policy.networking, network_name)?;
     configure_mount_args(&mut process, &spec.mounts);
     configure_env_args(&mut process, &command.env);
     process.arg(&spec.image);
@@ -2429,6 +2403,29 @@ async fn docker_load_image(container_bin: &Path, payload: &Bytes) -> Result<Stri
     bail!("docker load completed but no image reference found in output: {stdout}")
 }
 
+pub(crate) fn canonical_egress_host(host: &str) -> Result<String> {
+    ensure!(
+        !host.is_empty() && host.len() <= 253 && !host.ends_with('.'),
+        "invalid egress hostname"
+    );
+    let host = host.to_ascii_lowercase();
+    ensure!(
+        host.parse::<std::net::IpAddr>().is_err(),
+        "IP literals are not egress hostnames"
+    );
+    ensure!(
+        host.split('.').all(|label| !label.is_empty()
+            && label.len() <= 63
+            && !label.starts_with('-')
+            && !label.ends_with('-')
+            && label
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'-')),
+        "expected an exact ASCII hostname"
+    );
+    Ok(host)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2461,7 +2458,7 @@ mod tests {
                 "image": "alpine",
                 "mounts": [],
                 "durable_file_systems": [],
-                "network": { "type": "disabled" },
+                "policy": { "networking": { "type": "disabled" }, "credentials": [] },
                 "default_workdir": "/"
             },
             "lifecycle": {},
@@ -2587,7 +2584,6 @@ mod tests {
         fs::set_permissions(&script_path, permissions).expect("chmod fake docker");
 
         let request = SandboxRequest {
-            egress_proxy: None,
             sandbox_id: "sandbox".to_string(),
             scope: Some(SandboxScope::Thread {
                 thread_id: "thread".to_string(),
@@ -2597,7 +2593,7 @@ mod tests {
                 resources: Default::default(),
                 mounts: Vec::new(),
                 durable_file_systems: Vec::new(),
-                network: SandboxNetworkPolicy::Disabled,
+                policy: SandboxNetworkPolicy::Disabled.into(),
                 default_workdir: "/".to_string(),
             },
             lifecycle: SandboxLifecycleConfig {
@@ -2668,7 +2664,6 @@ mod tests {
             warm_sandboxes: Arc::new(Mutex::new(HashMap::new())),
         };
         let request = SandboxRequest {
-            egress_proxy: None,
             sandbox_id: "sandbox".to_string(),
             scope: Some(SandboxScope::Thread {
                 thread_id: "thread".to_string(),
@@ -2678,7 +2673,7 @@ mod tests {
                 resources: Default::default(),
                 mounts: Vec::new(),
                 durable_file_systems: Vec::new(),
-                network: SandboxNetworkPolicy::Disabled,
+                policy: SandboxNetworkPolicy::Disabled.into(),
                 default_workdir: "/".to_string(),
             },
             lifecycle: SandboxLifecycleConfig {
@@ -2762,7 +2757,6 @@ esac
             warm_sandboxes: Arc::new(Mutex::new(HashMap::new())),
         };
         let request = SandboxRequest {
-            egress_proxy: None,
             sandbox_id: "sandbox".to_string(),
             scope: Some(SandboxScope::Thread {
                 thread_id: "thread".to_string(),
@@ -2772,7 +2766,7 @@ esac
                 resources: Default::default(),
                 mounts: Vec::new(),
                 durable_file_systems: Vec::new(),
-                network: SandboxNetworkPolicy::Disabled,
+                policy: SandboxNetworkPolicy::Disabled.into(),
                 default_workdir: "/".to_string(),
             },
             lifecycle: SandboxLifecycleConfig {
@@ -2875,7 +2869,6 @@ esac
             warm_sandboxes: Arc::new(Mutex::new(HashMap::new())),
         };
         let request = SandboxRequest {
-            egress_proxy: None,
             sandbox_id: "sandbox".to_string(),
             scope: Some(SandboxScope::Thread {
                 thread_id: "thread".to_string(),
@@ -2885,7 +2878,7 @@ esac
                 resources: Default::default(),
                 mounts: Vec::new(),
                 durable_file_systems: Vec::new(),
-                network: SandboxNetworkPolicy::Unrestricted,
+                policy: SandboxNetworkPolicy::Unrestricted.into(),
                 default_workdir: "/task".to_string(),
             },
             lifecycle: SandboxLifecycleConfig::default(),

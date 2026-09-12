@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::{Context, Result, bail, ensure};
+use anyhow::{Result, bail, ensure};
 use async_trait::async_trait;
 use tokio::sync::Mutex;
 
@@ -13,26 +13,52 @@ use crate::{
     SandboxRequest, SandboxTerminalParts, SandboxTerminalSize, SnapshotFormat, SnapshotPayload,
 };
 
+#[async_trait]
+pub trait FirecrackerEgressProvider: ManagedSandboxBackend {
+    async fn egress_transport(
+        &self,
+        request: &SandboxRequest,
+        allowed_hosts: &[String],
+    ) -> Result<Arc<dyn super::EgressTransport>>;
+
+    async fn acquire_egress(
+        &self,
+        request: SandboxRequest,
+        endpoints: crate::SandboxEgressProxy,
+    ) -> Result<(Arc<dyn ManagedSandboxHandle>, std::net::Ipv4Addr)>;
+}
+
+struct NoCredentials;
+
+#[async_trait]
+impl EgressCredentialResolver for NoCredentials {
+    async fn resolve(
+        &self,
+        _identity: &EgressIdentity,
+        _binding_name: &str,
+        _destination: &super::EgressDestination,
+    ) -> Result<String> {
+        bail!("Firecracker credential resolver is not configured")
+    }
+}
+
 type SandboxSlot = Arc<Mutex<Option<Arc<EgressSandboxHandle>>>>;
 
-pub struct EgressSandboxBackend {
-    backend: Arc<dyn ManagedSandboxBackend>,
-    networking: SandboxNetworkPolicy,
-    resolver: Arc<dyn EgressCredentialResolver>,
+pub struct FirecrackerEgressBackend {
+    backend: Arc<dyn FirecrackerEgressProvider>,
+    resolver: Option<Arc<dyn EgressCredentialResolver>>,
     #[cfg(test)]
     pub(super) upstream: Option<super::tests::TestUpstream>,
     sandboxes: Mutex<HashMap<String, SandboxSlot>>,
 }
 
-impl EgressSandboxBackend {
+impl FirecrackerEgressBackend {
     pub fn new(
-        backend: Arc<dyn ManagedSandboxBackend>,
-        networking: SandboxNetworkPolicy,
-        resolver: Arc<dyn EgressCredentialResolver>,
+        backend: Arc<dyn FirecrackerEgressProvider>,
+        resolver: Option<Arc<dyn EgressCredentialResolver>>,
     ) -> Self {
         Self {
             backend,
-            networking,
             resolver,
             #[cfg(test)]
             upstream: None,
@@ -65,18 +91,26 @@ impl EgressSandboxBackend {
     }
 
     async fn proxy(&self, request: &SandboxRequest) -> Result<EgressProxy> {
-        let state = super::State::bind(
+        let state = super::State::new(
             EgressIdentity {
                 sandbox_id: request.sandbox_id.clone(),
                 scope: request.scope.clone(),
             },
-            self.networking.clone(),
-            self.resolver.clone(),
-        )
-        .await?;
+            request.spec.policy.clone(),
+            match &self.resolver {
+                Some(resolver) => resolver.clone(),
+                None => {
+                    ensure!(
+                        request.spec.policy.credentials.is_empty(),
+                        "Firecracker policy.credentials requires a credential resolver"
+                    );
+                    Arc::new(NoCredentials)
+                }
+            },
+        )?;
         let transport = self
             .backend
-            .egress_transport(&state.hosts.iter().cloned().collect::<Vec<_>>())
+            .egress_transport(request, &state.hosts.iter().cloned().collect::<Vec<_>>())
             .await?;
         #[cfg(test)]
         let state = super::State {
@@ -88,36 +122,52 @@ impl EgressSandboxBackend {
 }
 
 #[async_trait]
-impl ManagedSandboxBackend for EgressSandboxBackend {
+impl ManagedSandboxBackend for FirecrackerEgressBackend {
     fn is_local(&self) -> bool {
         self.backend.is_local()
     }
     fn consumable_snapshot_formats(&self) -> &[SnapshotFormat] {
-        &[]
+        self.backend.consumable_snapshot_formats()
+    }
+    async fn delete_snapshot(&self, payload: SnapshotPayload) -> Result<()> {
+        self.backend.delete_snapshot(payload).await
+    }
+    async fn fork_sandbox(
+        &self,
+        source: SandboxRequest,
+        target: SandboxRequest,
+    ) -> Result<Arc<dyn ManagedSandboxHandle>> {
+        source
+            .spec
+            .policy
+            .validate_basic("Firecracker snapshot source")?;
+        target
+            .spec
+            .policy
+            .validate_basic("Firecracker snapshot target")?;
+        self.backend.fork_sandbox(source, target).await
     }
     async fn resolve_image(&self, image: &str) -> Result<crate::ResolvedSandboxImage> {
         self.backend.resolve_image(image).await
     }
 
-    async fn acquire(&self, mut request: SandboxRequest) -> Result<Arc<dyn ManagedSandboxHandle>> {
+    async fn acquire(&self, request: SandboxRequest) -> Result<Arc<dyn ManagedSandboxHandle>> {
+        if request.spec.policy.credentials.is_empty()
+            && !matches!(
+                request.spec.policy.networking,
+                SandboxNetworkPolicy::Limited { .. }
+            )
+        {
+            return self.backend.acquire(request).await;
+        }
         ensure!(
             request.lifecycle.idle_ttl.is_some(),
             "proxy egress requires a managed sandbox lifecycle"
         );
         ensure!(
-            request.spec.network != SandboxNetworkPolicy::Disabled,
+            request.spec.policy.networking != SandboxNetworkPolicy::Disabled,
             "proxy egress requires networking enabled"
         );
-        ensure!(
-            request.egress_proxy.is_none(),
-            "egress backend owns its listener endpoints"
-        );
-        ensure!(
-            request.spec.network == SandboxNetworkPolicy::Unrestricted
-                || request.spec.network == self.networking,
-            "sandbox networking conflicts with the egress policy"
-        );
-        request.spec.network = self.networking.clone();
         let slot = self.slot(&request.sandbox_id).await;
         let mut slot = slot.lock().await;
         if let Some(handle) = slot.as_ref() {
@@ -133,15 +183,11 @@ impl ManagedSandboxBackend for EgressSandboxBackend {
             handle.proxy.close();
         }
         let proxy = self.proxy(&request).await?;
-        request.egress_proxy = Some(proxy.endpoints());
-        let inner = self.backend.acquire(request.clone()).await?;
-        proxy
-            .bind_source(
-                inner
-                    .egress_source_ipv4()
-                    .context("sandbox did not supply an egress source")?,
-            )
+        let (inner, source) = self
+            .backend
+            .acquire_egress(request.clone(), proxy.endpoints())
             .await?;
+        proxy.bind_source(source).await?;
         let ca_path = format!("/tmp/exo-egress-{}.pem", uuid::Uuid::new_v4().simple());
         let preparation = SandboxCommand {
             argv: vec!["/bin/sh".into(), "-c".into(),
@@ -165,37 +211,38 @@ impl ManagedSandboxBackend for EgressSandboxBackend {
         Ok(handle)
     }
 
-    async fn terminate(&self, mut request: SandboxRequest) -> Result<()> {
+    async fn terminate(&self, request: SandboxRequest) -> Result<()> {
         let slot = self.slot(&request.sandbox_id).await;
         let mut slot = slot.lock().await;
         if let Some(handle) = slot.as_ref() {
             handle.proxy.close();
-            self.backend.terminate(handle.request.clone()).await?;
-        } else {
-            let transport = self.backend.egress_transport(&[]).await?;
-            request.spec.network = self.networking.clone();
-            request.egress_proxy = Some(transport.endpoints());
-            let result = self.backend.terminate(request).await;
-            transport.close();
-            result?;
         }
+        self.backend.terminate(request).await?;
         *slot = None;
         Ok(())
     }
 
     async fn attach(
         &self,
-        _request: SandboxRequest,
-        _attachment: SandboxAttachment,
+        request: SandboxRequest,
+        attachment: SandboxAttachment,
     ) -> Result<Arc<dyn ManagedSandboxHandle>> {
-        bail!("proxy egress does not support external attachments")
+        request
+            .spec
+            .policy
+            .validate_basic("Firecracker external attachments")?;
+        self.backend.attach(request, attachment).await
     }
     async fn acquire_from_snapshot(
         &self,
-        _request: SandboxRequest,
-        _payload: SnapshotPayload,
+        request: SandboxRequest,
+        payload: SnapshotPayload,
     ) -> Result<Arc<dyn ManagedSandboxHandle>> {
-        bail!("proxy egress snapshots require a fresh identity and trust binding")
+        request
+            .spec
+            .policy
+            .validate_basic("Firecracker snapshot restore")?;
+        self.backend.acquire_from_snapshot(request, payload).await
     }
 }
 
@@ -237,9 +284,6 @@ impl ManagedSandboxHandle for EgressSandboxHandle {
     }
     fn effective_image(&self) -> Option<String> {
         self.inner.effective_image()
-    }
-    fn egress_source_ipv4(&self) -> Option<std::net::Ipv4Addr> {
-        self.inner.egress_source_ipv4()
     }
     async fn is_running(&self) -> Result<Option<bool>> {
         self.inner.is_running().await

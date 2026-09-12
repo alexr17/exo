@@ -13,9 +13,9 @@ use tokio::sync::{Mutex, mpsc};
 use tokio_util::compat::{FuturesAsyncReadCompatExt, FuturesAsyncWriteCompatExt};
 
 use crate::{
-    FirecrackerConfig, FirecrackerSandboxBackend, ManagedSandboxBackend, ManagedSandboxHandle,
-    SandboxCommand, SandboxCommandOutput, SandboxProcessParts, SandboxRequest, SnapshotFormat,
-    SnapshotPayload,
+    FirecrackerConfig, FirecrackerRequest, FirecrackerSandboxBackend, ManagedSandboxBackend,
+    ManagedSandboxHandle, SandboxCommand, SandboxCommandOutput, SandboxProcessParts,
+    SnapshotFormat, SnapshotPayload,
 };
 
 const MAX_BRIDGE_FRAME_BYTES: usize = 16 * 1024 * 1024;
@@ -27,7 +27,10 @@ const OUTPUT_DRAIN_GRACE: Duration = Duration::from_secs(2);
 #[serde(tag = "operation", rename_all = "snake_case")]
 pub enum FirecrackerBridgeRequest {
     #[cfg(feature = "egress-proxy")]
-    EgressCreate { allowed_hosts: Vec<String> },
+    EgressCreate {
+        allowed_hosts: Vec<String>,
+        listen: Option<crate::EgressListenConfig>,
+    },
     #[cfg(feature = "egress-proxy")]
     EgressBind {
         listener_id: String,
@@ -43,35 +46,35 @@ pub enum FirecrackerBridgeRequest {
     },
     Acquire {
         config: FirecrackerConfig,
-        request: SandboxRequest,
+        request: FirecrackerRequest,
     },
     Exec {
         config: FirecrackerConfig,
-        request: SandboxRequest,
+        request: FirecrackerRequest,
         command: SandboxCommand,
     },
     StartProcess {
         config: FirecrackerConfig,
-        request: SandboxRequest,
+        request: FirecrackerRequest,
         command: SandboxCommand,
     },
     ConnectTcp {
         config: FirecrackerConfig,
-        request: SandboxRequest,
+        request: FirecrackerRequest,
         port: u16,
     },
     Stop {
         config: FirecrackerConfig,
-        request: SandboxRequest,
+        request: FirecrackerRequest,
     },
     Fork {
         config: FirecrackerConfig,
-        source: SandboxRequest,
-        target: SandboxRequest,
+        source: FirecrackerRequest,
+        target: FirecrackerRequest,
     },
     AcquireFromSnapshot {
         config: FirecrackerConfig,
-        request: SandboxRequest,
+        request: FirecrackerRequest,
         format: SnapshotFormat,
         payload: String,
     },
@@ -82,11 +85,11 @@ pub enum FirecrackerBridgeRequest {
     },
     Snapshot {
         config: FirecrackerConfig,
-        request: SandboxRequest,
+        request: FirecrackerRequest,
     },
     Terminate {
         config: FirecrackerConfig,
-        request: SandboxRequest,
+        request: FirecrackerRequest,
     },
 }
 
@@ -225,9 +228,9 @@ impl BridgeBackendCache {
     async fn acquire(
         &self,
         config: FirecrackerConfig,
-        request: SandboxRequest,
+        request: FirecrackerRequest,
     ) -> Result<Arc<dyn ManagedSandboxHandle>> {
-        self.backend(config).await?.acquire(request).await
+        self.backend(config).await?.acquire_request(request).await
     }
 }
 
@@ -338,11 +341,18 @@ async fn handle_request(
 ) -> Result<FirecrackerBridgeResponse> {
     match request {
         #[cfg(feature = "egress-proxy")]
-        FirecrackerBridgeRequest::EgressCreate { allowed_hosts } => {
+        FirecrackerBridgeRequest::EgressCreate {
+            allowed_hosts,
+            listen,
+        } => {
             let mut listeners = backends.egress.lock().await;
             anyhow::ensure!(listeners.len() < 256, "too many egress listeners");
-            let listener: Arc<dyn crate::egress::EgressTransport> =
-                Arc::new(crate::egress::LocalEgressTransport::for_hosts(&allowed_hosts).await?);
+            let listener: Arc<dyn crate::egress::EgressTransport> = Arc::new(match listen {
+                Some(config) => {
+                    crate::egress::LocalEgressTransport::with_config(config, &allowed_hosts).await?
+                }
+                None => crate::egress::LocalEgressTransport::for_hosts(&allowed_hosts).await?,
+            });
             let endpoints = listener.endpoints();
             let listener_id = uuid::Uuid::new_v4().to_string();
             listeners.insert(listener_id.clone(), listener);
@@ -383,12 +393,14 @@ async fn handle_request(
             ))
         }
         FirecrackerBridgeRequest::Acquire { config, request } => {
-            let handle = backends.acquire(config, request).await?;
+            let backend = backends.backend(config).await?;
+            let handle = backend.acquire_request(request).await?;
+            let source_ipv4 = backend.egress_source(handle.as_ref()).await?;
             Ok(FirecrackerBridgeResponse::Handle {
                 id: handle.id().to_string(),
                 provider_state: handle.provider_state(),
                 effective_image: handle.effective_image(),
-                source_ipv4: handle.egress_source_ipv4(),
+                source_ipv4,
             })
         }
         FirecrackerBridgeRequest::Exec {
@@ -414,13 +426,13 @@ async fn handle_request(
             let handle = backends
                 .backend(config)
                 .await?
-                .fork_sandbox(source, target)
+                .fork_sandbox(source.sandbox, target.sandbox)
                 .await?;
             Ok(FirecrackerBridgeResponse::Handle {
                 id: handle.id().to_string(),
                 provider_state: handle.provider_state(),
                 effective_image: handle.effective_image(),
-                source_ipv4: handle.egress_source_ipv4(),
+                source_ipv4: None,
             })
         }
         FirecrackerBridgeRequest::AcquireFromSnapshot {
@@ -436,7 +448,7 @@ async fn handle_request(
                 .backend(config)
                 .await?
                 .acquire_from_snapshot(
-                    request,
+                    request.sandbox,
                     SnapshotPayload {
                         format,
                         bytes: payload.into(),
@@ -447,7 +459,7 @@ async fn handle_request(
                 id: handle.id().to_string(),
                 provider_state: handle.provider_state(),
                 effective_image: handle.effective_image(),
-                source_ipv4: handle.egress_source_ipv4(),
+                source_ipv4: None,
             })
         }
         FirecrackerBridgeRequest::Snapshot { config, request } => {
@@ -473,7 +485,11 @@ async fn handle_request(
             Ok(FirecrackerBridgeResponse::Unit)
         }
         FirecrackerBridgeRequest::Terminate { config, request } => {
-            backends.backend(config).await?.terminate(request).await?;
+            backends
+                .backend(config)
+                .await?
+                .terminate(request.sandbox)
+                .await?;
             Ok(FirecrackerBridgeResponse::Unit)
         }
         FirecrackerBridgeRequest::StartProcess { .. }

@@ -15,7 +15,6 @@ use wiremock::{Mock, MockServer, Request, ResponseTemplate};
 
 fn make_request(thread_id: &str, sandbox_id: &str) -> SandboxRequest {
     SandboxRequest {
-        egress_proxy: None,
         sandbox_id: sandbox_id.into(),
         scope: Some(SandboxScope::Thread {
             thread_id: thread_id.into(),
@@ -25,7 +24,7 @@ fn make_request(thread_id: &str, sandbox_id: &str) -> SandboxRequest {
             resources: Default::default(),
             mounts: Vec::new(),
             durable_file_systems: Vec::new(),
-            network: SandboxNetworkPolicy::Unrestricted,
+            policy: SandboxNetworkPolicy::Unrestricted.into(),
             default_workdir: "/vercel/sandbox".into(),
         },
         lifecycle: SandboxLifecycleConfig {
@@ -62,19 +61,26 @@ async fn mount_missing_named_sandbox(server: &MockServer) {
         .and(path_regex(r"^/v2/sandboxes/exo-[0-9a-f]+$"))
         .and(query_param("teamId", "team_1"))
         .and(query_param("projectId", "project_1"))
-        .and(query_param("resume", "true"))
+        .and(query_param("resume", "false"))
         .respond_with(ResponseTemplate::new(404))
         .mount(server)
         .await;
 }
 
 async fn mount_existing_named_sandbox(server: &MockServer, session_id: &str) {
-    Mock::given(method("GET"))
+    for resume in ["false", "true"] {
+        Mock::given(method("GET"))
+            .and(path_regex(r"^/v2/sandboxes/exo-[0-9a-f]+$"))
+            .and(query_param("teamId", "team_1"))
+            .and(query_param("projectId", "project_1"))
+            .and(query_param("resume", resume))
+            .respond_with(ResponseTemplate::new(200).set_body_json(sandbox_response(session_id)))
+            .mount(server)
+            .await;
+    }
+    Mock::given(method("PATCH"))
         .and(path_regex(r"^/v2/sandboxes/exo-[0-9a-f]+$"))
-        .and(query_param("teamId", "team_1"))
-        .and(query_param("projectId", "project_1"))
-        .and(query_param("resume", "true"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(sandbox_response(session_id)))
+        .respond_with(ResponseTemplate::new(200))
         .mount(server)
         .await;
 }
@@ -490,4 +496,117 @@ struct VercelCommandBody {
 struct BridgeRequestBody {
     #[serde(rename = "type")]
     kind: String,
+}
+
+#[tokio::test]
+async fn limited_policy_pins_each_allowed_host() {
+    let server = MockServer::start().await;
+    let backend = backend_for_mock(&server);
+    mount_missing_named_sandbox(&server).await;
+    Mock::given(method("POST"))
+        .and(path("/v2/sandboxes"))
+        .and(wiremock::matchers::body_partial_json(json!({
+            "networkPolicy": {"allow": {
+                "api.example.com": [{"transform": [{"headers": {"Host": "api.example.com"}}]}]
+            }}
+        })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(sandbox_response("limited")))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let mut request = make_request("thread", "limited");
+    request.spec.policy = SandboxNetworkPolicy::Limited {
+        allowed_hosts: vec!["API.example.com".into()],
+    }
+    .into();
+    backend.acquire(request).await.expect("limited networking");
+}
+
+#[tokio::test]
+async fn unsupported_credentials_fail_before_any_provider_request() {
+    let server = MockServer::start().await;
+    let backend = backend_for_mock(&server);
+    let mut request = make_request("thread", "credentials");
+    request
+        .spec
+        .policy
+        .credentials
+        .push(exoharness::EgressCredentialBinding {
+            name: "braintrust".into(),
+            environment_variable: "BRAINTRUST_API_KEY".into(),
+            networking: exoharness::CredentialNetworkPolicy::Unrestricted,
+            injection_location: exoharness::CredentialInjectionLocation {
+                header: true,
+                body: false,
+            },
+        });
+    let result = backend.acquire(request).await;
+    assert!(
+        result
+            .err()
+            .expect("unsupported credentials")
+            .to_string()
+            .contains("policy.credentials")
+    );
+    assert!(server.received_requests().await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn resume_applies_policy_before_starting_the_session() {
+    let server = MockServer::start().await;
+    let backend = backend_for_mock(&server);
+    mount_existing_named_sandbox(&server, "resumed").await;
+    let mut request = make_request("thread", "disabled");
+    request.spec.policy = SandboxNetworkPolicy::Disabled.into();
+    backend.acquire(request).await.expect("resume with policy");
+    let requests = server.received_requests().await.unwrap();
+    assert_eq!(requests.len(), 3);
+    assert!(requests[0].url.query().unwrap().contains("resume=false"));
+    assert_eq!(requests[1].method.as_str(), "PATCH");
+    let body: serde_json::Value = serde_json::from_slice(&requests[1].body).unwrap();
+    assert_eq!(body, json!({"networkPolicy": {"mode": "deny-all"}}));
+    assert!(requests[2].url.query().unwrap().contains("resume=true"));
+}
+
+#[tokio::test]
+async fn failed_policy_update_does_not_resume_the_sandbox() {
+    let server = MockServer::start().await;
+    let backend = backend_for_mock(&server);
+    Mock::given(method("GET"))
+        .and(path_regex(r"^/v2/sandboxes/exo-[0-9a-f]+$"))
+        .and(query_param("resume", "false"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"session": null})))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("PATCH"))
+        .and(path_regex(r"^/v2/sandboxes/exo-[0-9a-f]+$"))
+        .respond_with(ResponseTemplate::new(403))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let result = backend
+        .acquire(make_request("thread", "failed-update"))
+        .await;
+    assert!(
+        result
+            .err()
+            .expect("policy update failure")
+            .to_string()
+            .contains("network policy update failed")
+    );
+    assert_eq!(server.received_requests().await.unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn invalid_host_fails_before_any_provider_request() {
+    let server = MockServer::start().await;
+    let backend = backend_for_mock(&server);
+    let mut request = make_request("thread", "invalid-host");
+    request.spec.policy = SandboxNetworkPolicy::Limited {
+        allowed_hosts: vec!["*.example.com".into()],
+    }
+    .into();
+    assert!(backend.acquire(request).await.is_err());
+    assert!(server.received_requests().await.unwrap().is_empty());
 }

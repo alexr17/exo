@@ -48,10 +48,34 @@ impl LocalEgressTransport {
         Self::bind(host_ip, &hosts).await
     }
 
+    pub async fn with_config(config: crate::EgressListenConfig, hosts: &[String]) -> Result<Self> {
+        let hosts = hosts
+            .iter()
+            .map(|h| canonical_host(h))
+            .collect::<Result<HashSet<_>>>()?;
+        ensure!(hosts.len() <= 128, "too many allowed hosts");
+        Self::listen(config, &hosts).await
+    }
+
     pub(super) async fn bind(host_ip: Ipv4Addr, hosts: &HashSet<String>) -> Result<Self> {
-        let http = TcpListener::bind((host_ip, 0)).await?;
-        let https = TcpListener::bind((host_ip, 0)).await?;
-        let dns = UdpSocket::bind((host_ip, 0)).await?;
+        Self::listen(
+            crate::EgressListenConfig {
+                bind_address: host_ip,
+                advertised_address: host_ip,
+                http_port: 0,
+                https_port: 0,
+                dns_port: 0,
+            },
+            hosts,
+        )
+        .await
+    }
+
+    async fn listen(config: crate::EgressListenConfig, hosts: &HashSet<String>) -> Result<Self> {
+        let host_ip = config.advertised_address;
+        let http = TcpListener::bind((config.bind_address, config.http_port)).await?;
+        let https = TcpListener::bind((config.bind_address, config.https_port)).await?;
+        let dns = UdpSocket::bind((config.bind_address, config.dns_port)).await?;
         let dns_tcp = TcpListener::bind(dns.local_addr()?).await?;
         let endpoints = SandboxEgressProxy {
             http: SocketAddrV4::new(host_ip, http.local_addr()?.port()),

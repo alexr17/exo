@@ -421,7 +421,7 @@ impl ManagedSandboxBackend for SmolvmSandboxBackend {
     }
 
     async fn acquire(&self, request: SandboxRequest) -> Result<Arc<dyn ManagedSandboxHandle>> {
-        request.reject_egress_proxy()?;
+        request.spec.policy.validate_basic("smolvm")?;
         reject_unsupported_spec(&request.spec)?;
         match self.resolve_mode(&request).await {
             SmolvmExecutionMode::Warm => {
@@ -463,7 +463,7 @@ impl ManagedSandboxBackend for SmolvmSandboxBackend {
         request: SandboxRequest,
         payload: SnapshotPayload,
     ) -> Result<Arc<dyn ManagedSandboxHandle>> {
-        request.reject_egress_proxy()?;
+        request.spec.policy.validate_basic("smolvm")?;
         if payload.format != SnapshotFormat::SmolvmMachinePack {
             bail!(
                 "smolvm backend cannot restore snapshot format {}",
@@ -738,7 +738,7 @@ fn resolve_cwd(command: &SandboxCommand, spec: &SandboxSpec) -> String {
 
 /// Mounts and network policy, shared by the create/run paths.
 fn configure_spec_args(process: &mut Command, spec: &SandboxSpec) {
-    if spec.network == SandboxNetworkPolicy::Unrestricted {
+    if spec.policy.networking == SandboxNetworkPolicy::Unrestricted {
         process.arg("--net");
     }
     for mount in &spec.mounts {
@@ -838,7 +838,8 @@ fn reject_unsupported_spec(spec: &SandboxSpec) -> Result<()> {
     // smolvm resolves registry references over the machine's own network and
     // refuses this combination even for a cached image. Caught here so the caller
     // gets the two real remedies, not a failure deep in the CLI output.
-    if spec.network == SandboxNetworkPolicy::Disabled && !is_local_image_ref(&spec.image) {
+    if spec.policy.networking == SandboxNetworkPolicy::Disabled && !is_local_image_ref(&spec.image)
+    {
         bail!(
             "smolvm cannot use registry image '{}' in a network-disabled sandbox: \
              it resolves registry references over the machine's network, even for \
@@ -1020,7 +1021,6 @@ mod tests {
 
     fn test_request(idle_ttl: Option<Duration>) -> SandboxRequest {
         SandboxRequest {
-            egress_proxy: None,
             sandbox_id: "s".into(),
             scope: Some(SandboxScope::Agent {
                 agent_id: "a".into(),
@@ -1030,7 +1030,7 @@ mod tests {
                 resources: Default::default(),
                 mounts: Vec::new(),
                 durable_file_systems: Vec::new(),
-                network: SandboxNetworkPolicy::Disabled,
+                policy: SandboxNetworkPolicy::Disabled.into(),
                 default_workdir: "/".into(),
             },
             lifecycle: SandboxLifecycleConfig { idle_ttl },
@@ -1098,16 +1098,16 @@ mod tests {
     fn registry_image_without_network_is_rejected() {
         let mut spec = test_request(None).spec;
         spec.image = "docker.io/library/ubuntu:24.04".into();
-        spec.network = SandboxNetworkPolicy::Disabled;
+        spec.policy.networking = SandboxNetworkPolicy::Disabled;
         let err = reject_unsupported_spec(&spec).unwrap_err().to_string();
         assert!(err.contains("network-disabled"), "unexpected error: {err}");
 
         // Fine once the sandbox is allowed network...
-        spec.network = SandboxNetworkPolicy::Unrestricted;
+        spec.policy.networking = SandboxNetworkPolicy::Unrestricted;
         assert!(reject_unsupported_spec(&spec).is_ok());
 
         // ...and a local archive is fine while staying isolated.
-        spec.network = SandboxNetworkPolicy::Disabled;
+        spec.policy.networking = SandboxNetworkPolicy::Disabled;
         spec.image = "/tmp/alpine.tar".into();
         assert!(reject_unsupported_spec(&spec).is_ok());
     }
@@ -1177,7 +1177,7 @@ mod tests {
                 },
             ],
             durable_file_systems: Vec::new(),
-            network: SandboxNetworkPolicy::Disabled,
+            policy: SandboxNetworkPolicy::Disabled.into(),
             default_workdir: "/work".into(),
         };
 

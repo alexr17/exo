@@ -86,7 +86,6 @@ fn request(
     idle_ttl: Option<Duration>,
 ) -> SandboxRequest {
     SandboxRequest {
-        egress_proxy: None,
         sandbox_id: tag.into(),
         scope: Some(SandboxScope::Agent {
             agent_id: "smolvm-live".into(),
@@ -101,7 +100,7 @@ fn request(
                 internal: false,
             }],
             durable_file_systems: Vec::new(),
-            network,
+            policy: network.into(),
             default_workdir: "/".into(),
         },
         lifecycle: SandboxLifecycleConfig { idle_ttl },

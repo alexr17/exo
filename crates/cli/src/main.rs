@@ -74,7 +74,6 @@ const SANDBOX_CLI_AGENT_SLUG: &str = "__exo_sandbox_cli";
 )]
 struct Cli {
     /// JSON policy for sandbox hosts and credential substitution.
-    #[cfg(feature = "egress-proxy")]
     #[arg(long, global = true, conflicts_with = "exoharness_url")]
     egress_policy: Option<PathBuf>,
 
@@ -267,6 +266,7 @@ impl FirecrackerArgs {
             .chain(self.allowed_local_images.iter().cloned())
             .collect();
         let config = FirecrackerConfig {
+            egress_listen: None,
             firecracker_bin: self.firecracker_bin.clone(),
             jailer_bin: self.jailer_bin.clone(),
             kernel: self.kernel.clone(),
@@ -462,23 +462,19 @@ fn build_exo_config(cli: &Cli) -> Result<BasicExoHarnessConfig> {
     #[cfg(not(feature = "firecracker"))]
     let firecracker_spec = FirecrackerBackendSpec::default();
     let sandbox_backends = default_sandbox_backends(firecracker_spec);
-    #[cfg(feature = "egress-proxy")]
-    let sandbox_backends = match &cli.egress_policy {
-        Some(path) => {
-            let policy: executor::EgressPolicy =
-                serde_json::from_reader(std::fs::File::open(path)?)
-                    .with_context(|| format!("reading egress policy {}", path.display()))?;
-            sandbox_backends
-                .into_iter()
-                .map(|b| b.with_egress(policy.clone()))
-                .collect()
-        }
-        None => sandbox_backends,
-    };
+    let sandbox_policy = cli
+        .egress_policy
+        .as_ref()
+        .map(|path| {
+            serde_json::from_reader(std::fs::File::open(path)?)
+                .with_context(|| format!("reading sandbox policy {}", path.display()))
+        })
+        .transpose()?;
     Ok(BasicExoHarnessConfig {
         root: cli.root.join("exoharness"),
         secret_backend,
         sandbox_default: default_local_sandbox_provider(),
+        sandbox_policy,
         sandbox_backends,
     })
 }
@@ -2859,6 +2855,7 @@ async fn start_sandbox(
             file_system_mounts: (!mounts.is_empty()).then_some(mounts),
             durable_file_systems: (!durable_file_systems.is_empty())
                 .then_some(durable_file_systems),
+            policy: None,
             enable_networking: networking.map(EnabledDisabled::enabled),
             idle_seconds,
         })

@@ -22,6 +22,8 @@ use tokio_rustls::TlsAcceptor;
 use tokio_rustls::rustls::{self, ServerConfig, pki_types::PrivatePkcs8KeyDer};
 use tokio_util::sync::CancellationToken;
 
+use crate::sandbox::canonical_egress_host as canonical_host;
+
 use crate::{
     CredentialNetworkPolicy, EgressCredentialBinding, EgressPolicy, SandboxEgressProxy,
     SandboxNetworkPolicy,
@@ -30,7 +32,7 @@ use crate::{
 mod transport;
 pub use transport::{EgressTransport, LocalEgressTransport};
 mod sandbox;
-pub use sandbox::EgressSandboxBackend;
+pub use sandbox::{FirecrackerEgressBackend, FirecrackerEgressProvider};
 
 const PLACEHOLDER_PREFIX: &str = "exo_egress_";
 const IO_TIMEOUT: Duration = Duration::from_secs(30);
@@ -53,8 +55,6 @@ pub struct EgressDestination {
 
 #[async_trait]
 pub trait EgressCredentialResolver: Send + Sync {
-    async fn bindings(&self, identity: &EgressIdentity) -> Result<Vec<EgressCredentialBinding>>;
-
     async fn resolve(
         &self,
         identity: &EgressIdentity,
@@ -98,10 +98,10 @@ impl EgressProxy {
     pub async fn bind(
         host_ip: Ipv4Addr,
         identity: EgressIdentity,
-        networking: SandboxNetworkPolicy,
+        policy: EgressPolicy,
         resolver: Arc<dyn EgressCredentialResolver>,
     ) -> Result<Self> {
-        Self::start(host_ip, State::bind(identity, networking, resolver).await?).await
+        Self::start(host_ip, State::new(identity, policy, resolver)?).await
     }
 
     async fn start(host_ip: Ipv4Addr, state: State) -> Result<Self> {
@@ -112,14 +112,10 @@ impl EgressProxy {
     pub async fn with_transport(
         transport: Arc<dyn EgressTransport>,
         identity: EgressIdentity,
-        networking: SandboxNetworkPolicy,
+        policy: EgressPolicy,
         resolver: Arc<dyn EgressCredentialResolver>,
     ) -> Result<Self> {
-        Self::start_with_transport(
-            transport,
-            State::bind(identity, networking, resolver).await?,
-        )
-        .await
+        Self::start_with_transport(transport, State::new(identity, policy, resolver)?).await
     }
 
     async fn start_with_transport(
@@ -180,22 +176,6 @@ impl Drop for EgressProxy {
 }
 
 impl State {
-    async fn bind(
-        identity: EgressIdentity,
-        networking: SandboxNetworkPolicy,
-        resolver: Arc<dyn EgressCredentialResolver>,
-    ) -> Result<Self> {
-        let credentials = tokio::time::timeout(IO_TIMEOUT, resolver.bindings(&identity)).await??;
-        Self::new(
-            identity,
-            EgressPolicy {
-                networking,
-                credentials,
-            },
-            resolver,
-        )
-    }
-
     fn new(
         identity: EgressIdentity,
         policy: EgressPolicy,
@@ -444,29 +424,6 @@ impl State {
 fn canonical_hosts(hosts: &[String]) -> Result<HashSet<String>> {
     ensure!(hosts.len() <= 128, "too many allowed hosts");
     hosts.iter().map(|host| canonical_host(host)).collect()
-}
-
-fn canonical_host(host: &str) -> Result<String> {
-    ensure!(
-        !host.is_empty() && host.len() <= 253 && !host.ends_with('.'),
-        "invalid egress hostname"
-    );
-    let host = host.to_ascii_lowercase();
-    ensure!(
-        host.parse::<IpAddr>().is_err(),
-        "IP literals are not egress hostnames"
-    );
-    ensure!(
-        host.split('.').all(|label| !label.is_empty()
-            && label.len() <= 63
-            && !label.starts_with('-')
-            && !label.ends_with('-')
-            && label
-                .bytes()
-                .all(|b| b.is_ascii_alphanumeric() || b == b'-')),
-        "expected an exact ASCII hostname"
-    );
-    Ok(host)
 }
 
 fn public_ipv4(ip: IpAddr) -> bool {
