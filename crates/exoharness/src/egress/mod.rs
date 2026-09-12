@@ -63,6 +63,9 @@ pub(crate) struct PublicUpstreamResolver;
 #[async_trait]
 impl UpstreamResolver for PublicUpstreamResolver {
     async fn resolve(&self, host: &str, port: u16) -> Result<ResolvedUpstream> {
+        // Resolve on every request and discard private/special-use addresses.
+        // client() pins these answers, preventing a second DNS lookup from
+        // turning an allowed hostname into a connection to an internal service.
         let addresses =
             tokio::time::timeout(CONNECT_TIMEOUT, tokio::net::lookup_host((host, port)))
                 .await??
@@ -490,6 +493,10 @@ async fn relay(
     Ok(result)
 }
 
+// Conservative IPv4 unicast filter based on the IANA special-purpose registry:
+// https://www.iana.org/assignments/iana-ipv4-special-registry/
+// Also excludes multicast (RFC 1112). The whole 192.0.0.0/24 protocol block and
+// deprecated 192.88.99.0/24 stay blocked, including their anycast exceptions.
 fn public_ipv4(ip: IpAddr) -> bool {
     let IpAddr::V4(ip) = ip else {
         return false;
@@ -510,7 +517,13 @@ fn public_ipv4(ip: IpAddr) -> bool {
         || (a == 203 && b == 0 && c == 113))
 }
 
+// RFC 9110 section 7.6.1: remove connection-specific fields when forwarding.
+// https://www.rfc-editor.org/rfc/rfc9110.html#section-7.6.1
+// Proxy authentication is scoped to its proxy (sections 11.7.1/11.7.2); framing
+// and trailers are handled by the HTTP stacks on either side of this proxy.
 fn hop_header(name: &HeaderName) -> bool {
+    // HeaderName::as_str() always returns lowercase; no normalization is needed.
+    // https://docs.rs/http/latest/http/header/struct.HeaderName.html#method.as_str
     matches!(
         name.as_str(),
         "connection"
@@ -527,6 +540,7 @@ fn hop_header(name: &HeaderName) -> bool {
 
 fn strip_hop_headers(headers: &mut HeaderMap) -> Result<()> {
     let mut remove = Vec::new();
+    // The same rule also removes custom fields named by Connection.
     for value in headers.get_all(CONNECTION) {
         remove.extend(
             value
