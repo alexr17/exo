@@ -851,10 +851,11 @@ async fn send_executes_shell_tool_when_enabled() {
         EventData::SandboxCreated {
             provider,
             image,
-            policy: None,
+            policy: Some(policy),
             enable_networking: true,
             ..
         } if provider == &SandboxProvider::LocalProcess && image == "conversation-image"
+            && policy == &exoharness::SandboxNetworkPolicy::Unrestricted.into()
     ));
 }
 

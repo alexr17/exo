@@ -51,6 +51,8 @@ mod firecracker_image;
     feature = "firecracker"
 ))]
 mod firecracker_lima;
+#[cfg(all(target_os = "macos", feature = "firecracker"))]
+pub use firecracker_lima::LimaFirecrackerSandboxBackend;
 #[cfg(all(not(target_arch = "wasm32"), feature = "basic-backend"))]
 pub mod process_bridge;
 #[cfg(all(not(target_arch = "wasm32"), feature = "basic-backend"))]
@@ -117,90 +119,48 @@ impl Default for FirecrackerLimaConfig {
     }
 }
 
-#[cfg(all(
-    not(target_arch = "wasm32"),
-    feature = "firecracker",
-    not(feature = "egress-proxy")
-))]
+#[cfg(all(not(target_arch = "wasm32"), feature = "firecracker"))]
 pub async fn firecracker_backend(
     config: FirecrackerConfig,
     lima: FirecrackerLimaConfig,
 ) -> anyhow::Result<FirecrackerBackend> {
-    #[cfg(target_os = "linux")]
-    {
-        drop(lima);
-        Ok(Arc::new(FirecrackerSandboxBackend::new(config).await?))
-    }
-    #[cfg(target_os = "macos")]
-    {
-        Ok(Arc::new(
-            firecracker_lima::LimaFirecrackerSandboxBackend::new(config, lima).await?,
-        ))
-    }
-    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-    {
-        drop(config);
-        drop(lima);
-        anyhow::bail!("Firecracker sandbox execution is only supported on Linux or macOS with Lima")
-    }
+    configured_firecracker_backend(config, lima, None).await
 }
 
-#[cfg(all(
-    not(target_arch = "wasm32"),
-    feature = "firecracker",
-    feature = "egress-proxy"
-))]
-pub async fn firecracker_egress_provider(
-    config: FirecrackerConfig,
-    lima: FirecrackerLimaConfig,
-) -> anyhow::Result<Arc<dyn crate::egress::FirecrackerEgressProvider>> {
-    #[cfg(target_os = "linux")]
-    {
-        drop(lima);
-        Ok(Arc::new(FirecrackerSandboxBackend::new(config).await?))
-    }
-    #[cfg(target_os = "macos")]
-    {
-        Ok(Arc::new(
-            firecracker_lima::LimaFirecrackerSandboxBackend::new(config, lima).await?,
-        ))
-    }
-    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-    {
-        drop((config, lima));
-        anyhow::bail!("Firecracker sandbox execution requires Linux or macOS with Lima")
-    }
-}
-
-#[cfg(all(
-    not(target_arch = "wasm32"),
-    feature = "firecracker",
-    feature = "egress-proxy"
-))]
-pub async fn firecracker_backend(
-    config: FirecrackerConfig,
-    lima: FirecrackerLimaConfig,
-) -> anyhow::Result<FirecrackerBackend> {
-    Ok(Arc::new(crate::egress::FirecrackerEgressBackend::new(
-        firecracker_egress_provider(config, lima).await?,
-        None,
-    )))
-}
-
-#[cfg(all(
-    not(target_arch = "wasm32"),
-    feature = "firecracker",
-    feature = "egress-proxy"
-))]
+#[cfg(all(not(target_arch = "wasm32"), feature = "firecracker"))]
 pub async fn firecracker_backend_with_credentials(
     config: FirecrackerConfig,
     lima: FirecrackerLimaConfig,
     resolver: Arc<dyn crate::egress::EgressCredentialResolver>,
 ) -> anyhow::Result<FirecrackerBackend> {
-    Ok(Arc::new(crate::egress::FirecrackerEgressBackend::new(
-        firecracker_egress_provider(config, lima).await?,
-        Some(resolver),
-    )))
+    configured_firecracker_backend(config, lima, Some(resolver)).await
+}
+
+#[cfg(all(not(target_arch = "wasm32"), feature = "firecracker"))]
+async fn configured_firecracker_backend(
+    config: FirecrackerConfig,
+    lima: FirecrackerLimaConfig,
+    resolver: Option<Arc<dyn crate::egress::EgressCredentialResolver>>,
+) -> anyhow::Result<FirecrackerBackend> {
+    #[cfg(target_os = "linux")]
+    let backend = {
+        drop(lima);
+        FirecrackerSandboxBackend::new(config).await?
+    };
+    #[cfg(target_os = "macos")]
+    let backend = firecracker_lima::LimaFirecrackerSandboxBackend::new(config, lima).await?;
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    {
+        Ok(Arc::new(backend.with_egress(
+            resolver,
+            Arc::new(crate::egress::PublicUpstreamResolver),
+        )))
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        drop((config, lima, resolver));
+        anyhow::bail!("Firecracker sandbox execution requires Linux or macOS with Lima")
+    }
 }
 
 #[cfg(all(test, not(target_arch = "wasm32"), feature = "firecracker"))]

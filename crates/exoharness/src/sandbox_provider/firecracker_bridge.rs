@@ -18,6 +18,7 @@ use crate::{
     SnapshotFormat, SnapshotPayload,
 };
 
+const MAX_EGRESS_LISTENERS: usize = 256;
 const MAX_BRIDGE_FRAME_BYTES: usize = 16 * 1024 * 1024;
 pub(super) const STREAM_CHUNK_BYTES: usize = 64 * 1024;
 const STREAM_INPUT_QUEUE_DEPTH: usize = 16;
@@ -26,20 +27,21 @@ const OUTPUT_DRAIN_GRACE: Duration = Duration::from_secs(2);
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "operation", rename_all = "snake_case")]
 pub enum FirecrackerBridgeRequest {
-    #[cfg(feature = "egress-proxy")]
     EgressCreate {
         allowed_hosts: Vec<String>,
         listen: Option<crate::EgressListenConfig>,
     },
-    #[cfg(feature = "egress-proxy")]
     EgressBind {
         listener_id: String,
         source: std::net::Ipv4Addr,
     },
-    #[cfg(feature = "egress-proxy")]
-    EgressAccept { listener_id: String, tls: bool },
-    #[cfg(feature = "egress-proxy")]
-    EgressClose { listener_id: String },
+    EgressAccept {
+        listener_id: String,
+        tls: bool,
+    },
+    EgressClose {
+        listener_id: String,
+    },
     ResolveImage {
         config: FirecrackerConfig,
         image: String,
@@ -95,7 +97,6 @@ pub enum FirecrackerBridgeRequest {
 
 impl FirecrackerBridgeRequest {
     fn is_stream(&self) -> bool {
-        #[cfg(feature = "egress-proxy")]
         if matches!(self, Self::EgressAccept { .. }) {
             return true;
         }
@@ -106,7 +107,6 @@ impl FirecrackerBridgeRequest {
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "result", rename_all = "snake_case")]
 pub enum FirecrackerBridgeResponse {
-    #[cfg(feature = "egress-proxy")]
     Egress {
         listener_id: String,
         endpoints: crate::SandboxEgressProxy,
@@ -193,13 +193,11 @@ enum BridgeStreamInput {
 
 #[derive(Default)]
 struct BridgeBackendCache {
-    #[cfg(feature = "egress-proxy")]
     egress: Mutex<HashMap<String, Arc<dyn crate::egress::EgressTransport>>>,
     backends: Mutex<HashMap<FirecrackerConfig, Arc<FirecrackerSandboxBackend>>>,
 }
 
 impl BridgeBackendCache {
-    #[cfg(feature = "egress-proxy")]
     async fn egress(&self, id: &str) -> Result<Arc<dyn crate::egress::EgressTransport>> {
         self.egress
             .lock()
@@ -340,13 +338,15 @@ async fn handle_request(
     backends: &BridgeBackendCache,
 ) -> Result<FirecrackerBridgeResponse> {
     match request {
-        #[cfg(feature = "egress-proxy")]
         FirecrackerBridgeRequest::EgressCreate {
             allowed_hosts,
             listen,
         } => {
             let mut listeners = backends.egress.lock().await;
-            anyhow::ensure!(listeners.len() < 256, "too many egress listeners");
+            anyhow::ensure!(
+                listeners.len() < MAX_EGRESS_LISTENERS,
+                "too many egress listeners"
+            );
             let listener: Arc<dyn crate::egress::EgressTransport> = Arc::new(match listen {
                 Some(config) => {
                     crate::egress::LocalEgressTransport::with_config(config, &allowed_hosts).await?
@@ -361,7 +361,6 @@ async fn handle_request(
                 endpoints,
             })
         }
-        #[cfg(feature = "egress-proxy")]
         FirecrackerBridgeRequest::EgressBind {
             listener_id,
             source,
@@ -373,14 +372,12 @@ async fn handle_request(
                 .await?;
             Ok(FirecrackerBridgeResponse::Unit)
         }
-        #[cfg(feature = "egress-proxy")]
         FirecrackerBridgeRequest::EgressClose { listener_id } => {
             if let Some(listener) = backends.egress.lock().await.remove(&listener_id) {
                 listener.close();
             }
             Ok(FirecrackerBridgeResponse::Unit)
         }
-        #[cfg(feature = "egress-proxy")]
         FirecrackerBridgeRequest::EgressAccept { .. } => bail!("egress accept requires a stream"),
 
         FirecrackerBridgeRequest::ResolveImage { config, image } => {
@@ -511,7 +508,6 @@ async fn open_stream(
         bail!("duplicate Firecracker bridge stream id {id}");
     }
     match request {
-        #[cfg(feature = "egress-proxy")]
         FirecrackerBridgeRequest::EgressAccept { listener_id, tls } => {
             let listener = backends.egress(&listener_id).await?;
             let mut input_receiver = input_receiver;

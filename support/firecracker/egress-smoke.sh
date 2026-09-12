@@ -16,7 +16,7 @@ cd "$repo_root"
 build_output="$(mktemp)"
 trap 'rm -f "$build_output"' EXIT
 CARGO_TARGET_DIR="${EXO_EGRESS_TARGET_DIR:-/var/tmp/exo-egress-target}" \
-  CARGO_BUILD_JOBS=2 cargo test -p exoharness --features egress-proxy,firecracker \
+  CARGO_BUILD_JOBS=2 cargo test -p exoharness --features firecracker \
   --lib --no-run --message-format=json-render-diagnostics > "$build_output"
 test_binary="$(python3 - "$build_output" <<'PY'
 import json

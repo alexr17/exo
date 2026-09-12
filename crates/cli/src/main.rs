@@ -73,7 +73,7 @@ const SANDBOX_CLI_AGENT_SLUG: &str = "__exo_sandbox_cli";
     after_help = "Runtime options:\n  --braintrust-api-key <BRAINTRUST_API_KEY>\n  --braintrust-app-url <BRAINTRUST_APP_URL>\n  --braintrust-api-url <BRAINTRUST_API_URL>\n\nThese options are accepted globally, including after subcommands, but are hidden from subcommand help to reduce noise."
 )]
 struct Cli {
-    /// JSON policy for sandbox hosts and credential substitution.
+    /// JSON, YAML, or TOML policy for sandbox hosts and credential substitution.
     #[arg(long, global = true, conflicts_with = "exoharness_url")]
     egress_policy: Option<PathBuf>,
 
@@ -447,6 +447,22 @@ impl From<SandboxProviderArg> for SandboxProvider {
     }
 }
 
+fn read_config_file<T: serde::de::DeserializeOwned>(path: &std::path::Path) -> Result<T> {
+    let contents =
+        std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+    let extension = path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .map(str::to_ascii_lowercase);
+    match extension.as_deref() {
+        Some("json") => serde_json::from_str(&contents).context("invalid JSON"),
+        Some("yaml" | "yml") => serde_yaml::from_str(&contents).context("invalid YAML"),
+        Some("toml") => toml::from_str(&contents).context("invalid TOML"),
+        _ => anyhow::bail!("configuration file must use .json, .yaml, .yml, or .toml"),
+    }
+    .with_context(|| format!("parsing {}", path.display()))
+}
+
 fn build_exo_config(cli: &Cli) -> Result<BasicExoHarnessConfig> {
     let secret_backend = match cli.secret_backend.unwrap_or_else(default_secret_backend) {
         SecretBackendArg::AppleKeychain => SecretBackendChoice::AppleKeychain,
@@ -465,10 +481,7 @@ fn build_exo_config(cli: &Cli) -> Result<BasicExoHarnessConfig> {
     let sandbox_policy = cli
         .egress_policy
         .as_ref()
-        .map(|path| {
-            serde_json::from_reader(std::fs::File::open(path)?)
-                .with_context(|| format!("reading sandbox policy {}", path.display()))
-        })
+        .map(|path| read_config_file(path))
         .transpose()?;
     Ok(BasicExoHarnessConfig {
         root: cli.root.join("exoharness"),

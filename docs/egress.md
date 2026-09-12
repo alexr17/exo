@@ -4,7 +4,8 @@ Sandbox policy is part of `SandboxSpec`. Each backend enforces the policy when
 it acquires, attaches, or restores a sandbox, before returning a usable handle.
 Unsupported policies fail with an error identifying the unsupported field.
 
-Firecracker implements credential substitution with a transparent HTTP/HTTPS
+The existing `firecracker` build feature includes the proxy; there is no separate
+egress feature to enable. Firecracker implements credential substitution with a transparent HTTP/HTTPS
 proxy. Programs receive placeholder environment variables; the proxy resolves
 credentials outside the VM and substitutes them on authorized requests.
 
@@ -14,8 +15,8 @@ credentials or the TLS signing key.
 
 ## Try it
 
-Build with `cargo build -p exo --features firecracker,egress-proxy` and save this
-as `egress.json`:
+Build with `cargo build -p exo --features firecracker` and save this
+as `egress.json` (the flag also accepts `.yaml`, `.yml`, and `.toml`):
 
 ```json
 {
@@ -31,7 +32,7 @@ as `egress.json`:
         "type": "limited",
         "allowed_hosts": ["api.notion.com"]
       },
-      "injection_location": { "header": true, "body": false }
+      "injection_location": { "header": true }
     }
   ]
 }
@@ -81,8 +82,7 @@ async fn resolve(
 ```
 
 The caller selects bindings in `request.spec.policy.credentials`. Each use is
-resolved again, so
-rotation and revocation take effect without replacing the sandbox. Identity
+resolved again, so rotation and revocation take effect without replacing the sandbox. Identity
 includes the sandbox ID and agent/thread scope; destination includes the host,
 port, method, and normalized path/query. A vault adapter can pin a binding to a
 vault/secret reference per thread and enforce its stored destination restrictions.
@@ -97,7 +97,7 @@ let sandbox = backend.acquire(request).await?;
 let output = sandbox.exec(&command).await?;
 ```
 
-The wrapper injects placeholders into `exec`, `start_process`, and terminals,
+The sandbox handle injects placeholders into `exec`, `start_process`, and terminals,
 overriding caller-supplied values. It also configures TLS trust for curl, Git,
 Python requests, Node, and clients that use `SSL_CERT_FILE`. Images need
 `/bin/sh`, `cat`, and `/etc/ssl/certs/ca-certificates.crt`. Separate trust stores
@@ -116,7 +116,9 @@ values in their responses.
 `CreateSandboxRequest.policy` supplies the policy through the Exoharness API.
 `BasicExoHarnessConfig.sandbox_policy` supplies a default, including for the
 CLI's `--egress-policy`. The selected policy is persisted with the sandbox and
-included in its spec hash. Changing the default does not rewrite existing
+included in its spec hash. New records store only the policy; legacy records with
+`enable_networking` remain readable. The event's legacy boolean is derived from
+the policy. Changing the default does not rewrite existing
 sandboxes. Binding values and proxy listener addresses are never in the policy.
 
 The Firecracker backend creates its listeners during acquisition. On Linux,
@@ -138,8 +140,8 @@ fixed ports must be unique for each active sandbox on that address. With
 Lima, this configuration applies inside the Linux VM. Without an explicit
 configuration, the local transport selects the host's routed IPv4 address.
 
-`FirecrackerEgressBackend` owns the proxy lifecycle. Its `shutdown()` closes
-egress while retaining the VM. A fresh backend can reacquire it with new
+The Firecracker and Lima backends own their proxies. `shutdown_egress()` closes
+all proxies while retaining the VMs, including when another acquisition is pending. A fresh backend can reacquire it with new
 listeners, trust, and placeholders; existing client processes must restart to
 receive those values. `stop` and `terminate` preserve the provider's lifecycle
 behavior. Low-level callers that already own their proxy can pass endpoints to
@@ -158,7 +160,9 @@ before NAT on a trusted local host. The production relay is not implemented here
 Vercel translates unrestricted, disabled, and exact-host policies to its native
 network policy. Exact-host rules pin the HTTP Host header. Acquisition updates
 an existing sandbox's policy before resuming its session; a failed update prevents
-resume. Placeholder credential bindings are rejected: native header transforms
+resume. It skips the update when the returned policy exactly matches and skips
+resume when the session is already running. Vercel hides injected header values,
+so exact-host pinning must be reapplied. Placeholder credential bindings are rejected: native header transforms
 set whole values and do not implement Exo's per-request credential resolution.
 A Vercel forwarding adapter would be a separate implementation.
 
@@ -171,8 +175,8 @@ not control the attached container's network.
 ## Current scope
 
 The proxy supports limited networking with exact hosts and HTTPS header
-substitution. Unrestricted passthrough and body substitution are represented in
-the types but rejected until implemented. Standard ports 80/443 are supported;
+substitution. Unrestricted networking with credential bindings is rejected until
+passthrough is implemented. Body substitution is not part of the policy yet. Standard ports 80/443 are supported;
 local gateways on other ports need additional transport support. Model
 credential bindings are not inferred automatically.
 
@@ -185,7 +189,7 @@ auth encoding, and signed requests are also outside this initial implementation.
 With the [Firecracker artifacts](../support/firecracker/README.md) installed:
 
 ```bash
-cargo test -p exoharness --features firecracker,egress-proxy --lib
+cargo test -p exoharness --features firecracker --lib
 bash support/firecracker/egress-smoke.sh
 bash support/firecracker/managed-egress-smoke.sh
 ```

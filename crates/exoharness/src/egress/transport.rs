@@ -12,8 +12,12 @@ use tokio::net::{TcpListener, UdpSocket};
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 
-use super::{IO_TIMEOUT, canonical_host};
+use super::IO_TIMEOUT;
+use crate::types::canonical_egress_hosts;
 use crate::{BoxSandboxTcpStream, SandboxEgressProxy};
+
+const MAX_DNS_TASKS: usize = 32;
+const DNS_BUFFER_SIZE: usize = 4096;
 
 const SYNTHETIC_IP: Ipv4Addr = Ipv4Addr::new(192, 0, 2, 1);
 
@@ -40,20 +44,12 @@ impl LocalEgressTransport {
         let IpAddr::V4(host_ip) = probe.local_addr()?.ip() else {
             return Err(anyhow!("egress requires host IPv4 routing"));
         };
-        let hosts = hosts
-            .iter()
-            .map(|h| canonical_host(h))
-            .collect::<Result<HashSet<_>>>()?;
-        ensure!(hosts.len() <= 128, "too many allowed hosts");
+        let hosts = canonical_egress_hosts(hosts)?;
         Self::bind(host_ip, &hosts).await
     }
 
     pub async fn with_config(config: crate::EgressListenConfig, hosts: &[String]) -> Result<Self> {
-        let hosts = hosts
-            .iter()
-            .map(|h| canonical_host(h))
-            .collect::<Result<HashSet<_>>>()?;
-        ensure!(hosts.len() <= 128, "too many allowed hosts");
+        let hosts = canonical_egress_hosts(hosts)?;
         Self::listen(config, &hosts).await
     }
 
@@ -161,7 +157,7 @@ async fn serve_dns(
 ) {
     let hosts = Arc::new(hosts);
     let mut tasks = JoinSet::new();
-    let mut buffer = [0u8; 4096];
+    let mut buffer = [0u8; DNS_BUFFER_SIZE];
     loop {
         tokio::select! {
             _ = cancel.cancelled() => break,
@@ -178,7 +174,7 @@ async fn serve_dns(
             }
             incoming = tcp.accept() => {
                 let Ok((mut stream, peer)) = incoming else { break; };
-                if !accepts_peer(&source, peer) || tasks.len() >= 32 { continue; }
+                if !accepts_peer(&source, peer) || tasks.len() >= MAX_DNS_TASKS { continue; }
                 let hosts = hosts.clone();
                 tasks.spawn(async move {
                     tokio::time::timeout(IO_TIMEOUT, async {

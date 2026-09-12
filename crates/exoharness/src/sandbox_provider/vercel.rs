@@ -126,6 +126,7 @@ impl VercelSandboxBackend {
         request: &SandboxRequest,
         name: &str,
         spec_hash: &str,
+        network_policy: VercelNetworkPolicy,
     ) -> Result<VercelSandboxSessionResponse> {
         let mut tags = HashMap::new();
         tags.insert(
@@ -149,7 +150,7 @@ impl VercelSandboxBackend {
             timeout: request.lifecycle.idle_ttl.map(duration_to_millis),
             env: HashMap::new(),
             tags,
-            network_policy: VercelNetworkPolicy::from_policy(&request.spec.policy)?,
+            network_policy,
         };
 
         let response = self
@@ -188,15 +189,25 @@ impl ManagedSandboxBackend for VercelSandboxBackend {
         let spec_hash = sandbox_spec_hash(&request.spec);
         let sandbox_name = vercel_sandbox_name(&request, &spec_hash);
         let response = match self.get_sandbox_session(&sandbox_name, false).await? {
-            Some(_) => {
-                self.update_network_policy(&sandbox_name, network_policy)
-                    .await?;
-                self.get_sandbox_session(&sandbox_name, true)
-                    .await?
-                    .context("Vercel sandbox disappeared while resuming")?
+            Some(response) => {
+                if response.sandbox.network_policy != serde_json::to_value(&network_policy)? {
+                    self.update_network_policy(&sandbox_name, network_policy)
+                        .await?;
+                }
+                if response
+                    .session
+                    .as_ref()
+                    .is_some_and(|session| session.status == "running")
+                {
+                    response
+                } else {
+                    self.get_sandbox_session(&sandbox_name, true)
+                        .await?
+                        .context("Vercel sandbox disappeared while resuming")?
+                }
             }
             None => {
-                self.create_sandbox(&request, &sandbox_name, &spec_hash)
+                self.create_sandbox(&request, &sandbox_name, &spec_hash, network_policy)
                     .await?
             }
         };
@@ -756,8 +767,7 @@ impl VercelNetworkPolicy {
             }),
             SandboxNetworkPolicy::Limited { allowed_hosts } => {
                 let mut allow = BTreeMap::new();
-                for host in allowed_hosts {
-                    let host = crate::sandbox::canonical_egress_host(host)?;
+                for host in crate::types::canonical_egress_hosts(allowed_hosts)? {
                     allow.insert(
                         host.clone(),
                         vec![VercelNetworkRule {
@@ -778,12 +788,20 @@ impl VercelNetworkPolicy {
 
 #[derive(Debug, Deserialize)]
 struct VercelSandboxSessionResponse {
+    sandbox: VercelSandboxMetadata,
     session: Option<VercelSession>,
+}
+
+#[derive(Debug, Deserialize)]
+struct VercelSandboxMetadata {
+    #[serde(rename = "networkPolicy", default)]
+    network_policy: serde_json::Value,
 }
 
 #[derive(Debug, Deserialize)]
 struct VercelSession {
     id: String,
+    status: String,
 }
 
 #[derive(Debug, Serialize)]

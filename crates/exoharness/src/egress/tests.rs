@@ -8,10 +8,28 @@ use std::net::SocketAddr;
 use tokio::net::TcpListener;
 use tokio::sync::RwLock;
 
+impl EgressProxy {
+    async fn shutdown(mut self) -> Result<()> {
+        self.close();
+        (&mut self.task).await.context("joining egress proxy")?;
+        Ok(())
+    }
+}
+
 #[derive(Clone)]
-pub(super) struct TestUpstream {
-    pub address: SocketAddr,
-    pub ca_pem: String,
+struct TestUpstream {
+    address: SocketAddr,
+    ca_pem: String,
+}
+
+#[async_trait]
+impl UpstreamResolver for TestUpstream {
+    async fn resolve(&self, _host: &str, _port: u16) -> Result<ResolvedUpstream> {
+        Ok(ResolvedUpstream {
+            addresses: vec![self.address],
+            root_certificate: Some(reqwest::Certificate::from_pem(self.ca_pem.as_bytes())?),
+        })
+    }
 }
 
 struct TestResolver {
@@ -133,12 +151,14 @@ impl Upstream {
         resolver: Arc<dyn EgressCredentialResolver>,
         policy: EgressPolicy,
     ) -> Result<EgressProxy> {
-        let mut state = State::new(identity(sandbox_id), policy, resolver)?;
-        state.upstream = Some(TestUpstream {
-            address: self.config.address,
-            ca_pem: self.config.ca_pem.clone(),
-        });
-        EgressProxy::start(host_ip, state).await
+        let state = State::new(
+            identity(sandbox_id),
+            policy,
+            Some(resolver),
+            Arc::new(self.config.clone()),
+        )?;
+        let transport = Arc::new(LocalEgressTransport::bind(host_ip, &state.hosts).await?);
+        EgressProxy::start_with_transport(transport, state, CancellationToken::new()).await
     }
 }
 
@@ -287,10 +307,7 @@ fn policy() -> EgressPolicy {
             networking: CredentialNetworkPolicy::Limited {
                 allowed_hosts: vec!["api.test".into()],
             },
-            injection_location: CredentialInjectionLocation {
-                header: true,
-                body: false,
-            },
+            injection_location: CredentialInjectionLocation { header: true },
         }],
     }
 }
@@ -316,7 +333,7 @@ fn client(proxy: &EgressProxy) -> Result<reqwest::Client> {
 }
 
 #[tokio::test]
-async fn proxy_authenticates_rotates_revokes_and_isolates() -> Result<()> {
+async fn proxy_requires_a_bound_source_and_closes_on_shutdown() -> Result<()> {
     let upstream = Upstream::start().await?;
     let resolver = TestResolver::new();
     let proxy = upstream.proxy(host_ip()?, "one", resolver.clone()).await?;
@@ -330,9 +347,27 @@ async fn proxy_authenticates_rotates_revokes_and_isolates() -> Result<()> {
     );
     proxy.bind_source(host_ip()?).await?;
     assert!(proxy.bind_source(host_ip()?).await.is_err());
-    let client = client(&proxy)?;
+    let proxy_client = client(&proxy)?;
+    proxy.shutdown().await?;
+    assert!(
+        proxy_client
+            .get("https://api.test/auth")
+            .send()
+            .await
+            .is_err()
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn proxy_substitutes_placeholders_in_header_formats() -> Result<()> {
+    let upstream = Upstream::start().await?;
+    let resolver = TestResolver::new();
+    let proxy = upstream.proxy(host_ip()?, "one", resolver.clone()).await?;
+    proxy.bind_source(host_ip()?).await?;
+    let proxy_client = client(&proxy)?;
     let bearer = format!("Bearer {}", proxy.environment()["TEST_API_KEY"]);
-    let response = client
+    let response = proxy_client
         .get("https://api.test/auth")
         .header("authorization", &bearer)
         .send()
@@ -340,7 +375,7 @@ async fn proxy_authenticates_rotates_revokes_and_isolates() -> Result<()> {
     assert_eq!(response.status(), StatusCode::OK);
     assert_eq!(response.text().await?, "authenticated-v1");
     assert_eq!(
-        client
+        proxy_client
             .get("https://api.test/auth")
             .header("x-api-key", &proxy.environment()["TEST_API_KEY"])
             .send()
@@ -351,7 +386,7 @@ async fn proxy_authenticates_rotates_revokes_and_isolates() -> Result<()> {
     );
     for header in ["connection", "proxy-authorization"] {
         assert!(
-            client
+            proxy_client
                 .get("https://api.test/auth")
                 .header(header, &bearer)
                 .send()
@@ -361,7 +396,7 @@ async fn proxy_authenticates_rotates_revokes_and_isolates() -> Result<()> {
         );
     }
     assert_eq!(
-        client
+        proxy_client
             .get("https://api.test/auth")
             .header("authorization", &proxy.environment()["TEST_API_KEY"])
             .send()
@@ -371,7 +406,7 @@ async fn proxy_authenticates_rotates_revokes_and_isolates() -> Result<()> {
         "raw-v1"
     );
     assert_eq!(
-        client
+        proxy_client
             .get("https://api.test/auth")
             .header(
                 "authorization",
@@ -385,7 +420,7 @@ async fn proxy_authenticates_rotates_revokes_and_isolates() -> Result<()> {
     );
 
     assert_eq!(
-        client
+        proxy_client
             .get("https://public.test/auth")
             .send()
             .await?
@@ -393,9 +428,21 @@ async fn proxy_authenticates_rotates_revokes_and_isolates() -> Result<()> {
             .await?,
         "anonymous"
     );
+    proxy.shutdown().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn proxy_resolves_current_credentials_for_each_request() -> Result<()> {
+    let upstream = Upstream::start().await?;
+    let resolver = TestResolver::new();
+    let proxy = upstream.proxy(host_ip()?, "one", resolver.clone()).await?;
+    proxy.bind_source(host_ip()?).await?;
+    let proxy_client = client(&proxy)?;
+    let bearer = format!("Bearer {}", proxy.environment()["TEST_API_KEY"]);
     *resolver.value.write().await = Some("canary-v2".into());
     assert_eq!(
-        client
+        proxy_client
             .get("https://api.test/auth")
             .header("authorization", &bearer)
             .send()
@@ -404,59 +451,9 @@ async fn proxy_authenticates_rotates_revokes_and_isolates() -> Result<()> {
             .await?,
         "authenticated-v2"
     );
-    let cleartext = reqwest::Client::builder()
-        .no_proxy()
-        .resolve("api.test", proxy.endpoints().http.into())
-        .timeout(Duration::from_secs(5))
-        .build()?;
-    assert!(
-        cleartext
-            .get("http://api.test/auth")
-            .header("authorization", &bearer)
-            .send()
-            .await?
-            .status()
-            .is_server_error()
-    );
-    assert!(
-        client
-            .get("https://public.test/auth")
-            .header("authorization", &bearer)
-            .send()
-            .await?
-            .status()
-            .is_server_error()
-    );
-    assert!(
-        client
-            .get("https://api.test/auth")
-            .header(HOST, "public.test")
-            .header("authorization", &bearer)
-            .send()
-            .await?
-            .status()
-            .is_server_error()
-    );
-    let redirect = client
-        .get("https://api.test/redirect")
-        .header("authorization", &bearer)
-        .send()
-        .await?;
-    assert_eq!(redirect.status(), StatusCode::FOUND);
-    let other = upstream.proxy(host_ip()?, "two", resolver.clone()).await?;
-    other.bind_source(host_ip()?).await?;
-    assert!(
-        self::client(&other)?
-            .get("https://api.test/auth")
-            .header("authorization", &bearer)
-            .send()
-            .await?
-            .status()
-            .is_server_error()
-    );
     *resolver.value.write().await = None;
     assert!(
-        client
+        proxy_client
             .get("https://api.test/auth")
             .header("authorization", &bearer)
             .send()
@@ -475,7 +472,68 @@ async fn proxy_authenticates_rotates_revokes_and_isolates() -> Result<()> {
                 && host == "api.test")
     );
     proxy.shutdown().await?;
-    assert!(client.get("https://api.test/auth").send().await.is_err());
+    Ok(())
+}
+
+#[tokio::test]
+async fn proxy_rejects_cleartext_wrong_destinations_and_other_sandboxes() -> Result<()> {
+    let upstream = Upstream::start().await?;
+    let resolver = TestResolver::new();
+    let proxy = upstream.proxy(host_ip()?, "one", resolver.clone()).await?;
+    proxy.bind_source(host_ip()?).await?;
+    let proxy_client = client(&proxy)?;
+    let bearer = format!("Bearer {}", proxy.environment()["TEST_API_KEY"]);
+    let cleartext = reqwest::Client::builder()
+        .no_proxy()
+        .resolve("api.test", proxy.endpoints().http.into())
+        .timeout(Duration::from_secs(5))
+        .build()?;
+    assert!(
+        cleartext
+            .get("http://api.test/auth")
+            .header("authorization", &bearer)
+            .send()
+            .await?
+            .status()
+            .is_server_error()
+    );
+    assert!(
+        proxy_client
+            .get("https://public.test/auth")
+            .header("authorization", &bearer)
+            .send()
+            .await?
+            .status()
+            .is_server_error()
+    );
+    assert!(
+        proxy_client
+            .get("https://api.test/auth")
+            .header(HOST, "public.test")
+            .header("authorization", &bearer)
+            .send()
+            .await?
+            .status()
+            .is_server_error()
+    );
+    let redirect = proxy_client
+        .get("https://api.test/redirect")
+        .header("authorization", &bearer)
+        .send()
+        .await?;
+    assert_eq!(redirect.status(), StatusCode::FOUND);
+    let other = upstream.proxy(host_ip()?, "two", resolver.clone()).await?;
+    other.bind_source(host_ip()?).await?;
+    assert!(
+        client(&other)?
+            .get("https://api.test/auth")
+            .header("authorization", &bearer)
+            .send()
+            .await?
+            .status()
+            .is_server_error()
+    );
+    proxy.shutdown().await?;
     other.shutdown().await?;
     Ok(())
 }
@@ -514,7 +572,13 @@ fn rejects_unsafe_policy_and_addresses() {
     config.credentials[0].networking = CredentialNetworkPolicy::Limited {
         allowed_hosts: vec!["blocked.test".into()],
     };
-    let state = State::new(identity("one"), config, TestResolver::new()).unwrap();
+    let state = State::new(
+        identity("one"),
+        config,
+        Some(TestResolver::new()),
+        Arc::new(PublicUpstreamResolver),
+    )
+    .unwrap();
     assert!(!state.hosts.contains("blocked.test"));
     assert!(!state.bindings[0].permits_header("api.test"));
 }
@@ -523,18 +587,38 @@ fn rejects_unsafe_policy_and_addresses() {
 fn credential_networking_is_independent_of_environment_networking() -> Result<()> {
     let mut config = policy();
     config.credentials[0].networking = CredentialNetworkPolicy::Unrestricted;
-    let state = State::new(identity("one"), config.clone(), TestResolver::new())?;
+    let state = State::new(
+        identity("one"),
+        config.clone(),
+        Some(TestResolver::new()),
+        Arc::new(PublicUpstreamResolver),
+    )?;
     assert!(state.hosts.contains("public.test"));
     assert!(!state.hosts.contains("blocked.test"));
     assert!(state.bindings[0].permits_header("public.test"));
     config.credentials[0].injection_location.header = false;
-    let state = State::new(identity("one"), config.clone(), TestResolver::new())?;
+    let state = State::new(
+        identity("one"),
+        config.clone(),
+        Some(TestResolver::new()),
+        Arc::new(PublicUpstreamResolver),
+    )?;
     assert!(!state.bindings[0].permits_header("api.test"));
-    config.credentials[0].injection_location.body = true;
-    assert!(State::new(identity("one"), config, TestResolver::new()).is_err());
+    assert!(
+        serde_json::from_str::<CredentialInjectionLocation>(r#"{"header": true, "body": true}"#)
+            .is_err()
+    );
     let mut config = policy();
     config.networking = SandboxNetworkPolicy::Unrestricted;
-    assert!(State::new(identity("one"), config, TestResolver::new()).is_err());
+    assert!(
+        State::new(
+            identity("one"),
+            config,
+            Some(TestResolver::new()),
+            Arc::new(PublicUpstreamResolver)
+        )
+        .is_err()
+    );
     Ok(())
 }
 
@@ -542,7 +626,12 @@ fn credential_networking_is_independent_of_environment_networking() -> Result<()
 fn dns_only_answers_exact_allowed_names() -> Result<()> {
     use hickory_proto::op::Query;
     use hickory_proto::rr::Name;
-    let state = State::new(identity("one"), policy(), TestResolver::new())?;
+    let state = State::new(
+        identity("one"),
+        policy(),
+        Some(TestResolver::new()),
+        Arc::new(PublicUpstreamResolver),
+    )?;
     for (host, kind, allowed) in [
         ("api.test", RecordType::A, true),
         ("api.test", RecordType::AAAA, true),
@@ -744,13 +833,18 @@ async fn managed_firecracker_egress_live() -> Result<()> {
     };
     #[cfg(target_os = "macos")]
     let instance = lima.instance.clone();
-    let raw = crate::firecracker_egress_provider(config, lima).await?;
+    #[cfg(target_os = "linux")]
+    let raw = {
+        drop(lima);
+        crate::FirecrackerSandboxBackend::new(config).await?
+    };
+    #[cfg(target_os = "macos")]
+    let raw = crate::LimaFirecrackerSandboxBackend::new(config, lima).await?;
     let upstream = Upstream::start().await?;
     let resolver = TestResolver::new();
     let make_backend = || {
-        let mut backend = FirecrackerEgressBackend::new(raw.clone(), Some(resolver.clone()));
-        backend.upstream = Some(upstream.config.clone());
-        backend
+        raw.clone()
+            .with_egress(Some(resolver.clone()), Arc::new(upstream.config.clone()))
     };
     let backend = make_backend();
     let request = SandboxRequest {
@@ -823,7 +917,7 @@ print('PASS automatic placeholders, Python and curl trust, native transport, DNS
         let reused = backend.acquire(request.clone()).await?;
         assert_eq!(reused.id(), id);
         let old_ca = handle.exec(&command("import os; print(os.environ['SSL_CERT_FILE'])".into())).await?.stdout;
-        backend.shutdown().await;
+        backend.shutdown_egress();
         let replacement = make_backend();
         let new_handle = replacement.acquire(request.clone()).await?;
         assert_eq!(new_handle.id(), id);

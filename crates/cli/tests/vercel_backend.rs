@@ -45,13 +45,19 @@ fn backend_for_mock(server: &MockServer) -> VercelSandboxBackend {
 }
 
 fn sandbox_response(session_id: &str) -> Value {
+    sandbox_response_with_status(session_id, "running")
+}
+
+fn sandbox_response_with_status(session_id: &str, status: &str) -> Value {
     json!({
         "sandbox": {
             "id": "sandbox-id",
-            "status": "running"
+            "status": status,
+            "networkPolicy": {"mode": "allow-all"}
         },
         "session": {
-            "id": session_id
+            "id": session_id,
+            "status": status
         }
     })
 }
@@ -68,13 +74,22 @@ async fn mount_missing_named_sandbox(server: &MockServer) {
 }
 
 async fn mount_existing_named_sandbox(server: &MockServer, session_id: &str) {
+    mount_named_sandbox_with_status(server, session_id, "running").await;
+}
+
+async fn mount_named_sandbox_with_status(server: &MockServer, session_id: &str, status: &str) {
     for resume in ["false", "true"] {
         Mock::given(method("GET"))
             .and(path_regex(r"^/v2/sandboxes/exo-[0-9a-f]+$"))
             .and(query_param("teamId", "team_1"))
             .and(query_param("projectId", "project_1"))
             .and(query_param("resume", resume))
-            .respond_with(ResponseTemplate::new(200).set_body_json(sandbox_response(session_id)))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(sandbox_response_with_status(
+                    session_id,
+                    if resume == "false" { status } else { "running" },
+                )),
+            )
             .mount(server)
             .await;
     }
@@ -119,12 +134,8 @@ async fn acquire_reuses_named_sandbox_without_create() {
         .expect("acquire should reuse the named Vercel sandbox");
 
     let requests = server.received_requests().await.unwrap_or_default();
-    assert!(
-        !requests
-            .iter()
-            .any(|request| request.method.to_string().to_uppercase() == "POST"),
-        "reusing a named sandbox must not create a fresh sandbox"
-    );
+    assert_eq!(requests.len(), 1, "unchanged warm policy needs only a GET");
+    assert_eq!(requests[0].method.as_str(), "GET");
 }
 
 #[tokio::test]
@@ -535,10 +546,7 @@ async fn unsupported_credentials_fail_before_any_provider_request() {
             name: "braintrust".into(),
             environment_variable: "BRAINTRUST_API_KEY".into(),
             networking: exoharness::CredentialNetworkPolicy::Unrestricted,
-            injection_location: exoharness::CredentialInjectionLocation {
-                header: true,
-                body: false,
-            },
+            injection_location: exoharness::CredentialInjectionLocation { header: true },
         });
     let result = backend.acquire(request).await;
     assert!(
@@ -555,7 +563,7 @@ async fn unsupported_credentials_fail_before_any_provider_request() {
 async fn resume_applies_policy_before_starting_the_session() {
     let server = MockServer::start().await;
     let backend = backend_for_mock(&server);
-    mount_existing_named_sandbox(&server, "resumed").await;
+    mount_named_sandbox_with_status(&server, "resumed", "stopped").await;
     let mut request = make_request("thread", "disabled");
     request.spec.policy = SandboxNetworkPolicy::Disabled.into();
     backend.acquire(request).await.expect("resume with policy");
@@ -575,7 +583,9 @@ async fn failed_policy_update_does_not_resume_the_sandbox() {
     Mock::given(method("GET"))
         .and(path_regex(r"^/v2/sandboxes/exo-[0-9a-f]+$"))
         .and(query_param("resume", "false"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"session": null})))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(json!({"sandbox": {}, "session": null})),
+        )
         .expect(1)
         .mount(&server)
         .await;
@@ -609,4 +619,42 @@ async fn invalid_host_fails_before_any_provider_request() {
     .into();
     assert!(backend.acquire(request).await.is_err());
     assert!(server.received_requests().await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn redacted_host_pinning_is_reapplied_without_resuming() {
+    let server = MockServer::start().await;
+    let backend = backend_for_mock(&server);
+    Mock::given(method("GET"))
+        .and(query_param("resume", "false"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "sandbox": {"networkPolicy": {
+                "mode": "custom", "allowedDomains": ["api.test"],
+                "injectionRules": [{"domain": "api.test", "headerNames": ["Host"]}]
+            }},
+            "session": {"id": "running", "status": "running"}
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("PATCH"))
+        .and(wiremock::matchers::body_json(
+            json!({"networkPolicy": {"allow": {
+                "api.test": [{"transform": [{"headers": {"Host": "api.test"}}]}]
+            }}}),
+        ))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let mut request = make_request("thread", "limited-reuse");
+    request.spec.policy = SandboxNetworkPolicy::Limited {
+        allowed_hosts: vec!["api.test".into()],
+    }
+    .into();
+    backend
+        .acquire(request)
+        .await
+        .expect("limited policy reapplied");
+    assert_eq!(server.received_requests().await.unwrap().len(), 2);
 }

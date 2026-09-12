@@ -106,16 +106,25 @@ fn proxy_transport_enforces_egress_independently_of_network_policy() {
     let limited = SandboxNetworkPolicy::Limited {
         allowed_hosts: vec!["api.notion.com".into()],
     };
-    assert!(network_firewall_rules(&config, &network, &limited, None).is_err());
-    assert!(
-        network_firewall_rules(
-            &config,
-            &network,
-            &SandboxNetworkPolicy::Disabled,
-            Some(proxy)
-        )
-        .is_err()
-    );
+    let request = |networking, egress_proxy| FirecrackerRequest {
+        sandbox: SandboxRequest {
+            sandbox_id: "policy-validation".into(),
+            scope: None,
+            provider_state: None,
+            spec: SandboxSpec {
+                image: String::new(),
+                resources: Default::default(),
+                mounts: vec![],
+                durable_file_systems: vec![],
+                default_workdir: "/home/exo/workspace".into(),
+                policy: crate::EgressPolicy::from(networking),
+            },
+            lifecycle: Default::default(),
+        },
+        egress_proxy,
+    };
+    assert!(prepare_request(request(limited.clone(), None)).is_err());
+    assert!(prepare_request(request(SandboxNetworkPolicy::Disabled, Some(proxy))).is_err());
     for policy in [limited, SandboxNetworkPolicy::Unrestricted] {
         let rules = network_firewall_rules(&config, &network, &policy, Some(proxy)).unwrap();
         assert!(rules.contains("tcp dport 443 counter dnat ip to 192.0.2.10:18443"));

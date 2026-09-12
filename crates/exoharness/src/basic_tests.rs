@@ -2214,10 +2214,7 @@ async fn sandbox_provider_state_persists_through_events_after_harness_reload() {
             name: "thread-credential".into(),
             environment_variable: "API_KEY".into(),
             networking: crate::CredentialNetworkPolicy::Unrestricted,
-            injection_location: crate::CredentialInjectionLocation {
-                header: true,
-                body: false,
-            },
+            injection_location: crate::CredentialInjectionLocation { header: true },
         }],
     };
     let mut config = local_test_config(tempdir.path());
@@ -2903,4 +2900,32 @@ async fn daytona_sandbox_binding_drives_provider_config() {
     assert_eq!(config.target.as_deref(), Some("experimental"));
     assert_eq!(config.organization_id.as_deref(), Some("org-1"));
     assert_eq!(config.api_url, crate::DEFAULT_DAYTONA_API_URL);
+}
+
+#[tokio::test]
+async fn local_process_sandbox_rejects_disabled_networking() {
+    let backend = crate::LocalProcessSandboxBackend::new();
+    let result = backend
+        .acquire(crate::SandboxRequest {
+            sandbox_id: "disabled-network".into(),
+            scope: None,
+            provider_state: None,
+            spec: crate::SandboxSpec {
+                image: String::new(),
+                resources: Default::default(),
+                mounts: vec![],
+                durable_file_systems: vec![],
+                default_workdir: "/tmp".into(),
+                policy: crate::SandboxNetworkPolicy::Disabled.into(),
+            },
+            lifecycle: crate::SandboxLifecycleConfig::default(),
+        })
+        .await;
+    assert!(
+        result
+            .err()
+            .expect("disabled networking must be rejected")
+            .to_string()
+            .contains("policy.networking.disabled")
+    );
 }

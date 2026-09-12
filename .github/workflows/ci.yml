@@ -68,4 +68,4 @@ jobs:
         run: cargo test --workspace --all-targets
 
       - name: Check Firecracker and sandbox egress
-        run: cargo test -p exoharness --features firecracker,egress-proxy --lib --locked
+        run: cargo test -p exoharness --features firecracker --lib --locked

@@ -91,17 +91,6 @@ impl SandboxEgressProxy {
     }
 }
 
-impl SandboxNetworkPolicy {
-    pub(crate) fn reject_limited(&self) -> Result<()> {
-        if matches!(self, Self::Limited { .. }) {
-            bail!(
-                "sandbox provider cannot enforce limited networking; use Firecracker with an egress backend"
-            );
-        }
-        Ok(())
-    }
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct SandboxSpec {
     pub image: String,
@@ -1906,7 +1895,6 @@ fn configure_network_args(
     policy: &SandboxNetworkPolicy,
     network_name: Option<&str>,
 ) -> Result<()> {
-    policy.reject_limited()?;
     match policy {
         SandboxNetworkPolicy::Disabled | SandboxNetworkPolicy::Limited { .. } => {
             process.arg("--network").arg("none");
@@ -2401,29 +2389,6 @@ async fn docker_load_image(container_bin: &Path, payload: &Bytes) -> Result<Stri
         }
     }
     bail!("docker load completed but no image reference found in output: {stdout}")
-}
-
-pub(crate) fn canonical_egress_host(host: &str) -> Result<String> {
-    ensure!(
-        !host.is_empty() && host.len() <= 253 && !host.ends_with('.'),
-        "invalid egress hostname"
-    );
-    let host = host.to_ascii_lowercase();
-    ensure!(
-        host.parse::<std::net::IpAddr>().is_err(),
-        "IP literals are not egress hostnames"
-    );
-    ensure!(
-        host.split('.').all(|label| !label.is_empty()
-            && label.len() <= 63
-            && !label.starts_with('-')
-            && !label.ends_with('-')
-            && label
-                .bytes()
-                .all(|b| b.is_ascii_alphanumeric() || b == b'-')),
-        "expected an exact ASCII hostname"
-    );
-    Ok(host)
 }
 
 #[cfg(test)]

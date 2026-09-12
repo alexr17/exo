@@ -1,260 +1,61 @@
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::future::Future;
+use std::net::Ipv4Addr;
+use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 
-use anyhow::{Result, bail, ensure};
-use async_trait::async_trait;
-use tokio::sync::Mutex;
+use anyhow::{Result, ensure};
+use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard};
+use tokio_util::sync::CancellationToken;
 
-use super::{EgressCredentialResolver, EgressIdentity, EgressProxy};
-use crate::{
-    BoxSandboxTcpStream, ManagedSandboxBackend, ManagedSandboxHandle, SandboxAttachment,
-    SandboxCommand, SandboxCommandOutput, SandboxNetworkPolicy, SandboxProcessParts,
-    SandboxRequest, SandboxTerminalParts, SandboxTerminalSize, SnapshotFormat, SnapshotPayload,
+use super::{
+    EgressCredentialResolver, EgressIdentity, EgressProxy, EgressTransport, State, UpstreamResolver,
 };
+use crate::{ManagedSandboxHandle, SandboxCommand, SandboxRequest};
 
-#[async_trait]
-pub trait FirecrackerEgressProvider: ManagedSandboxBackend {
-    async fn egress_transport(
-        &self,
-        request: &SandboxRequest,
-        allowed_hosts: &[String],
-    ) -> Result<Arc<dyn super::EgressTransport>>;
+const PREPARE_TRUST: &str = r#"set -eu
+umask 077
+cat /etc/ssl/certs/ca-certificates.crt > "$EXO_EGRESS_CA_PATH"
+printf '\n%s\n' "$EXO_EGRESS_CA_PEM" >> "$EXO_EGRESS_CA_PATH"
+"#;
 
-    async fn acquire_egress(
-        &self,
-        request: SandboxRequest,
-        endpoints: crate::SandboxEgressProxy,
-    ) -> Result<(Arc<dyn ManagedSandboxHandle>, std::net::Ipv4Addr)>;
+pub(crate) struct SandboxEgress {
+    proxy: EgressProxy,
+    ca_path: String,
 }
 
-struct NoCredentials;
+impl SandboxEgress {
+    pub(crate) fn endpoints(&self) -> crate::SandboxEgressProxy {
+        self.proxy.endpoints()
+    }
 
-#[async_trait]
-impl EgressCredentialResolver for NoCredentials {
-    async fn resolve(
+    pub(crate) async fn initialize(
         &self,
-        _identity: &EgressIdentity,
-        _binding_name: &str,
-        _destination: &super::EgressDestination,
-    ) -> Result<String> {
-        bail!("Firecracker credential resolver is not configured")
-    }
-}
-
-type SandboxSlot = Arc<Mutex<Option<Arc<EgressSandboxHandle>>>>;
-
-pub struct FirecrackerEgressBackend {
-    backend: Arc<dyn FirecrackerEgressProvider>,
-    resolver: Option<Arc<dyn EgressCredentialResolver>>,
-    #[cfg(test)]
-    pub(super) upstream: Option<super::tests::TestUpstream>,
-    sandboxes: Mutex<HashMap<String, SandboxSlot>>,
-}
-
-impl FirecrackerEgressBackend {
-    pub fn new(
-        backend: Arc<dyn FirecrackerEgressProvider>,
-        resolver: Option<Arc<dyn EgressCredentialResolver>>,
-    ) -> Self {
-        Self {
-            backend,
-            resolver,
-            #[cfg(test)]
-            upstream: None,
-            sandboxes: Mutex::new(HashMap::new()),
-        }
-    }
-
-    pub async fn shutdown(&self) {
-        let slots = self
-            .sandboxes
-            .lock()
-            .await
-            .values()
-            .cloned()
-            .collect::<Vec<_>>();
-        for slot in slots {
-            if let Some(handle) = slot.lock().await.as_ref() {
-                handle.proxy.close();
-            }
-        }
-    }
-
-    async fn slot(&self, id: &str) -> SandboxSlot {
-        self.sandboxes
-            .lock()
-            .await
-            .entry(id.to_owned())
-            .or_default()
-            .clone()
-    }
-
-    async fn proxy(&self, request: &SandboxRequest) -> Result<EgressProxy> {
-        let state = super::State::new(
-            EgressIdentity {
-                sandbox_id: request.sandbox_id.clone(),
-                scope: request.scope.clone(),
-            },
-            request.spec.policy.clone(),
-            match &self.resolver {
-                Some(resolver) => resolver.clone(),
-                None => {
-                    ensure!(
-                        request.spec.policy.credentials.is_empty(),
-                        "Firecracker policy.credentials requires a credential resolver"
-                    );
-                    Arc::new(NoCredentials)
-                }
-            },
-        )?;
-        let transport = self
-            .backend
-            .egress_transport(request, &state.hosts.iter().cloned().collect::<Vec<_>>())
+        handle: &dyn ManagedSandboxHandle,
+        source: Ipv4Addr,
+    ) -> Result<()> {
+        self.proxy.bind_source(source).await?;
+        let prepared = handle
+            .exec(&SandboxCommand {
+                argv: vec!["/bin/sh".into(), "-c".into(), PREPARE_TRUST.into()],
+                env: HashMap::from([
+                    ("EXO_EGRESS_CA_PATH".into(), self.ca_path.clone()),
+                    ("EXO_EGRESS_CA_PEM".into(), self.proxy.ca_pem().into()),
+                ]),
+                display_argv: None,
+                cwd: None,
+                timeout: Some(Duration::from_secs(30)),
+            })
             .await?;
-        #[cfg(test)]
-        let state = super::State {
-            upstream: self.upstream.clone(),
-            ..state
-        };
-        EgressProxy::start_with_transport(transport, state).await
-    }
-}
-
-#[async_trait]
-impl ManagedSandboxBackend for FirecrackerEgressBackend {
-    fn is_local(&self) -> bool {
-        self.backend.is_local()
-    }
-    fn consumable_snapshot_formats(&self) -> &[SnapshotFormat] {
-        self.backend.consumable_snapshot_formats()
-    }
-    async fn delete_snapshot(&self, payload: SnapshotPayload) -> Result<()> {
-        self.backend.delete_snapshot(payload).await
-    }
-    async fn fork_sandbox(
-        &self,
-        source: SandboxRequest,
-        target: SandboxRequest,
-    ) -> Result<Arc<dyn ManagedSandboxHandle>> {
-        source
-            .spec
-            .policy
-            .validate_basic("Firecracker snapshot source")?;
-        target
-            .spec
-            .policy
-            .validate_basic("Firecracker snapshot target")?;
-        self.backend.fork_sandbox(source, target).await
-    }
-    async fn resolve_image(&self, image: &str) -> Result<crate::ResolvedSandboxImage> {
-        self.backend.resolve_image(image).await
-    }
-
-    async fn acquire(&self, request: SandboxRequest) -> Result<Arc<dyn ManagedSandboxHandle>> {
-        if request.spec.policy.credentials.is_empty()
-            && !matches!(
-                request.spec.policy.networking,
-                SandboxNetworkPolicy::Limited { .. }
-            )
-        {
-            return self.backend.acquire(request).await;
-        }
-        ensure!(
-            request.lifecycle.idle_ttl.is_some(),
-            "proxy egress requires a managed sandbox lifecycle"
-        );
-        ensure!(
-            request.spec.policy.networking != SandboxNetworkPolicy::Disabled,
-            "proxy egress requires networking enabled"
-        );
-        let slot = self.slot(&request.sandbox_id).await;
-        let mut slot = slot.lock().await;
-        if let Some(handle) = slot.as_ref() {
-            ensure!(
-                handle.request.spec == request.spec && handle.request.scope == request.scope,
-                "stop the protected sandbox before changing its configuration"
-            );
-            if !handle.proxy.cancel.is_cancelled()
-                && handle.inner.is_running().await? != Some(false)
-            {
-                return Ok(handle.clone());
-            }
-            handle.proxy.close();
-        }
-        let proxy = self.proxy(&request).await?;
-        let (inner, source) = self
-            .backend
-            .acquire_egress(request.clone(), proxy.endpoints())
-            .await?;
-        proxy.bind_source(source).await?;
-        let ca_path = format!("/tmp/exo-egress-{}.pem", uuid::Uuid::new_v4().simple());
-        let preparation = SandboxCommand {
-            argv: vec!["/bin/sh".into(), "-c".into(),
-                "set -eu; umask 077; cat /etc/ssl/certs/ca-certificates.crt > \"$EXO_EGRESS_CA_PATH\"; printf '\\n%s\\n' \"$EXO_EGRESS_CA_PEM\" >> \"$EXO_EGRESS_CA_PATH\"".into()],
-            env: HashMap::from([("EXO_EGRESS_CA_PATH".into(), ca_path.clone()), ("EXO_EGRESS_CA_PEM".into(), proxy.ca_pem().into())]),
-            display_argv: None, cwd: None, timeout: Some(Duration::from_secs(30)),
-        };
-        let prepared = inner.exec(&preparation).await?;
         ensure!(
             prepared.ok,
             "could not prepare sandbox TLS trust: {}",
             prepared.stderr
         );
-        let handle = Arc::new(EgressSandboxHandle {
-            inner,
-            proxy,
-            request,
-            ca_path,
-        });
-        *slot = Some(handle.clone());
-        Ok(handle)
-    }
-
-    async fn terminate(&self, request: SandboxRequest) -> Result<()> {
-        let slot = self.slot(&request.sandbox_id).await;
-        let mut slot = slot.lock().await;
-        if let Some(handle) = slot.as_ref() {
-            handle.proxy.close();
-        }
-        self.backend.terminate(request).await?;
-        *slot = None;
         Ok(())
     }
 
-    async fn attach(
-        &self,
-        request: SandboxRequest,
-        attachment: SandboxAttachment,
-    ) -> Result<Arc<dyn ManagedSandboxHandle>> {
-        request
-            .spec
-            .policy
-            .validate_basic("Firecracker external attachments")?;
-        self.backend.attach(request, attachment).await
-    }
-    async fn acquire_from_snapshot(
-        &self,
-        request: SandboxRequest,
-        payload: SnapshotPayload,
-    ) -> Result<Arc<dyn ManagedSandboxHandle>> {
-        request
-            .spec
-            .policy
-            .validate_basic("Firecracker snapshot restore")?;
-        self.backend.acquire_from_snapshot(request, payload).await
-    }
-}
-
-struct EgressSandboxHandle {
-    inner: Arc<dyn ManagedSandboxHandle>,
-    proxy: EgressProxy,
-    request: SandboxRequest,
-    ca_path: String,
-}
-
-impl EgressSandboxHandle {
-    fn command(&self, command: &SandboxCommand) -> Result<SandboxCommand> {
+    pub(crate) fn command(&self, command: &SandboxCommand) -> Result<SandboxCommand> {
         ensure!(
             !self.proxy.cancel.is_cancelled(),
             "sandbox egress proxy is closed; acquire the sandbox again"
@@ -272,54 +73,329 @@ impl EgressSandboxHandle {
         }
         Ok(command)
     }
+
+    pub(crate) fn close(&self) {
+        self.proxy.close();
+    }
 }
 
-#[async_trait]
-impl ManagedSandboxHandle for EgressSandboxHandle {
-    fn id(&self) -> &str {
-        self.inner.id()
+struct CachedSandbox<H> {
+    request: SandboxRequest,
+    handle: Option<Arc<H>>,
+    egress: Arc<SandboxEgress>,
+}
+
+pub(crate) struct EgressRuntime<H> {
+    resolver: Option<Arc<dyn EgressCredentialResolver>>,
+    upstream: Arc<dyn UpstreamResolver>,
+    locks: Mutex<HashMap<String, Weak<AsyncMutex<()>>>>,
+    sandboxes: Mutex<HashMap<String, CachedSandbox<H>>>,
+    closed: CancellationToken,
+}
+
+impl<H: ManagedSandboxHandle + 'static> EgressRuntime<H> {
+    pub(crate) fn new(
+        resolver: Option<Arc<dyn EgressCredentialResolver>>,
+        upstream: Arc<dyn UpstreamResolver>,
+    ) -> Self {
+        Self {
+            resolver,
+            upstream,
+            locks: Mutex::new(HashMap::new()),
+            sandboxes: Mutex::new(HashMap::new()),
+            closed: CancellationToken::new(),
+        }
     }
-    fn provider_state(&self) -> Option<serde_json::Value> {
-        self.inner.provider_state()
+
+    async fn lock(&self, id: &str) -> OwnedMutexGuard<()> {
+        let lock = {
+            let mut locks = self.locks.lock().expect("egress lock map poisoned");
+            locks.retain(|_, lock| lock.strong_count() > 0);
+            match locks.get(id).and_then(Weak::upgrade) {
+                Some(lock) => lock,
+                None => {
+                    let lock = Arc::new(AsyncMutex::new(()));
+                    locks.insert(id.to_owned(), Arc::downgrade(&lock));
+                    lock
+                }
+            }
+        };
+        lock.lock_owned().await
     }
-    fn effective_image(&self) -> Option<String> {
-        self.inner.effective_image()
-    }
-    async fn is_running(&self) -> Result<Option<bool>> {
-        self.inner.is_running().await
-    }
-    async fn exec(&self, command: &SandboxCommand) -> Result<SandboxCommandOutput> {
-        self.inner.exec(&self.command(command)?).await
-    }
-    async fn start_process(&self, command: &SandboxCommand) -> Result<SandboxProcessParts> {
-        self.inner.start_process(&self.command(command)?).await
-    }
-    async fn start_terminal(
+
+    pub(crate) async fn acquire<T, TF, B, BF>(
         &self,
-        command: &SandboxCommand,
-        size: SandboxTerminalSize,
-    ) -> Result<SandboxTerminalParts> {
-        self.inner
-            .start_terminal(&self.command(command)?, size)
-            .await
+        request: SandboxRequest,
+        transport: T,
+        build: B,
+    ) -> Result<Arc<H>>
+    where
+        T: FnOnce(Vec<String>) -> TF,
+        TF: Future<Output = Result<Arc<dyn EgressTransport>>>,
+        B: FnOnce(Option<Arc<SandboxEgress>>) -> BF,
+        BF: Future<Output = Result<H>>,
+    {
+        let _guard = self.lock(&request.sandbox_id).await;
+        let cached = self
+            .sandboxes
+            .lock()
+            .expect("egress sandbox map poisoned")
+            .get(&request.sandbox_id)
+            .map(|cached| {
+                (
+                    cached.request.clone(),
+                    cached.handle.clone(),
+                    cached.egress.clone(),
+                )
+            });
+        if let Some((previous, handle, egress)) = cached {
+            ensure!(
+                previous.spec == request.spec && previous.scope == request.scope,
+                "stop the protected sandbox before changing its configuration"
+            );
+            if let Some(handle) = handle
+                && !egress.proxy.cancel.is_cancelled()
+                && handle.is_running().await? != Some(false)
+            {
+                return Ok(handle);
+            }
+            self.remove(&request.sandbox_id);
+        }
+        if !request.spec.policy.requires_proxy() {
+            return Ok(Arc::new(build(None).await?));
+        }
+        ensure!(
+            !self.closed.is_cancelled(),
+            "sandbox egress runtime is shut down"
+        );
+        ensure!(
+            request.lifecycle.idle_ttl.is_some(),
+            "proxy egress requires a managed sandbox lifecycle"
+        );
+        let state = State::new(
+            EgressIdentity {
+                sandbox_id: request.sandbox_id.clone(),
+                scope: request.scope.clone(),
+            },
+            request.spec.policy.clone(),
+            self.resolver.clone(),
+            self.upstream.clone(),
+        )?;
+        let transport = transport(state.hosts.iter().cloned().collect()).await?;
+        let egress = Arc::new(SandboxEgress {
+            proxy: EgressProxy::start_with_transport(transport, state, self.closed.child_token())
+                .await?,
+            ca_path: format!("/tmp/exo-egress-{}.pem", uuid::Uuid::new_v4().simple()),
+        });
+        self.sandboxes
+            .lock()
+            .expect("egress sandbox map poisoned")
+            .insert(
+                request.sandbox_id.clone(),
+                CachedSandbox {
+                    request: request.clone(),
+                    handle: None,
+                    egress: egress.clone(),
+                },
+            );
+        let handle = match build(Some(egress)).await {
+            Ok(handle) => Arc::new(handle),
+            Err(error) => {
+                self.remove(&request.sandbox_id);
+                return Err(error);
+            }
+        };
+        let mut sandboxes = self.sandboxes.lock().expect("egress sandbox map poisoned");
+        ensure!(
+            !self.closed.is_cancelled(),
+            "sandbox egress runtime shut down during acquisition"
+        );
+        sandboxes
+            .get_mut(&request.sandbox_id)
+            .expect("acquiring sandbox remains registered")
+            .handle = Some(handle.clone());
+        Ok(handle)
     }
-    fn supports_tcp(&self) -> bool {
-        self.inner.supports_tcp()
+
+    fn remove(&self, id: &str) {
+        if let Some(cached) = self
+            .sandboxes
+            .lock()
+            .expect("egress sandbox map poisoned")
+            .remove(id)
+        {
+            cached.egress.close();
+        }
     }
-    async fn connect_tcp(&self, port: u16) -> Result<Option<BoxSandboxTcpStream>> {
-        self.inner.connect_tcp(port).await
+
+    pub(crate) async fn terminate<F: Future<Output = Result<()>>>(
+        &self,
+        id: &str,
+        terminate: F,
+    ) -> Result<()> {
+        let _guard = self.lock(id).await;
+        self.remove(id);
+        terminate.await
     }
-    async fn stop(&self) -> Result<()> {
-        self.proxy.close();
-        self.inner.stop().await
+
+    pub(crate) fn shutdown(&self) {
+        self.closed.cancel();
+        let sandboxes =
+            std::mem::take(&mut *self.sandboxes.lock().expect("egress sandbox map poisoned"));
+        for cached in sandboxes.into_values() {
+            cached.egress.close();
+        }
     }
-    async fn detach(&self) -> Result<SandboxAttachment> {
-        bail!("proxy egress does not support detaching")
+}
+
+impl<H> Drop for EgressRuntime<H> {
+    fn drop(&mut self) {
+        self.closed.cancel();
     }
-    async fn snapshot(&self) -> Result<SnapshotPayload> {
-        bail!("proxy egress snapshots require a fresh identity and trust binding")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::egress::PublicUpstreamResolver;
+    use crate::{SandboxLifecycleConfig, SandboxNetworkPolicy, SandboxSpec};
+    use async_trait::async_trait;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    struct Handle;
+
+    #[async_trait]
+    impl ManagedSandboxHandle for Handle {
+        fn id(&self) -> &str {
+            "test"
+        }
+        async fn exec(&self, _command: &SandboxCommand) -> Result<crate::SandboxCommandOutput> {
+            unreachable!()
+        }
+        async fn start_process(
+            &self,
+            _command: &SandboxCommand,
+        ) -> Result<crate::SandboxProcessParts> {
+            unreachable!()
+        }
+        async fn stop(&self) -> Result<()> {
+            unreachable!()
+        }
+        async fn detach(&self) -> Result<crate::SandboxAttachment> {
+            unreachable!()
+        }
+        async fn snapshot(&self) -> Result<crate::SnapshotPayload> {
+            unreachable!()
+        }
     }
-    async fn delete_snapshot(&self, payload: SnapshotPayload) -> Result<()> {
-        self.inner.delete_snapshot(payload).await
+
+    #[derive(Default)]
+    struct Transport {
+        closed: AtomicBool,
+    }
+
+    #[async_trait]
+    impl EgressTransport for Transport {
+        fn endpoints(&self) -> crate::SandboxEgressProxy {
+            crate::SandboxEgressProxy {
+                http: "192.0.2.1:80".parse().unwrap(),
+                https: "192.0.2.1:443".parse().unwrap(),
+                dns: "192.0.2.1:53".parse().unwrap(),
+            }
+        }
+        async fn bind_source(&self, _source: Ipv4Addr) -> Result<()> {
+            Ok(())
+        }
+        async fn accept(&self, _tls: bool) -> Result<crate::BoxSandboxTcpStream> {
+            std::future::pending().await
+        }
+        fn close(&self) {
+            self.closed.store(true, Ordering::SeqCst);
+        }
+    }
+
+    fn request(id: &str) -> SandboxRequest {
+        SandboxRequest {
+            sandbox_id: id.into(),
+            scope: None,
+            provider_state: None,
+            spec: SandboxSpec {
+                image: "test".into(),
+                resources: Default::default(),
+                mounts: vec![],
+                durable_file_systems: vec![],
+                default_workdir: "/tmp".into(),
+                policy: SandboxNetworkPolicy::Limited {
+                    allowed_hosts: vec!["api.test".into()],
+                }
+                .into(),
+            },
+            lifecycle: SandboxLifecycleConfig {
+                idle_ttl: Some(Duration::from_secs(60)),
+            },
+        }
+    }
+
+    #[tokio::test]
+    async fn shutdown_closes_proxies_while_acquisition_is_pending() -> Result<()> {
+        let runtime = EgressRuntime::<Handle>::new(None, Arc::new(PublicUpstreamResolver));
+        let transport = Arc::new(Transport::default());
+        let (started, ready) = tokio::sync::oneshot::channel();
+        let (release, released) = tokio::sync::oneshot::channel();
+        let acquiring = runtime.acquire(
+            request("one"),
+            |_| async { Ok(transport.clone() as Arc<dyn EgressTransport>) },
+            |_| async {
+                started.send(()).unwrap();
+                released.await?;
+                Ok(Handle)
+            },
+        );
+        let shutdown = async {
+            ready.await.unwrap();
+            runtime.shutdown();
+            assert!(transport.closed.load(Ordering::SeqCst));
+            assert!(runtime.sandboxes.lock().unwrap().is_empty());
+            release.send(()).unwrap();
+        };
+        let (result, ()) = tokio::join!(acquiring, shutdown);
+        assert!(result.err().unwrap().to_string().contains("shut down"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn termination_waits_for_acquisition_and_removes_cached_state() -> Result<()> {
+        let runtime = EgressRuntime::<Handle>::new(None, Arc::new(PublicUpstreamResolver));
+        let transport = Arc::new(Transport::default());
+        let (started, ready) = tokio::sync::oneshot::channel();
+        let (release, released) = tokio::sync::oneshot::channel();
+        let acquiring = runtime.acquire(
+            request("one"),
+            |_| async { Ok(transport.clone() as Arc<dyn EgressTransport>) },
+            |_| async {
+                started.send(()).unwrap();
+                released.await?;
+                Ok(Handle)
+            },
+        );
+        let terminating = async {
+            ready.await?;
+            let terminate = runtime.terminate("one", async { Ok(()) });
+            tokio::pin!(terminate);
+            assert!(futures::poll!(&mut terminate).is_pending());
+            assert!(!transport.closed.load(Ordering::SeqCst));
+            release.send(()).unwrap();
+            terminate.await
+        };
+        let (handle, terminated) = tokio::join!(acquiring, terminating);
+        handle?;
+        terminated?;
+        assert!(transport.closed.load(Ordering::SeqCst));
+        assert!(runtime.sandboxes.lock().unwrap().is_empty());
+        for i in 0..20 {
+            runtime.terminate(&i.to_string(), async { Ok(()) }).await?;
+        }
+        assert_eq!(runtime.locks.lock().unwrap().len(), 1);
+        Ok(())
     }
 }

@@ -97,5 +97,4 @@ pub use typescript::TypeScriptHarness;
 
 pub(crate) use basic::BasicExecutor;
 
-#[cfg(feature = "egress-proxy")]
 pub use exoharness::EgressPolicy;

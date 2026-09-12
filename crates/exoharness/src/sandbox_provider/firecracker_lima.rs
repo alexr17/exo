@@ -29,6 +29,10 @@ use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 use tokio_util::io::StreamReader;
 use tokio_util::sync::PollSender;
 
+use crate::egress::{
+    EgressCredentialResolver, EgressRuntime, PublicUpstreamResolver, SandboxEgress,
+    UpstreamResolver,
+};
 use crate::sandbox::{
     BoxSandboxTcpStream, ManagedSandboxBackend, ManagedSandboxHandle, SandboxCommand,
     SandboxCommandOutput, SnapshotFormat, SnapshotPayload,
@@ -55,12 +59,38 @@ const BRIDGE_INSTALL_PATH: &str = "/usr/local/libexec/exo-firecracker-bridge";
 
 #[derive(Clone)]
 pub struct LimaFirecrackerSandboxBackend {
+    egress: Arc<EgressRuntime<LimaFirecrackerSandboxHandle>>,
     config: FirecrackerConfig,
     bridge: Arc<LimaBridgeManager>,
 }
 
 impl LimaFirecrackerSandboxBackend {
-    #[cfg(feature = "egress-proxy")]
+    async fn terminate_raw(&self, request: SandboxRequest) -> Result<()> {
+        match self
+            .request(FirecrackerBridgeRequest::Terminate {
+                config: self.config.clone(),
+                request: request.into(),
+            })
+            .await?
+        {
+            FirecrackerBridgeResponse::Unit => Ok(()),
+            _ => bail!("Firecracker Lima bridge returned the wrong response to terminate"),
+        }
+    }
+
+    pub(crate) fn with_egress(
+        mut self,
+        resolver: Option<Arc<dyn EgressCredentialResolver>>,
+        upstream: Arc<dyn UpstreamResolver>,
+    ) -> Self {
+        self.egress = Arc::new(EgressRuntime::new(resolver, upstream));
+        self
+    }
+
+    pub fn shutdown_egress(&self) {
+        self.egress.shutdown();
+    }
+
     async fn egress_transport(
         &self,
         allowed_hosts: &[String],
@@ -88,21 +118,22 @@ impl LimaFirecrackerSandboxBackend {
     async fn acquire_request(
         &self,
         request: FirecrackerRequest,
-    ) -> Result<Arc<LimaFirecrackerSandboxHandle>> {
+    ) -> Result<LimaFirecrackerSandboxHandle> {
         // A one-shot Firecracker handle destroys its VM after the command. Do
         // not eagerly acquire it here and then acquire a second VM when the
         // command crosses the bridge.
         if request.lifecycle.idle_ttl.is_none() {
             let sequence = LIMA_ONE_SHOT_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-            return Ok(Arc::new(LimaFirecrackerSandboxHandle {
+            return Ok(LimaFirecrackerSandboxHandle {
+                egress: None,
                 id: format!("firecracker-lima-oneshot:{sequence}"),
                 provider_state: None,
                 effective_image: None,
-                #[cfg(feature = "egress-proxy")]
                 source_ipv4: None,
                 request,
-                backend: self.client(),
-            }));
+                config: self.config.clone(),
+                bridge: self.bridge.clone(),
+            });
         }
         let response = self
             .request(FirecrackerBridgeRequest::Acquire {
@@ -133,7 +164,11 @@ impl LimaFirecrackerSandboxBackend {
         ));
         bridge.prepare_bridge(&lima.target_dir).await?;
         bridge.connection().await?;
-        Ok(Self { config, bridge })
+        Ok(Self {
+            config,
+            bridge,
+            egress: Arc::new(EgressRuntime::new(None, Arc::new(PublicUpstreamResolver))),
+        })
     }
 
     async fn request(
@@ -149,54 +184,22 @@ impl LimaFirecrackerSandboxBackend {
         id: String,
         provider_state: Option<serde_json::Value>,
         effective_image: Option<String>,
-        _source_ipv4: Option<std::net::Ipv4Addr>,
-    ) -> Result<Arc<LimaFirecrackerSandboxHandle>> {
+        source_ipv4: Option<std::net::Ipv4Addr>,
+    ) -> Result<LimaFirecrackerSandboxHandle> {
         let effective_image = effective_image
             .context("Firecracker Lima bridge did not return a resolved image for its handle")?;
         request.spec.image.clone_from(&effective_image);
         request.provider_state.clone_from(&provider_state);
-        Ok(Arc::new(LimaFirecrackerSandboxHandle {
+        Ok(LimaFirecrackerSandboxHandle {
+            egress: None,
             id,
             provider_state,
             effective_image: Some(effective_image),
-            #[cfg(feature = "egress-proxy")]
-            source_ipv4: _source_ipv4,
+            source_ipv4,
             request,
-            backend: self.client(),
-        }))
-    }
-
-    fn client(&self) -> Arc<Self> {
-        Arc::new(self.clone())
-    }
-}
-
-#[cfg(feature = "egress-proxy")]
-#[async_trait]
-impl crate::egress::FirecrackerEgressProvider for LimaFirecrackerSandboxBackend {
-    async fn egress_transport(
-        &self,
-        _request: &SandboxRequest,
-        allowed_hosts: &[String],
-    ) -> Result<Arc<dyn crate::egress::EgressTransport>> {
-        self.egress_transport(allowed_hosts).await
-    }
-
-    async fn acquire_egress(
-        &self,
-        request: SandboxRequest,
-        endpoints: crate::SandboxEgressProxy,
-    ) -> Result<(Arc<dyn ManagedSandboxHandle>, std::net::Ipv4Addr)> {
-        let handle = self
-            .acquire_request(FirecrackerRequest {
-                sandbox: request,
-                egress_proxy: Some(endpoints),
-            })
-            .await?;
-        let source = handle
-            .source_ipv4
-            .context("Firecracker sandbox has no egress source")?;
-        Ok((handle, source))
+            config: self.config.clone(),
+            bridge: self.bridge.clone(),
+        })
     }
 }
 
@@ -224,11 +227,29 @@ impl ManagedSandboxBackend for LimaFirecrackerSandboxBackend {
     }
 
     async fn acquire(&self, request: SandboxRequest) -> Result<Arc<dyn ManagedSandboxHandle>> {
-        request
-            .spec
-            .policy
-            .validate_basic("Firecracker without a configured egress runtime")?;
-        Ok(self.acquire_request(request.into()).await?)
+        self.egress
+            .acquire(
+                request.clone(),
+                |hosts| async move { self.egress_transport(&hosts).await },
+                |egress| async move {
+                    let mut handle = self
+                        .acquire_request(FirecrackerRequest {
+                            sandbox: request,
+                            egress_proxy: egress.as_ref().map(|egress| egress.endpoints()),
+                        })
+                        .await?;
+                    if let Some(egress) = egress {
+                        let source = handle
+                            .source_ipv4
+                            .context("Firecracker sandbox has no egress source")?;
+                        egress.initialize(&handle, source).await?;
+                        handle.egress = Some(egress);
+                    }
+                    Ok(handle)
+                },
+            )
+            .await
+            .map(|handle| handle as Arc<dyn ManagedSandboxHandle>)
     }
 
     async fn attach(
@@ -240,30 +261,15 @@ impl ManagedSandboxBackend for LimaFirecrackerSandboxBackend {
     }
 
     async fn delete_snapshot(&self, payload: SnapshotPayload) -> Result<()> {
-        match self
-            .request(FirecrackerBridgeRequest::DeleteSnapshot {
-                config: self.config.clone(),
-                format: payload.format,
-                payload: BASE64.encode(payload.bytes),
-            })
-            .await?
-        {
-            FirecrackerBridgeResponse::Unit => Ok(()),
-            _ => bail!("Firecracker Lima bridge returned the wrong response to delete snapshot"),
-        }
+        self.bridge
+            .delete_snapshot(self.config.clone(), payload)
+            .await
     }
 
     async fn terminate(&self, request: SandboxRequest) -> Result<()> {
-        match self
-            .request(FirecrackerBridgeRequest::Terminate {
-                config: self.config.clone(),
-                request: request.into(),
-            })
-            .await?
-        {
-            FirecrackerBridgeResponse::Unit => Ok(()),
-            _ => bail!("Firecracker Lima bridge returned the wrong response to terminate"),
-        }
+        self.egress
+            .terminate(&request.sandbox_id, self.terminate_raw(request.clone()))
+            .await
     }
 
     async fn fork_sandbox(
@@ -298,13 +304,13 @@ impl ManagedSandboxBackend for LimaFirecrackerSandboxBackend {
         else {
             bail!("Firecracker Lima bridge returned the wrong response to fork");
         };
-        Ok(self.bound_handle(
+        Ok(Arc::new(self.bound_handle(
             target.into(),
             id,
             provider_state,
             effective_image,
             source_ipv4,
-        )?)
+        )?))
     }
 
     async fn acquire_from_snapshot(
@@ -336,24 +342,25 @@ impl ManagedSandboxBackend for LimaFirecrackerSandboxBackend {
         else {
             bail!("Firecracker Lima bridge returned the wrong response to snapshot restore");
         };
-        Ok(self.bound_handle(
+        Ok(Arc::new(self.bound_handle(
             request.into(),
             id,
             provider_state,
             effective_image,
             source_ipv4,
-        )?)
+        )?))
     }
 }
 
 struct LimaFirecrackerSandboxHandle {
-    #[cfg(feature = "egress-proxy")]
+    egress: Option<Arc<SandboxEgress>>,
     source_ipv4: Option<std::net::Ipv4Addr>,
     id: String,
     provider_state: Option<serde_json::Value>,
     effective_image: Option<String>,
     request: FirecrackerRequest,
-    backend: Arc<LimaFirecrackerSandboxBackend>,
+    config: FirecrackerConfig,
+    bridge: Arc<LimaBridgeManager>,
 }
 
 #[async_trait]
@@ -371,10 +378,16 @@ impl ManagedSandboxHandle for LimaFirecrackerSandboxHandle {
     }
 
     async fn exec(&self, command: &SandboxCommand) -> Result<SandboxCommandOutput> {
+        let prepared = self
+            .egress
+            .as_ref()
+            .map(|egress| egress.command(command))
+            .transpose()?;
+        let command = prepared.as_ref().unwrap_or(command);
         let response = self
-            .backend
+            .bridge
             .request(FirecrackerBridgeRequest::Exec {
-                config: self.backend.config.clone(),
+                config: self.config.clone(),
                 request: self.request.clone(),
                 command: command.clone(),
             })
@@ -386,10 +399,15 @@ impl ManagedSandboxHandle for LimaFirecrackerSandboxHandle {
     }
 
     async fn start_process(&self, command: &SandboxCommand) -> Result<SandboxProcessParts> {
-        self.backend
-            .bridge
+        let prepared = self
+            .egress
+            .as_ref()
+            .map(|egress| egress.command(command))
+            .transpose()?;
+        let command = prepared.as_ref().unwrap_or(command);
+        self.bridge
             .start_process(FirecrackerBridgeRequest::StartProcess {
-                config: self.backend.config.clone(),
+                config: self.config.clone(),
                 request: self.request.clone(),
                 command: command.clone(),
             })
@@ -405,10 +423,9 @@ impl ManagedSandboxHandle for LimaFirecrackerSandboxHandle {
             bail!("one-shot Firecracker Lima sandboxes do not support TCP connections");
         }
         let stream = self
-            .backend
             .bridge
             .connect_tcp(FirecrackerBridgeRequest::ConnectTcp {
-                config: self.backend.config.clone(),
+                config: self.config.clone(),
                 request: self.request.clone(),
                 port,
             })
@@ -417,13 +434,16 @@ impl ManagedSandboxHandle for LimaFirecrackerSandboxHandle {
     }
 
     async fn stop(&self) -> Result<()> {
+        if let Some(egress) = &self.egress {
+            egress.close();
+        }
         if self.request.lifecycle.idle_ttl.is_none() {
             bail!("one-shot Firecracker Lima sandboxes cannot be stopped independently");
         }
         match self
-            .backend
+            .bridge
             .request(FirecrackerBridgeRequest::Stop {
-                config: self.backend.config.clone(),
+                config: self.config.clone(),
                 request: self.request.clone(),
             })
             .await?
@@ -438,17 +458,24 @@ impl ManagedSandboxHandle for LimaFirecrackerSandboxHandle {
     }
 
     async fn delete_snapshot(&self, payload: SnapshotPayload) -> Result<()> {
-        self.backend.delete_snapshot(payload).await
+        self.bridge
+            .delete_snapshot(self.config.clone(), payload)
+            .await
     }
 
     async fn snapshot(&self) -> Result<SnapshotPayload> {
+        if self.egress.is_some() {
+            bail!(
+                "proxied Firecracker snapshots require a fresh egress binding; not implemented yet"
+            );
+        }
         if self.request.lifecycle.idle_ttl.is_none() {
             bail!("one-shot Firecracker Lima sandboxes cannot be snapshotted");
         }
         let response = self
-            .backend
+            .bridge
             .request(FirecrackerBridgeRequest::Snapshot {
-                config: self.backend.config.clone(),
+                config: self.config.clone(),
                 request: self.request.clone(),
             })
             .await?;
@@ -474,6 +501,24 @@ struct LimaBridgeManager {
 }
 
 impl LimaBridgeManager {
+    async fn delete_snapshot(
+        &self,
+        config: FirecrackerConfig,
+        payload: SnapshotPayload,
+    ) -> Result<()> {
+        match self
+            .request(FirecrackerBridgeRequest::DeleteSnapshot {
+                config,
+                format: payload.format,
+                payload: BASE64.encode(payload.bytes),
+            })
+            .await?
+        {
+            FirecrackerBridgeResponse::Unit => Ok(()),
+            _ => bail!("Firecracker Lima bridge returned the wrong response to delete snapshot"),
+        }
+    }
+
     fn new(limactl: PathBuf, instance: String, bridge_binary: PathBuf, build_bridge: bool) -> Self {
         Self {
             limactl,
@@ -552,11 +597,7 @@ impl LimaBridgeManager {
             .arg("--package")
             .arg("exoharness")
             .arg("--features")
-            .arg(if cfg!(feature = "egress-proxy") {
-                "firecracker,egress-proxy"
-            } else {
-                "firecracker"
-            })
+            .arg("firecracker")
             .arg("--example")
             .arg("firecracker-bridge");
         self.run_checked(&mut command, "building the Exo Firecracker bridge in Lima")
@@ -1407,7 +1448,6 @@ fn send_bridge_frame_on_drop(
     }
 }
 
-#[cfg(feature = "egress-proxy")]
 struct LimaEgressTransport {
     connection: Arc<LimaBridgeConnection>,
     listener_id: String,
@@ -1417,7 +1457,6 @@ struct LimaEgressTransport {
     cancel: tokio_util::sync::CancellationToken,
 }
 
-#[cfg(feature = "egress-proxy")]
 impl LimaEgressTransport {
     fn new(
         connection: Arc<LimaBridgeConnection>,
@@ -1480,7 +1519,6 @@ impl LimaEgressTransport {
     }
 }
 
-#[cfg(feature = "egress-proxy")]
 #[async_trait]
 impl crate::egress::EgressTransport for LimaEgressTransport {
     fn endpoints(&self) -> crate::SandboxEgressProxy {
@@ -1512,7 +1550,6 @@ impl crate::egress::EgressTransport for LimaEgressTransport {
     }
 }
 
-#[cfg(feature = "egress-proxy")]
 impl Drop for LimaEgressTransport {
     fn drop(&mut self) {
         self.cancel.cancel();

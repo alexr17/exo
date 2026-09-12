@@ -7,15 +7,6 @@ rust-version.workspace = true
 
 [features]
 default = []
-egress-proxy = [
-  "basic-backend",
-  "dep:hickory-proto",
-  "dep:http-body-util",
-  "dep:hyper",
-  "dep:hyper-util",
-  "dep:rcgen",
-  "dep:tokio-rustls",
-]
 basic-backend = [
   "dep:aes-gcm",
   "dep:actix-web",
@@ -31,6 +22,12 @@ basic-backend = [
 ]
 firecracker = [
   "basic-backend",
+  "dep:hickory-proto",
+  "dep:http-body-util",
+  "dep:hyper",
+  "dep:hyper-util",
+  "dep:rcgen",
+  "dep:tokio-rustls",
   "dep:docker_credential",
   "dep:exo-firecracker-protocol",
   "dep:flate2",

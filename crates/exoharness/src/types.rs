@@ -677,6 +677,42 @@ pub struct SandboxRecord {
     pub running: bool,
 }
 
+#[cfg(all(not(target_arch = "wasm32"), feature = "basic-backend"))]
+pub(crate) fn canonical_egress_host(host: &str) -> Result<String> {
+    anyhow::ensure!(
+        !host.is_empty() && host.len() <= 253 && !host.ends_with('.'),
+        "invalid egress hostname"
+    );
+    let host = host.to_ascii_lowercase();
+    anyhow::ensure!(
+        host.parse::<std::net::IpAddr>().is_err(),
+        "IP literals are not egress hostnames"
+    );
+    anyhow::ensure!(
+        host.split('.').all(|label| !label.is_empty()
+            && label.len() <= 63
+            && !label.starts_with('-')
+            && !label.ends_with('-')
+            && label
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'-')),
+        "expected an exact ASCII hostname"
+    );
+    Ok(host)
+}
+
+#[cfg(all(not(target_arch = "wasm32"), feature = "basic-backend"))]
+pub(crate) fn canonical_egress_hosts(
+    hosts: &[String],
+) -> anyhow::Result<std::collections::HashSet<String>> {
+    const MAX_ALLOWED_HOSTS: usize = 128;
+    anyhow::ensure!(hosts.len() <= MAX_ALLOWED_HOSTS, "too many allowed hosts");
+    hosts
+        .iter()
+        .map(|host| canonical_egress_host(host))
+        .collect()
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum SandboxNetworkPolicy {
@@ -714,8 +750,18 @@ pub enum CredentialNetworkPolicy {
 pub struct CredentialInjectionLocation {
     #[serde(default)]
     pub header: bool,
-    #[serde(default)]
-    pub body: bool,
+}
+
+impl EgressPolicy {
+    pub fn networking_enabled(&self) -> bool {
+        self.networking != SandboxNetworkPolicy::Disabled
+    }
+
+    #[cfg(feature = "firecracker")]
+    pub(crate) fn requires_proxy(&self) -> bool {
+        !self.credentials.is_empty()
+            || matches!(self.networking, SandboxNetworkPolicy::Limited { .. })
+    }
 }
 
 impl From<SandboxNetworkPolicy> for EgressPolicy {

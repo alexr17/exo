@@ -42,6 +42,9 @@ use tokio::net::{TcpStream, UnixStream};
 use tokio::sync::{Mutex, OwnedMutexGuard};
 use uuid::Uuid;
 
+#[cfg(target_os = "linux")]
+use crate::egress::{EgressCredentialResolver, UpstreamResolver};
+use crate::egress::{EgressRuntime, PublicUpstreamResolver, SandboxEgress};
 use crate::sandbox::{
     BoxSandboxTcpStream, ManagedSandboxBackend, ManagedSandboxHandle, SandboxCommand,
     SandboxCommandOutput, SandboxNetworkPolicy, SandboxRequest, SandboxSpec, SnapshotFormat,
@@ -481,6 +484,7 @@ struct Machine {
 
 #[derive(Debug, Clone)]
 struct WarmMachineEntry {
+    egress_proxy: Option<crate::SandboxEgressProxy>,
     machine_id: String,
     spec_hash: String,
     idle_ttl: Option<Duration>,
@@ -610,16 +614,69 @@ struct Shared {
     starting_machines: Arc<StdMutex<HashSet<String>>>,
 }
 
+#[derive(Clone)]
 pub struct FirecrackerSandboxBackend {
+    egress: Arc<EgressRuntime<FirecrackerSandboxHandle>>,
     shared: Arc<Shared>,
 }
 
 impl FirecrackerSandboxBackend {
-    #[tracing::instrument(name = "firecracker.acquire", skip_all)]
+    async fn terminate_raw(&self, request: SandboxRequest) -> Result<()> {
+        let persisted_machine_id = request
+            .provider_state
+            .as_ref()
+            .map(parse_provider_state)
+            .transpose()?
+            .map(|state| state.machine_id);
+        if let Some(machine_id) = persisted_machine_id.as_deref() {
+            let machine_key_prefix = format!("fc-{}-", stable_id(request.sandbox_id.as_str()));
+            if !valid_machine_id(machine_id) || !machine_id.starts_with(&machine_key_prefix) {
+                bail!("Firecracker provider state does not match the terminated sandbox key");
+            }
+        }
+        let _lifecycle_guard = self
+            .shared
+            .lifecycle_locks
+            .lock_sandbox(request.sandbox_id.as_str())
+            .await;
+        let machine_id = self
+            .shared
+            .warm_machines
+            .lock()
+            .await
+            .remove(request.sandbox_id.as_str())
+            .map(|entry| entry.machine_id)
+            .or(persisted_machine_id)
+            .unwrap_or_else(|| {
+                let spec_hash = sandbox_spec_hash(&request.spec);
+                machine_id(request.sandbox_id.as_str(), &spec_hash)
+            });
+        self.shared.cleanup_machine(&machine_id, true).await
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(crate) fn with_egress(
+        mut self,
+        resolver: Option<Arc<dyn EgressCredentialResolver>>,
+        upstream: Arc<dyn UpstreamResolver>,
+    ) -> Self {
+        self.egress = Arc::new(EgressRuntime::new(resolver, upstream));
+        self
+    }
+
+    pub fn shutdown_egress(&self) {
+        self.egress.shutdown();
+    }
+
     pub async fn acquire_request(
         &self,
         request: FirecrackerRequest,
     ) -> Result<Arc<dyn ManagedSandboxHandle>> {
+        Ok(Arc::new(self.acquire_raw(request).await?))
+    }
+
+    #[tracing::instrument(name = "firecracker.acquire", skip_all)]
+    async fn acquire_raw(&self, request: FirecrackerRequest) -> Result<FirecrackerSandboxHandle> {
         self.reap_stale_machines().await?;
         self.reap_expired_machines().await?;
         self.shared.reap_orphaned_fork_snapshot_templates().await;
@@ -749,6 +806,7 @@ impl FirecrackerSandboxBackend {
         validate_jailed_socket_paths(&config)?;
 
         Ok(Self {
+            egress: Arc::new(EgressRuntime::new(None, Arc::new(PublicUpstreamResolver))),
             shared: Arc::new(Shared {
                 config,
                 host_fingerprint,
@@ -927,7 +985,7 @@ impl FirecrackerSandboxBackend {
         manifest: FirecrackerSnapshotManifest,
         lifecycle: SnapshotTemplateLifecycle,
         captured_lease: Option<File>,
-    ) -> Result<Arc<dyn ManagedSandboxHandle>> {
+    ) -> Result<FirecrackerSandboxHandle> {
         let spec_hash = sandbox_spec_hash(&request.spec);
         let machine_id = machine_id(request.sandbox_id.as_str(), &spec_hash);
         let _lifecycle_guard = self
@@ -957,7 +1015,7 @@ impl FirecrackerSandboxBackend {
         captured_lease: Option<File>,
         spec_hash: String,
         machine_id: String,
-    ) -> Result<Arc<dyn ManagedSandboxHandle>> {
+    ) -> Result<FirecrackerSandboxHandle> {
         if request.egress_proxy.is_some() {
             bail!(
                 "proxied Firecracker snapshots require a fresh egress binding; not implemented yet"
@@ -1068,7 +1126,7 @@ impl FirecrackerSandboxBackend {
     async fn acquire_resolved(
         &self,
         request: FirecrackerRequest,
-    ) -> Result<Arc<dyn ManagedSandboxHandle>> {
+    ) -> Result<FirecrackerSandboxHandle> {
         let spec_hash = sandbox_spec_hash(&request.spec);
         let one_shot = request.lifecycle.idle_ttl.is_none();
         let machine_id = if one_shot {
@@ -1096,7 +1154,7 @@ impl FirecrackerSandboxBackend {
         target_machine_id: String,
         one_shot: bool,
         capacity_reservation: Option<MachineCapacityReservation>,
-    ) -> Result<Arc<dyn ManagedSandboxHandle>> {
+    ) -> Result<FirecrackerSandboxHandle> {
         let stable_machine_id = machine_id(request.sandbox_id.as_str(), &spec_hash);
         let machine_key_prefix = format!("fc-{}-", stable_id(request.sandbox_id.as_str()));
 
@@ -1141,23 +1199,12 @@ impl FirecrackerSandboxBackend {
             .shared
             .ensure_machine(&request, &target_machine_id, &spec_hash)
             .await?;
-        if let Some(proxy) = request.egress_proxy {
-            let network = machine.record.network();
-            tokio::task::spawn_blocking(move || {
-                let rules = format!(
-                    "delete table inet {}\n{}",
-                    network.nft_table,
-                    proxy_network_firewall_rules(&network, proxy)?
-                );
-                run_checked_input("nft", &["-f", "-"], rules.as_bytes())
-            })
-            .await??;
-        }
         if !one_shot {
             self.shared.touch_machine_lease(&target_machine_id).await?;
             self.shared.warm_machines.lock().await.insert(
                 request.sandbox_id.clone(),
                 WarmMachineEntry {
+                    egress_proxy: request.egress_proxy,
                     machine_id: target_machine_id.clone(),
                     spec_hash: spec_hash.clone(),
                     idle_ttl: request.lifecycle.idle_ttl,
@@ -1171,23 +1218,21 @@ impl FirecrackerSandboxBackend {
         } else {
             format!("firecracker:{target_machine_id}")
         };
-        Ok(Arc::new(FirecrackerSandboxHandle {
+        Ok(FirecrackerSandboxHandle {
+            egress: None,
             id,
             machine,
             request,
             spec_hash,
             shared: Arc::clone(&self.shared),
             one_shot,
-        }))
+        })
     }
 }
 
-#[cfg(feature = "egress-proxy")]
-#[async_trait]
-impl crate::egress::FirecrackerEgressProvider for FirecrackerSandboxBackend {
+impl FirecrackerSandboxBackend {
     async fn egress_transport(
         &self,
-        _request: &SandboxRequest,
         allowed_hosts: &[String],
     ) -> Result<Arc<dyn crate::egress::EgressTransport>> {
         let transport = match self.shared.config.egress_listen {
@@ -1197,24 +1242,6 @@ impl crate::egress::FirecrackerEgressProvider for FirecrackerSandboxBackend {
             None => crate::egress::LocalEgressTransport::for_hosts(allowed_hosts).await?,
         };
         Ok(Arc::new(transport))
-    }
-
-    async fn acquire_egress(
-        &self,
-        request: SandboxRequest,
-        endpoints: crate::SandboxEgressProxy,
-    ) -> Result<(Arc<dyn ManagedSandboxHandle>, Ipv4Addr)> {
-        let handle = self
-            .acquire_request(FirecrackerRequest {
-                sandbox: request,
-                egress_proxy: Some(endpoints),
-            })
-            .await?;
-        let source = self
-            .egress_source(handle.as_ref())
-            .await?
-            .context("Firecracker sandbox has no egress source")?;
-        Ok((handle, source))
     }
 }
 
@@ -1250,11 +1277,27 @@ impl ManagedSandboxBackend for FirecrackerSandboxBackend {
     }
 
     async fn acquire(&self, request: SandboxRequest) -> Result<Arc<dyn ManagedSandboxHandle>> {
-        request
-            .spec
-            .policy
-            .validate_basic("Firecracker without a configured egress runtime")?;
-        self.acquire_request(request.into()).await
+        self.egress
+            .acquire(
+                request.clone(),
+                |hosts| async move { self.egress_transport(&hosts).await },
+                |egress| async move {
+                    let mut handle = self
+                        .acquire_raw(FirecrackerRequest {
+                            sandbox: request,
+                            egress_proxy: egress.as_ref().map(|egress| egress.endpoints()),
+                        })
+                        .await?;
+                    if let Some(egress) = egress {
+                        let source = handle.machine.record.network().guest_ip;
+                        egress.initialize(&handle, source).await?;
+                        handle.egress = Some(egress);
+                    }
+                    Ok(handle)
+                },
+            )
+            .await
+            .map(|handle| handle as Arc<dyn ManagedSandboxHandle>)
     }
 
     async fn attach(
@@ -1271,36 +1314,9 @@ impl ManagedSandboxBackend for FirecrackerSandboxBackend {
 
     #[tracing::instrument(name = "firecracker.terminate", skip_all)]
     async fn terminate(&self, request: SandboxRequest) -> Result<()> {
-        let persisted_machine_id = request
-            .provider_state
-            .as_ref()
-            .map(parse_provider_state)
-            .transpose()?
-            .map(|state| state.machine_id);
-        if let Some(machine_id) = persisted_machine_id.as_deref() {
-            let machine_key_prefix = format!("fc-{}-", stable_id(request.sandbox_id.as_str()));
-            if !valid_machine_id(machine_id) || !machine_id.starts_with(&machine_key_prefix) {
-                bail!("Firecracker provider state does not match the terminated sandbox key");
-            }
-        }
-        let _lifecycle_guard = self
-            .shared
-            .lifecycle_locks
-            .lock_sandbox(request.sandbox_id.as_str())
-            .await;
-        let machine_id = self
-            .shared
-            .warm_machines
-            .lock()
+        self.egress
+            .terminate(&request.sandbox_id, self.terminate_raw(request.clone()))
             .await
-            .remove(request.sandbox_id.as_str())
-            .map(|entry| entry.machine_id)
-            .or(persisted_machine_id)
-            .unwrap_or_else(|| {
-                let spec_hash = sandbox_spec_hash(&request.spec);
-                machine_id(request.sandbox_id.as_str(), &spec_hash)
-            });
-        self.shared.cleanup_machine(&machine_id, true).await
     }
 
     async fn fork_sandbox(
@@ -1359,15 +1375,17 @@ impl ManagedSandboxBackend for FirecrackerSandboxBackend {
             SnapshotTemplateLifecycle::Machine,
         )
         .await?;
-        self.restore_snapshot_locked(
-            target,
-            captured.manifest,
-            SnapshotTemplateLifecycle::Machine,
-            Some(captured.lease),
-            target_spec_hash,
-            target_machine_id,
-        )
-        .await
+        Ok(Arc::new(
+            self.restore_snapshot_locked(
+                target,
+                captured.manifest,
+                SnapshotTemplateLifecycle::Machine,
+                Some(captured.lease),
+                target_spec_hash,
+                target_machine_id,
+            )
+            .await?,
+        ))
     }
 
     #[tracing::instrument(name = "firecracker.restore", skip_all)]
@@ -1382,12 +1400,15 @@ impl ManagedSandboxBackend for FirecrackerSandboxBackend {
             .validate_basic("Firecracker snapshot restore")?;
         let manifest = FirecrackerSnapshotManifest::from_payload(payload)?;
         let request = self.resolve_request(request.into()).await?;
-        self.restore_snapshot(request, manifest, SnapshotTemplateLifecycle::Snapshot, None)
-            .await
+        Ok(Arc::new(
+            self.restore_snapshot(request, manifest, SnapshotTemplateLifecycle::Snapshot, None)
+                .await?,
+        ))
     }
 }
 
 struct FirecrackerSandboxHandle {
+    egress: Option<Arc<SandboxEgress>>,
     id: String,
     machine: Machine,
     request: FirecrackerRequest,
@@ -1429,6 +1450,12 @@ impl ManagedSandboxHandle for FirecrackerSandboxHandle {
     }
 
     async fn exec(&self, command: &SandboxCommand) -> Result<SandboxCommandOutput> {
+        let prepared = self
+            .egress
+            .as_ref()
+            .map(|egress| egress.command(command))
+            .transpose()?;
+        let command = prepared.as_ref().unwrap_or(command);
         let output = GuestClient::new(Arc::clone(&self.shared), self.machine.vsock_path.clone())
             .exec(&self.request.spec, command)
             .await;
@@ -1465,6 +1492,12 @@ impl ManagedSandboxHandle for FirecrackerSandboxHandle {
     }
 
     async fn start_process(&self, command: &SandboxCommand) -> Result<SandboxProcessParts> {
+        let prepared = self
+            .egress
+            .as_ref()
+            .map(|egress| egress.command(command))
+            .transpose()?;
+        let command = prepared.as_ref().unwrap_or(command);
         let cleanup_machine_id = self
             .one_shot
             .then(|| self.machine.record.machine_id.clone());
@@ -1493,6 +1526,12 @@ impl ManagedSandboxHandle for FirecrackerSandboxHandle {
         command: &SandboxCommand,
         size: SandboxTerminalSize,
     ) -> Result<SandboxTerminalParts> {
+        let prepared = self
+            .egress
+            .as_ref()
+            .map(|egress| egress.command(command))
+            .transpose()?;
+        let command = prepared.as_ref().unwrap_or(command);
         let cleanup_machine_id = self
             .one_shot
             .then(|| self.machine.record.machine_id.clone());
@@ -1531,6 +1570,9 @@ impl ManagedSandboxHandle for FirecrackerSandboxHandle {
 
     #[tracing::instrument(name = "firecracker.stop", skip_all)]
     async fn stop(&self) -> Result<()> {
+        if let Some(egress) = &self.egress {
+            egress.close();
+        }
         let _lifecycle_guard = self
             .shared
             .lifecycle_locks
@@ -1719,6 +1761,26 @@ impl Shared {
                         .await
                         .is_ok()
                 {
+                    if let Some(proxy) = request.egress_proxy
+                        && self
+                            .warm_machines
+                            .lock()
+                            .await
+                            .get(&request.sandbox_id)
+                            .is_none_or(|entry| entry.egress_proxy != Some(proxy))
+                    {
+                        let network = machine.record.network();
+                        tokio::task::spawn_blocking(move || {
+                            let rules = format!(
+                                "delete table inet {}\n{}",
+                                network.nft_table,
+                                proxy_network_firewall_rules(&network, proxy)?
+                            );
+                            run_checked_input("nft", &["-f", "-"], rules.as_bytes())
+                        })
+                        .await??;
+                    }
+
                     return Ok(machine);
                 }
                 self.cleanup_machine(machine_id, false).await?;
@@ -3020,12 +3082,8 @@ fn network_firewall_rules(
     egress_proxy: Option<crate::SandboxEgressProxy>,
 ) -> Result<String> {
     if let Some(proxy) = egress_proxy {
-        if *policy == SandboxNetworkPolicy::Disabled {
-            bail!("disabled networking cannot use an egress proxy");
-        }
         return proxy_network_firewall_rules(network, proxy);
     }
-    policy.reject_limited()?;
     let mut rules = String::new();
     let table = &network.nft_table;
     let interface = &network.host_veth;
@@ -3107,7 +3165,6 @@ fn proxy_network_firewall_rules(
     network: &NetworkConfig,
     proxy: crate::SandboxEgressProxy,
 ) -> Result<String> {
-    proxy.validate()?;
     let table = &network.nft_table;
     let interface = &network.host_veth;
     let source = network.guest_ip;
@@ -3124,6 +3181,10 @@ fn proxy_network_firewall_rules(
             "add chain inet {table} {chain} {{ type {kind} hook {chain} priority {priority}; policy accept; }}"
         )?;
     }
+    // Proxied mode redirects HTTP/HTTPS on TCP 80/443 and DNS on TCP/UDP 53.
+    // Other outbound traffic is rejected below, including HTTPS on 8443, SSH,
+    // and QUIC. This is a current implementation restriction: unrestricted
+    // outbound traffic with selective credential substitution still needs work.
     for (protocol, port, destination) in [
         ("tcp", 80, proxy.http),
         ("tcp", 443, proxy.https),

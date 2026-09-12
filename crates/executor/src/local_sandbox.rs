@@ -1256,7 +1256,7 @@ fn sandbox_created_events(sandbox_id: &SandboxId, request: CreateSandboxRequest)
             enable_networking: request
                 .policy
                 .as_ref()
-                .map(|policy| policy.networking != exoharness::SandboxNetworkPolicy::Disabled)
+                .map(|policy| policy.networking_enabled())
                 .unwrap_or(request.enable_networking.unwrap_or(true)),
             policy: request.policy,
             idle_seconds: request.idle_seconds.unwrap_or(60),

@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::convert::Infallible;
-use std::net::{IpAddr, Ipv4Addr};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -22,7 +22,7 @@ use tokio_rustls::TlsAcceptor;
 use tokio_rustls::rustls::{self, ServerConfig, pki_types::PrivatePkcs8KeyDer};
 use tokio_util::sync::CancellationToken;
 
-use crate::sandbox::canonical_egress_host as canonical_host;
+use crate::types::{canonical_egress_host as canonical_host, canonical_egress_hosts};
 
 use crate::{
     CredentialNetworkPolicy, EgressCredentialBinding, EgressPolicy, SandboxEgressProxy,
@@ -32,10 +32,45 @@ use crate::{
 mod transport;
 pub use transport::{EgressTransport, LocalEgressTransport};
 mod sandbox;
-pub use sandbox::{FirecrackerEgressBackend, FirecrackerEgressProvider};
+pub(crate) use sandbox::{EgressRuntime, SandboxEgress};
 
 const PLACEHOLDER_PREFIX: &str = "exo_egress_";
 const IO_TIMEOUT: Duration = Duration::from_secs(30);
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+const MAX_REQUEST_BODY: usize = 8 * 1024 * 1024;
+const HTTP_BUFFER_SIZE: usize = 32 * 1024;
+const MAX_CONNECTIONS: usize = 128;
+
+pub(crate) struct ResolvedUpstream {
+    addresses: Vec<SocketAddr>,
+    root_certificate: Option<reqwest::Certificate>,
+}
+
+#[async_trait]
+pub(crate) trait UpstreamResolver: Send + Sync {
+    async fn resolve(&self, host: &str, port: u16) -> Result<ResolvedUpstream>;
+}
+
+pub(crate) struct PublicUpstreamResolver;
+
+#[async_trait]
+impl UpstreamResolver for PublicUpstreamResolver {
+    async fn resolve(&self, host: &str, port: u16) -> Result<ResolvedUpstream> {
+        let addresses =
+            tokio::time::timeout(CONNECT_TIMEOUT, tokio::net::lookup_host((host, port)))
+                .await??
+                .filter(|address| public_ipv4(address.ip()))
+                .collect::<Vec<_>>();
+        ensure!(
+            !addresses.is_empty(),
+            "upstream has no permitted IPv4 address"
+        );
+        Ok(ResolvedUpstream {
+            addresses,
+            root_certificate: None,
+        })
+    }
+}
 type ProxyError = Box<dyn std::error::Error + Send + Sync>;
 type ProxyBody = BoxBody<Bytes, ProxyError>;
 
@@ -63,7 +98,7 @@ pub trait EgressCredentialResolver: Send + Sync {
     ) -> Result<String>;
 }
 
-pub struct EgressProxy {
+struct EgressProxy {
     endpoints: SandboxEgressProxy,
     transport: Arc<dyn EgressTransport>,
     ca_pem: String,
@@ -89,38 +124,15 @@ struct State {
     hosts: HashSet<String>,
     bindings: Vec<Binding>,
     identity: EgressIdentity,
-    resolver: Arc<dyn EgressCredentialResolver>,
-    #[cfg(test)]
-    upstream: Option<tests::TestUpstream>,
+    resolver: Option<Arc<dyn EgressCredentialResolver>>,
+    upstream: Arc<dyn UpstreamResolver>,
 }
 
 impl EgressProxy {
-    pub async fn bind(
-        host_ip: Ipv4Addr,
-        identity: EgressIdentity,
-        policy: EgressPolicy,
-        resolver: Arc<dyn EgressCredentialResolver>,
-    ) -> Result<Self> {
-        Self::start(host_ip, State::new(identity, policy, resolver)?).await
-    }
-
-    async fn start(host_ip: Ipv4Addr, state: State) -> Result<Self> {
-        let transport = Arc::new(LocalEgressTransport::bind(host_ip, &state.hosts).await?);
-        Self::start_with_transport(transport, state).await
-    }
-
-    pub async fn with_transport(
-        transport: Arc<dyn EgressTransport>,
-        identity: EgressIdentity,
-        policy: EgressPolicy,
-        resolver: Arc<dyn EgressCredentialResolver>,
-    ) -> Result<Self> {
-        Self::start_with_transport(transport, State::new(identity, policy, resolver)?).await
-    }
-
     async fn start_with_transport(
         transport: Arc<dyn EgressTransport>,
         state: State,
+        cancel: CancellationToken,
     ) -> Result<Self> {
         let endpoints = transport.endpoints();
         endpoints.validate()?;
@@ -131,7 +143,6 @@ impl EgressProxy {
             .map(|b| (b.config.environment_variable.clone(), b.placeholder.clone()))
             .collect();
         let state = Arc::new(state);
-        let cancel = CancellationToken::new();
         let task = tokio::spawn(serve(transport.clone(), tls, state, cancel.clone()));
         Ok(Self {
             endpoints,
@@ -157,12 +168,6 @@ impl EgressProxy {
         &self.environment
     }
 
-    pub async fn shutdown(mut self) -> Result<()> {
-        self.close();
-        (&mut self.task).await.context("joining egress proxy")?;
-        Ok(())
-    }
-
     fn close(&self) {
         self.cancel.cancel();
         self.transport.close();
@@ -172,6 +177,7 @@ impl EgressProxy {
 impl Drop for EgressProxy {
     fn drop(&mut self) {
         self.close();
+        self.task.abort();
     }
 }
 
@@ -179,7 +185,8 @@ impl State {
     fn new(
         identity: EgressIdentity,
         policy: EgressPolicy,
-        resolver: Arc<dyn EgressCredentialResolver>,
+        resolver: Option<Arc<dyn EgressCredentialResolver>>,
+        upstream: Arc<dyn UpstreamResolver>,
     ) -> Result<Self> {
         ensure!(
             !identity.sandbox_id.is_empty(),
@@ -190,18 +197,18 @@ impl State {
                 "egress proxy currently requires limited networking; unrestricted passthrough is not implemented"
             ));
         };
-        let hosts = canonical_hosts(&allowed_hosts)?;
+        let hosts = canonical_egress_hosts(&allowed_hosts)?;
+        ensure!(
+            policy.credentials.is_empty() || resolver.is_some(),
+            "credential substitution requires an egress credential resolver"
+        );
         let mut variables = HashSet::new();
         let mut bindings = Vec::new();
         for config in policy.credentials {
-            ensure!(
-                !config.injection_location.body,
-                "credential substitution in request bodies is not implemented"
-            );
             let hosts = match &config.networking {
                 CredentialNetworkPolicy::Unrestricted => None,
                 CredentialNetworkPolicy::Limited { allowed_hosts } => {
-                    Some(canonical_hosts(allowed_hosts)?)
+                    Some(canonical_egress_hosts(allowed_hosts)?)
                 }
             };
             ensure!(
@@ -234,16 +241,30 @@ impl State {
             bindings,
             identity,
             resolver,
-            #[cfg(test)]
-            upstream: None,
+            upstream,
         })
     }
 
     async fn forward(
         &self,
-        mut request: Request<Incoming>,
+        request: Request<Incoming>,
         sni: Option<&str>,
     ) -> Result<Response<ProxyBody>> {
+        let (destination, url) = self.destination(&request, sni)?;
+        let mut headers = request.headers().clone();
+        self.validate_credentials(&headers, &destination.host, sni.is_some())?;
+        strip_hop_headers(&mut headers)?;
+        let client = self.client(&destination.host, destination.port).await?;
+        self.substitute_credentials(&mut headers, &destination)
+            .await?;
+        relay(request, headers, url, client).await
+    }
+
+    fn destination(
+        &self,
+        request: &Request<Incoming>,
+        sni: Option<&str>,
+    ) -> Result<(EgressDestination, reqwest::Url)> {
         ensure!(
             request.method() != Method::CONNECT,
             "CONNECT is not supported on the transparent listener"
@@ -305,16 +326,15 @@ impl State {
             method: request.method().clone(),
             path,
         };
-        let mut headers = request.headers().clone();
-        for (header, value) in &headers {
-            if !value
-                .as_bytes()
-                .windows(PLACEHOLDER_PREFIX.len())
-                .any(|s| s == PLACEHOLDER_PREFIX.as_bytes())
-            {
+        Ok((destination, url))
+    }
+
+    fn validate_credentials(&self, headers: &HeaderMap, host: &str, tls: bool) -> Result<()> {
+        for (header, value) in headers {
+            if !contains_placeholder(value.as_bytes()) {
                 continue;
             }
-            ensure!(sni.is_some(), "credential substitution requires HTTPS");
+            ensure!(tls, "credential substitution requires HTTPS");
             ensure!(
                 !hop_header(header) && header != HOST && header != "content-length",
                 "credential cannot rewrite HTTP routing or framing"
@@ -325,7 +345,7 @@ impl State {
             );
             let mut unresolved = value.to_str()?.to_owned();
             for binding in &self.bindings {
-                if binding.permits_header(&host) {
+                if binding.permits_header(host) {
                     unresolved = unresolved.replace(&binding.placeholder, "");
                 }
             }
@@ -334,25 +354,31 @@ impl State {
                 "credential placeholder does not match this request"
             );
         }
-        strip_hop_headers(&mut headers)?;
-        let client = self.client(&host, port).await?;
+        Ok(())
+    }
+
+    async fn substitute_credentials(
+        &self,
+        headers: &mut HeaderMap,
+        destination: &EgressDestination,
+    ) -> Result<()> {
         for (_, header_value) in headers.iter_mut() {
-            if !header_value
-                .as_bytes()
-                .windows(PLACEHOLDER_PREFIX.len())
-                .any(|s| s == PLACEHOLDER_PREFIX.as_bytes())
-            {
+            if !contains_placeholder(header_value.as_bytes()) {
                 continue;
             }
             let mut replacement = header_value.to_str()?.to_owned();
             for binding in &self.bindings {
-                if !binding.permits_header(&host) || !replacement.contains(&binding.placeholder) {
+                if !binding.permits_header(&destination.host)
+                    || !replacement.contains(&binding.placeholder)
+                {
                     continue;
                 }
                 let value = tokio::time::timeout(
                     IO_TIMEOUT,
                     self.resolver
-                        .resolve(&self.identity, &binding.config.name, &destination),
+                        .as_ref()
+                        .context("credential resolver is unavailable")?
+                        .resolve(&self.identity, &binding.config.name, destination),
                 )
                 .await?
                 .map_err(|_| anyhow!("credential is unavailable or not authorized"))?;
@@ -363,67 +389,68 @@ impl State {
             value.set_sensitive(true);
             *header_value = value;
         }
-        headers.remove(HOST);
-        headers.remove("content-length");
-        let method = request.method().clone();
-        let body = tokio::time::timeout(
-            IO_TIMEOUT,
-            Limited::new(request.body_mut(), 8 * 1024 * 1024).collect(),
-        )
-        .await?
-        .map_err(|_| anyhow!("invalid or oversized request body"))?
-        .to_bytes();
-        let response = client
-            .request(method, url)
-            .headers(headers)
-            .body(body)
-            .send()
-            .await
-            .map_err(|_| anyhow!("upstream request failed"))?;
-        let status = response.status();
-        let mut headers = response.headers().clone();
-        strip_hop_headers(&mut headers)?;
-        let stream = response
-            .bytes_stream()
-            .map_ok(Frame::data)
-            .map_err(|_| -> ProxyError { "upstream response failed".into() });
-        let mut result = Response::new(BodyExt::boxed(StreamBody::new(stream)));
-        *result.status_mut() = status;
-        *result.headers_mut() = headers;
-        Ok(result)
+        Ok(())
     }
 
     async fn client(&self, host: &str, port: u16) -> Result<reqwest::Client> {
-        let builder = reqwest::Client::builder()
+        let upstream = self
+            .upstream
+            .resolve(host, port)
+            .await
+            .map_err(|_| anyhow!("upstream address resolution failed"))?;
+        let mut builder = reqwest::Client::builder()
             .no_proxy()
             .redirect(reqwest::redirect::Policy::none())
-            .connect_timeout(Duration::from_secs(10))
-            .read_timeout(IO_TIMEOUT);
-        #[cfg(test)]
-        if let Some(upstream) = &self.upstream {
-            return Ok(builder
-                .add_root_certificate(reqwest::Certificate::from_pem(upstream.ca_pem.as_bytes())?)
-                .resolve(host, upstream.address)
-                .build()?);
+            .connect_timeout(CONNECT_TIMEOUT)
+            .read_timeout(IO_TIMEOUT)
+            .resolve_to_addrs(host, &upstream.addresses);
+        if let Some(certificate) = upstream.root_certificate {
+            builder = builder.add_root_certificate(certificate);
         }
-        let addresses = tokio::time::timeout(
-            Duration::from_secs(10),
-            tokio::net::lookup_host((host, port)),
-        )
-        .await??
-        .filter(|addr| public_ipv4(addr.ip()))
-        .collect::<Vec<_>>();
-        ensure!(
-            !addresses.is_empty(),
-            "upstream has no permitted IPv4 address"
-        );
-        Ok(builder.resolve_to_addrs(host, &addresses).build()?)
+        Ok(builder.build()?)
     }
 }
 
-fn canonical_hosts(hosts: &[String]) -> Result<HashSet<String>> {
-    ensure!(hosts.len() <= 128, "too many allowed hosts");
-    hosts.iter().map(|host| canonical_host(host)).collect()
+fn contains_placeholder(value: &[u8]) -> bool {
+    value
+        .windows(PLACEHOLDER_PREFIX.len())
+        .any(|s| s == PLACEHOLDER_PREFIX.as_bytes())
+}
+
+async fn relay(
+    mut request: Request<Incoming>,
+    mut headers: HeaderMap,
+    url: reqwest::Url,
+    client: reqwest::Client,
+) -> Result<Response<ProxyBody>> {
+    headers.remove(HOST);
+    headers.remove("content-length");
+    let method = request.method().clone();
+    let body = tokio::time::timeout(
+        IO_TIMEOUT,
+        Limited::new(request.body_mut(), MAX_REQUEST_BODY).collect(),
+    )
+    .await?
+    .map_err(|_| anyhow!("invalid or oversized request body"))?
+    .to_bytes();
+    let response = client
+        .request(method, url)
+        .headers(headers)
+        .body(body)
+        .send()
+        .await
+        .map_err(|_| anyhow!("upstream request failed"))?;
+    let status = response.status();
+    let mut headers = response.headers().clone();
+    strip_hop_headers(&mut headers)?;
+    let stream = response
+        .bytes_stream()
+        .map_ok(Frame::data)
+        .map_err(|_| -> ProxyError { "upstream response failed".into() });
+    let mut result = Response::new(BodyExt::boxed(StreamBody::new(stream)));
+    *result.status_mut() = status;
+    *result.headers_mut() = headers;
+    Ok(result)
 }
 
 fn public_ipv4(ip: IpAddr) -> bool {
@@ -516,7 +543,8 @@ where
         async move {
             let response = match state.forward(request, sni.as_deref()).await {
                 Ok(response) => response,
-                Err(_) => {
+                Err(error) => {
+                    tracing::debug!(%error, sandbox_id = %state.identity.sandbox_id, "egress request failed");
                     let body = Full::new(Bytes::from_static(
                         b"egress request denied or upstream unavailable\n",
                     ))
@@ -533,7 +561,7 @@ where
     hyper::server::conn::http1::Builder::new()
         .timer(TokioTimer::new())
         .header_read_timeout(IO_TIMEOUT)
-        .max_buf_size(32 * 1024)
+        .max_buf_size(HTTP_BUFFER_SIZE)
         .serve_connection(TokioIo::new(stream), service)
         .await?;
     Ok(())
@@ -546,7 +574,7 @@ async fn serve(
     cancel: CancellationToken,
 ) {
     let mut tasks = JoinSet::new();
-    let permits = Arc::new(Semaphore::new(128));
+    let permits = Arc::new(Semaphore::new(MAX_CONNECTIONS));
     loop {
         tokio::select! {
             _ = cancel.cancelled() => break,
