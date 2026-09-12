@@ -187,10 +187,13 @@ impl<H: ManagedSandboxHandle + 'static> EgressRuntime<H> {
                 .await?,
             ca_path: format!("/tmp/exo-egress-{}.pem", uuid::Uuid::new_v4().simple()),
         });
-        self.sandboxes
-            .lock()
-            .expect("egress sandbox map poisoned")
-            .insert(
+        {
+            let mut sandboxes = self.sandboxes.lock().expect("egress sandbox map poisoned");
+            ensure!(
+                !self.closed.is_cancelled(),
+                "sandbox egress runtime shut down during acquisition"
+            );
+            sandboxes.insert(
                 request.sandbox_id.clone(),
                 CachedSandbox {
                     request: request.clone(),
@@ -198,6 +201,7 @@ impl<H: ManagedSandboxHandle + 'static> EgressRuntime<H> {
                     egress: egress.clone(),
                 },
             );
+        }
         let handle = match build(Some(egress)).await {
             Ok(handle) => Arc::new(handle),
             Err(error) => {
@@ -360,6 +364,33 @@ mod tests {
         };
         let (result, ()) = tokio::join!(acquiring, shutdown);
         assert!(result.err().unwrap().to_string().contains("shut down"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn shutdown_during_transport_creation_prevents_late_registration() -> Result<()> {
+        let runtime = EgressRuntime::<Handle>::new(None, Arc::new(PublicUpstreamResolver));
+        let transport = Arc::new(Transport::default());
+        let (started, ready) = tokio::sync::oneshot::channel();
+        let (release, released) = tokio::sync::oneshot::channel();
+        let acquiring = runtime.acquire(
+            request("one"),
+            |_| async {
+                started.send(()).unwrap();
+                released.await?;
+                Ok(transport.clone() as Arc<dyn EgressTransport>)
+            },
+            |_| async { panic!("closed runtime must not start a sandbox") },
+        );
+        let shutdown = async {
+            ready.await.unwrap();
+            runtime.shutdown();
+            release.send(()).unwrap();
+        };
+        let (result, ()) = tokio::join!(acquiring, shutdown);
+        assert!(result.err().unwrap().to_string().contains("shut down"));
+        assert!(transport.closed.load(Ordering::SeqCst));
+        assert!(runtime.sandboxes.lock().unwrap().is_empty());
         Ok(())
     }
 

@@ -3968,7 +3968,7 @@ struct StoredSandbox {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(untagged)]
+#[serde(untagged, deny_unknown_fields)]
 enum StoredSandboxPolicy {
     Policy { policy: crate::EgressPolicy },
     Legacy { enable_networking: bool },
@@ -4976,5 +4976,15 @@ mod stored_policy_tests {
         assert!(!serialized.contains("enable_networking"));
         let current: StoredSandbox = serde_json::from_str(&serialized).unwrap();
         assert_eq!(current.policy(), legacy.policy());
+        assert!(
+            serde_json::from_value::<StoredSandbox>(serde_json::json!({
+                "id": "invalid-policy", "provider": "local_process", "image": "",
+                "default_workdir": null, "file_system_mounts": [],
+                "enable_networking": true, "idle_seconds": 60,
+                "running": true, "latest_snapshot_id": null,
+                "policy": {"networking": {"type": "unsupported"}}
+            }))
+            .is_err()
+        );
     }
 }
