@@ -454,7 +454,7 @@ async fn handle_request(
             backends
                 .backend(config)
                 .await?
-                .terminate(request.sandbox)
+                .stop_request(request.sandbox)
                 .await?;
             Ok(FirecrackerBridgeResponse::Unit)
         }

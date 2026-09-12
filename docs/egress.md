@@ -148,8 +148,11 @@ configuration, the local transport selects the host's routed IPv4 address.
 The Firecracker and Lima backends own their proxies. `shutdown_egress()` closes
 all proxies while retaining the VMs, including when another acquisition is pending. A fresh backend can reacquire it with new
 listeners, trust, and placeholders; existing client processes must restart to
-receive those values. `stop` and `terminate` preserve the provider's lifecycle
-behavior and release the listener ports, even while callers retain old handles.
+receive those values. On Firecracker (including Lima), `stop` flushes durable
+filesystems before closing egress or stopping the VM. If the flush fails, the VM
+and its networking remain available for retry. `terminate` revokes egress and
+attempts the flush, but logs a sync failure or timeout and continues destroying
+the VM. Both release listener ports even while callers retain old handles.
 VM cleanup, including idle reaping, closes its listeners before releasing its
 network address. This also applies to the listeners inside the Lima bridge.
 Low-level callers that already own their proxy can pass endpoints to

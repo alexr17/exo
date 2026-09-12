@@ -1,4 +1,5 @@
 use super::*;
+use crate::egress::{EgressTransport, LocalEgressTransport};
 use tokio::net::UnixListener;
 
 fn test_host_runtime() -> FirecrackerHostFingerprint {
@@ -854,6 +855,8 @@ struct DurableStopFixture {
     request: SandboxRequest,
     machine: Machine,
     listener: UnixListener,
+    handle: Arc<FirecrackerSandboxHandle>,
+    egress_transport: Arc<LocalEgressTransport>,
 }
 
 impl DurableStopFixture {
@@ -874,10 +877,15 @@ impl DurableStopFixture {
                 resources: Default::default(),
                 mounts: vec![],
                 durable_file_systems: vec![],
-                policy: SandboxNetworkPolicy::Disabled.into(),
+                policy: SandboxNetworkPolicy::Limited {
+                    allowed_hosts: vec!["api.test".into()],
+                }
+                .into(),
                 default_workdir: "/workspace".into(),
             },
-            lifecycle: Default::default(),
+            lifecycle: crate::SandboxLifecycleConfig {
+                idle_ttl: Some(Duration::from_secs(60)),
+            },
             provider_state: None,
         };
         let record = MachineRecord {
@@ -916,24 +924,53 @@ impl DurableStopFixture {
         fs::create_dir_all(machine.vsock_path.parent().unwrap())?;
         let listener = UnixListener::bind(&machine.vsock_path)?;
         // Only liveness reads this PID. The fake guest removes it before a
-        // successful sync reply so cleanup never signals the test process.
+        // reply that permits cleanup so it never signals the test process.
         fs::write(
             shared.pid_path(&machine.record.machine_id),
             std::process::id().to_string(),
         )?;
+        let backend = FirecrackerSandboxBackend {
+            shared,
+            egress: Arc::new(EgressRuntime::new(None, Arc::new(PublicUpstreamResolver))),
+        };
+        let egress_transport =
+            Arc::new(LocalEgressTransport::for_hosts(&["api.test".into()]).await?);
+        backend
+            .shared
+            .egress_transports
+            .lock()
+            .unwrap()
+            .insert(machine.record.machine_id.clone(), egress_transport.clone());
+        let handle = backend
+            .egress
+            .acquire(
+                request.clone(),
+                |_| async { Ok(egress_transport.clone() as Arc<dyn EgressTransport>) },
+                |egress| async {
+                    Ok(FirecrackerSandboxHandle {
+                        egress,
+                        id: request.sandbox_id.clone(),
+                        machine: machine.clone(),
+                        request: request.clone().into(),
+                        spec_hash: machine.record.spec_hash.clone(),
+                        shared: backend.shared.clone(),
+                        one_shot: false,
+                    })
+                },
+            )
+            .await?;
         Ok(Self {
             _directory: directory,
-            backend: FirecrackerSandboxBackend {
-                shared,
-                egress: Arc::new(EgressRuntime::new(None, Arc::new(PublicUpstreamResolver))),
-            },
+            backend,
             request,
             machine,
             listener,
+            handle,
+            egress_transport,
         })
     }
 
-    async fn sync_reply(&self, response: GuestResponse) -> Result<()> {
+    async fn sync_request(&self) -> Result<UnixStream> {
         let (stream, _) = self.listener.accept().await?;
         let mut stream = AsyncBufReader::new(stream);
         let mut handshake = String::new();
@@ -948,7 +985,12 @@ impl DurableStopFixture {
         assert!(
             matches!(request.payload, ProtocolGuestRequest::SyncFilesystem { path } if path == "/workspace")
         );
-        if response.ok {
+        Ok(stream)
+    }
+
+    async fn sync_reply(&self, response: GuestResponse, exit_guest: bool) -> Result<()> {
+        let mut stream = self.sync_request().await?;
+        if exit_guest {
             fs::remove_file(
                 self.backend
                     .shared
@@ -972,7 +1014,7 @@ async fn terminate_flushes_durable_guest_without_acquiring_a_vm() -> Result<()> 
     tokio::time::timeout(Duration::from_secs(2), async {
         tokio::try_join!(
             fixture.backend.terminate(fixture.request.clone()),
-            fixture.sync_reply(GuestResponse::ok()),
+            fixture.sync_reply(GuestResponse::ok(), true),
         )
     })
     .await??;
@@ -992,17 +1034,18 @@ async fn terminate_flushes_durable_guest_without_acquiring_a_vm() -> Result<()> 
     not(target_os = "linux"),
     ignore = "uses Linux process liveness; no VM required"
 )]
-async fn failed_durable_sync_leaves_the_vm_and_warm_entry_for_retry() -> Result<()> {
+async fn failed_stop_keeps_the_vm_and_egress_usable_until_retry() -> Result<()> {
     let fixture = DurableStopFixture::new().await?;
     let (stop, reply) = tokio::time::timeout(Duration::from_secs(2), async {
         tokio::join!(
-            fixture.backend.terminate(fixture.request.clone()),
-            fixture.sync_reply(GuestResponse::error("sync failed")),
+            fixture.handle.stop(),
+            fixture.sync_reply(GuestResponse::error("sync failed"), false),
         )
     })
     .await?;
     reply?;
     assert!(format!("{:#}", stop.unwrap_err()).contains("sync failed"));
+    assert!(!fixture.egress_transport.is_closed());
     assert!(
         fixture
             .backend
@@ -1026,5 +1069,104 @@ async fn failed_durable_sync_leaves_the_vm_and_warm_entry_for_retry() -> Result<
             .await
             .contains_key(&fixture.request.sandbox_id)
     );
+    // The non-booting request path used by Lima must preserve the same state.
+    let (stop, reply) = tokio::time::timeout(Duration::from_secs(2), async {
+        tokio::join!(
+            fixture.backend.stop_request(fixture.request.clone()),
+            fixture.sync_reply(GuestResponse::error("sync failed"), false),
+        )
+    })
+    .await?;
+    reply?;
+    assert!(format!("{:#}", stop.unwrap_err()).contains("sync failed"));
+    assert!(!fixture.egress_transport.is_closed());
+    // A subsequent successful stop closes egress even while the handle is retained.
+    tokio::time::timeout(Duration::from_secs(2), async {
+        tokio::try_join!(
+            fixture.handle.stop(),
+            fixture.sync_reply(GuestResponse::ok(), true)
+        )
+    })
+    .await??;
+    assert!(fixture.egress_transport.is_closed());
+    assert!(
+        !fixture
+            .backend
+            .shared
+            .manifest_path(&fixture.machine.record.machine_id)
+            .exists()
+    );
+    Ok(())
+}
+
+#[tokio::test]
+#[cfg_attr(
+    not(target_os = "linux"),
+    ignore = "uses Linux process liveness; no VM required"
+)]
+async fn terminate_cleans_up_after_a_failed_durable_sync() -> Result<()> {
+    let fixture = DurableStopFixture::new().await?;
+    tokio::time::timeout(Duration::from_secs(2), async {
+        tokio::try_join!(
+            fixture.backend.terminate(fixture.request.clone()),
+            fixture.sync_reply(GuestResponse::error("sync failed"), true),
+        )
+    })
+    .await??;
+    assert!(fixture.egress_transport.is_closed());
+    assert!(
+        !fixture
+            .backend
+            .shared
+            .manifest_path(&fixture.machine.record.machine_id)
+            .exists()
+    );
+    assert!(fixture.backend.shared.warm_machines.lock().await.is_empty());
+    Ok(())
+}
+
+#[tokio::test]
+#[cfg_attr(
+    not(target_os = "linux"),
+    ignore = "uses Linux process liveness; no VM required"
+)]
+async fn terminate_cleans_up_when_the_guest_never_answers_sync() -> Result<()> {
+    let fixture = DurableStopFixture::new().await?;
+    let (finished, completion) = tokio::sync::oneshot::channel();
+    let terminate = async {
+        let result = fixture.backend.terminate(fixture.request.clone()).await;
+        finished.send(()).unwrap();
+        result
+    };
+    let silent_guest = async {
+        let stream = fixture.sync_request().await?;
+        // Simulate VM exit so cleanup can run without signaling the test process,
+        // but hold its connection open to exercise the sync timeout, not EOF.
+        fs::remove_file(
+            fixture
+                .backend
+                .shared
+                .pid_path(&fixture.machine.record.machine_id),
+        )?;
+        tokio::time::pause();
+        tokio::time::advance(GUEST_REQUEST_TIMEOUT + Duration::from_secs(1)).await;
+        tokio::time::resume();
+        completion.await?;
+        drop(stream);
+        Ok::<_, anyhow::Error>(())
+    };
+    tokio::time::timeout(GUEST_REQUEST_TIMEOUT * 2, async {
+        tokio::try_join!(terminate, silent_guest)
+    })
+    .await??;
+    assert!(fixture.egress_transport.is_closed());
+    assert!(
+        !fixture
+            .backend
+            .shared
+            .manifest_path(&fixture.machine.record.machine_id)
+            .exists()
+    );
+    assert!(fixture.backend.shared.warm_machines.lock().await.is_empty());
     Ok(())
 }

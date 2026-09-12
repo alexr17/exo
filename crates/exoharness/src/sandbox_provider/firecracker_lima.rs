@@ -454,9 +454,6 @@ impl ManagedSandboxHandle for LimaFirecrackerSandboxHandle {
     }
 
     async fn stop(&self) -> Result<()> {
-        if let Some(egress) = &self.egress {
-            egress.close();
-        }
         if self.request.lifecycle.idle_ttl.is_none() {
             bail!("one-shot Firecracker Lima sandboxes cannot be stopped independently");
         }
@@ -468,7 +465,12 @@ impl ManagedSandboxHandle for LimaFirecrackerSandboxHandle {
             })
             .await?
         {
-            FirecrackerBridgeResponse::Unit => Ok(()),
+            FirecrackerBridgeResponse::Unit => {
+                if let Some(egress) = &self.egress {
+                    egress.close();
+                }
+                Ok(())
+            }
             _ => bail!("Firecracker Lima bridge returned the wrong response to stop"),
         }
     }
@@ -1654,6 +1656,96 @@ mod egress_cleanup_tests {
                     FirecrackerBridgeRequest::EgressClose { .. }
                 ));
             }
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn failed_lima_stop_preserves_egress_until_a_successful_retry() -> Result<()> {
+        let (outgoing, mut receiver) = mpsc::channel(8);
+        let connection = Arc::new(LimaBridgeConnection {
+            outgoing,
+            state: Arc::new(LimaBridgeClientState::default()),
+            next_id: AtomicU64::new(1),
+        });
+        let bridge = Arc::new(LimaBridgeManager {
+            limactl: "unused-limactl".into(),
+            instance: "test".into(),
+            bridge_binary: "unused-bridge".into(),
+            build_bridge: false,
+            connection: Mutex::new(Some(connection.clone())),
+        });
+        let request = SandboxRequest {
+            sandbox_id: "stop-test".into(),
+            scope: None,
+            provider_state: None,
+            spec: crate::SandboxSpec {
+                image: "test".into(),
+                resources: Default::default(),
+                mounts: vec![],
+                durable_file_systems: vec![],
+                default_workdir: "/workspace".into(),
+                policy: crate::SandboxNetworkPolicy::Limited {
+                    allowed_hosts: vec!["api.test".into()],
+                }
+                .into(),
+            },
+            lifecycle: crate::SandboxLifecycleConfig {
+                idle_ttl: Some(std::time::Duration::from_secs(60)),
+            },
+        };
+        let transport =
+            Arc::new(crate::egress::LocalEgressTransport::for_hosts(&["api.test".into()]).await?);
+        let runtime = EgressRuntime::new(None, Arc::new(PublicUpstreamResolver));
+        let handle = runtime
+            .acquire(
+                request.clone(),
+                |_| async { Ok(transport.clone() as Arc<dyn EgressTransport>) },
+                |egress| async {
+                    Ok(LimaFirecrackerSandboxHandle {
+                        egress,
+                        source_ipv4: None,
+                        id: request.sandbox_id.clone(),
+                        provider_state: None,
+                        effective_image: None,
+                        request: request.into(),
+                        config: FirecrackerConfig::default(),
+                        bridge,
+                    })
+                },
+            )
+            .await?;
+        for response in [
+            Err("sync failed".into()),
+            Ok(FirecrackerBridgeResponse::Unit),
+        ] {
+            let stopped = response.is_ok();
+            let reply = async {
+                let FirecrackerBridgeClientFrame::Request { id, request } =
+                    receiver.recv().await.context("stop request missing")?
+                else {
+                    bail!("expected stop RPC");
+                };
+                anyhow::ensure!(
+                    matches!(*request, FirecrackerBridgeRequest::Stop { .. }),
+                    "expected stop, not terminate"
+                );
+                connection.state.handle_frame(
+                    FirecrackerBridgeServerFrame::Response {
+                        id,
+                        result: response,
+                    },
+                    &connection.outgoing,
+                )
+            };
+            let (result, replied) =
+                tokio::time::timeout(std::time::Duration::from_secs(1), async {
+                    tokio::join!(handle.stop(), reply)
+                })
+                .await?;
+            replied?;
+            assert_eq!(result.is_ok(), stopped);
+            assert_eq!(transport.is_closed(), stopped);
         }
         Ok(())
     }

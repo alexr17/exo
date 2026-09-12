@@ -636,8 +636,18 @@ pub struct FirecrackerSandboxBackend {
     shared: Arc<Shared>,
 }
 
+#[derive(Clone, Copy)]
+enum ShutdownMode {
+    Stop,
+    Terminate,
+}
+
 impl FirecrackerSandboxBackend {
-    async fn terminate_raw(&self, request: SandboxRequest) -> Result<()> {
+    pub(super) async fn stop_request(&self, request: SandboxRequest) -> Result<()> {
+        self.shutdown_request(request, ShutdownMode::Stop).await
+    }
+
+    async fn shutdown_request(&self, request: SandboxRequest, mode: ShutdownMode) -> Result<()> {
         let persisted_machine_id = request
             .provider_state
             .as_ref()
@@ -647,7 +657,7 @@ impl FirecrackerSandboxBackend {
         if let Some(machine_id) = persisted_machine_id.as_deref() {
             let machine_key_prefix = format!("fc-{}-", stable_id(request.sandbox_id.as_str()));
             if !valid_machine_id(machine_id) || !machine_id.starts_with(&machine_key_prefix) {
-                bail!("Firecracker provider state does not match the terminated sandbox key");
+                bail!("Firecracker provider state does not match the requested sandbox key");
             }
         }
         let _lifecycle_guard = self
@@ -668,7 +678,7 @@ impl FirecrackerSandboxBackend {
                 machine_id(request.sandbox_id.as_str(), &spec_hash)
             });
         self.shared
-            .stop_machine(&machine_id, &request.spec.default_workdir)
+            .shutdown_machine(&machine_id, &request.spec.default_workdir, mode)
             .await
     }
 
@@ -1394,7 +1404,7 @@ impl ManagedSandboxBackend for FirecrackerSandboxBackend {
     async fn terminate(&self, request: SandboxRequest) -> Result<()> {
         let id = request.sandbox_id.clone();
         self.egress
-            .terminate(&id, self.terminate_raw(request))
+            .terminate(&id, self.shutdown_request(request, ShutdownMode::Terminate))
             .await
     }
 
@@ -1636,15 +1646,17 @@ impl ManagedSandboxHandle for FirecrackerSandboxHandle {
 
     #[tracing::instrument(name = "firecracker.stop", skip_all)]
     async fn stop(&self) -> Result<()> {
+        self.shared
+            .shutdown_machine(
+                &self.machine.record.machine_id,
+                &self.request.spec.default_workdir,
+                ShutdownMode::Stop,
+            )
+            .await?;
         if let Some(egress) = &self.egress {
             egress.close();
         }
-        self.shared
-            .stop_machine(
-                &self.machine.record.machine_id,
-                &self.request.spec.default_workdir,
-            )
-            .await
+        Ok(())
     }
 
     async fn detach(&self) -> Result<SandboxAttachment> {
@@ -2060,11 +2072,15 @@ impl Shared {
         .context("joining Firecracker launch task")?
     }
 
-    // Both handle.stop() and backend termination (including the Lima bridge)
-    // stop an existing VM here without acquiring or booting it first.
-    async fn stop_machine(self: &Arc<Self>, machine_id: &str, workdir: &str) -> Result<()> {
+    // Stop leaves the VM and its network usable if syncing fails. Terminate
+    // still destroys it after a failed or timed-out sync. Neither path boots a VM.
+    async fn shutdown_machine(
+        self: &Arc<Self>,
+        machine_id: &str,
+        workdir: &str,
+        mode: ShutdownMode,
+    ) -> Result<()> {
         let _lifecycle_guard = self.lifecycle_locks.lock_machine(machine_id).await;
-        self.close_egress(machine_id);
         if let Some(record) = self.load_machine_record(machine_id).await?
             && record.workspace_id.is_some()
             && process_running(&self.pid_path(machine_id))
@@ -2074,10 +2090,20 @@ impl Shared {
             // VMM so completed writes are not stranded in the guest page cache.
             // https://github.com/firecracker-microvm/firecracker/blob/main/docs/api_requests/actions.md#intel-and-amd-only-sendctrlaltdel
             let machine = machine_from_record(&self.config, record);
-            GuestClient::new(Arc::clone(self), machine.vsock_path)
+            if let Err(error) = GuestClient::new(Arc::clone(self), machine.vsock_path)
                 .sync_filesystem(workdir)
                 .await
-                .context("syncing Firecracker durable filesystem before stop")?;
+            {
+                match mode {
+                    ShutdownMode::Stop => {
+                        return Err(error)
+                            .context("syncing Firecracker durable filesystem before stop");
+                    }
+                    ShutdownMode::Terminate => {
+                        tracing::warn!(machine_id, %error, "durable filesystem sync failed; terminating Firecracker VM anyway");
+                    }
+                }
+            }
         }
         self.warm_machines
             .lock()
