@@ -5,6 +5,7 @@ use anyhow::bail;
 use hickory_proto::op::{Message, ResponseCode};
 use hickory_proto::rr::RecordType;
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use tokio::net::TcpListener;
 use tokio::sync::RwLock;
 
@@ -75,7 +76,7 @@ impl EgressCredentialResolver for TestResolver {
 }
 
 struct Upstream {
-    connections: Arc<std::sync::atomic::AtomicUsize>,
+    connections: Arc<AtomicUsize>,
     config: TestUpstream,
     task: tokio::task::JoinHandle<()>,
 }
@@ -94,7 +95,7 @@ impl Upstream {
             address: listener.local_addr()?,
             ca_pem,
         };
-        let count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let count = Arc::new(AtomicUsize::new(0));
         let connection_count = count.clone();
         let task = tokio::spawn(async move {
             let mut connections = JoinSet::new();
@@ -102,7 +103,7 @@ impl Upstream {
                 tokio::select! {
                     incoming = listener.accept() => {
                         let Ok((stream, _)) = incoming else { break; };
-                        connection_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        connection_count.fetch_add(1, Ordering::SeqCst);
                         let tls = tls.clone();
                         connections.spawn(async move {
                             let stream = tls.accept(stream).await?;
@@ -345,6 +346,17 @@ fn host_ip() -> Result<Ipv4Addr> {
     }
 }
 
+async fn bound_proxy(
+    upstream: &Upstream,
+    sandbox_id: &str,
+    resolver: Arc<dyn EgressCredentialResolver>,
+) -> Result<(EgressProxy, reqwest::Client)> {
+    let proxy = upstream.proxy(host_ip()?, sandbox_id, resolver).await?;
+    proxy.bind_source(host_ip()?).await?;
+    let client = client(&proxy)?;
+    Ok((proxy, client))
+}
+
 fn client(proxy: &EgressProxy) -> Result<reqwest::Client> {
     Ok(reqwest::Client::builder()
         .no_proxy()
@@ -387,9 +399,7 @@ async fn proxy_requires_a_bound_source_and_closes_on_shutdown() -> Result<()> {
 async fn proxy_substitutes_placeholders_in_header_formats() -> Result<()> {
     let upstream = Upstream::start().await?;
     let resolver = TestResolver::new();
-    let proxy = upstream.proxy(host_ip()?, "one", resolver.clone()).await?;
-    proxy.bind_source(host_ip()?).await?;
-    let proxy_client = client(&proxy)?;
+    let (proxy, proxy_client) = bound_proxy(&upstream, "one", resolver.clone()).await?;
     let bearer = format!("Bearer {}", proxy.environment()["TEST_API_KEY"]);
     let response = proxy_client
         .get("https://api.test/auth")
@@ -460,9 +470,7 @@ async fn proxy_substitutes_placeholders_in_header_formats() -> Result<()> {
 async fn proxy_resolves_current_credentials_for_each_request() -> Result<()> {
     let upstream = Upstream::start().await?;
     let resolver = TestResolver::new();
-    let proxy = upstream.proxy(host_ip()?, "one", resolver.clone()).await?;
-    proxy.bind_source(host_ip()?).await?;
-    let proxy_client = client(&proxy)?;
+    let (proxy, proxy_client) = bound_proxy(&upstream, "one", resolver.clone()).await?;
     let bearer = format!("Bearer {}", proxy.environment()["TEST_API_KEY"]);
     *resolver.value.write().await = Some("canary-v2".into());
     assert_eq!(
@@ -503,9 +511,7 @@ async fn proxy_resolves_current_credentials_for_each_request() -> Result<()> {
 async fn proxy_rejects_cleartext_wrong_destinations_and_other_sandboxes() -> Result<()> {
     let upstream = Upstream::start().await?;
     let resolver = TestResolver::new();
-    let proxy = upstream.proxy(host_ip()?, "one", resolver.clone()).await?;
-    proxy.bind_source(host_ip()?).await?;
-    let proxy_client = client(&proxy)?;
+    let (proxy, proxy_client) = bound_proxy(&upstream, "one", resolver.clone()).await?;
     let bearer = format!("Bearer {}", proxy.environment()["TEST_API_KEY"]);
     let cleartext = reqwest::Client::builder()
         .no_proxy()
@@ -575,7 +581,7 @@ fn rejects_unsafe_policy_and_addresses() {
         "-a.com",
         "example.com.",
     ] {
-        assert!(canonical_host(host).is_err(), "{host}");
+        assert!(canonical_egress_host(host).is_err(), "{host}");
     }
     for ip in [
         "127.0.0.1",
@@ -715,14 +721,14 @@ async fn guest(
 #[tokio::test]
 #[ignore = "requires root, Linux/KVM, and the Exo Firecracker artifact bundle"]
 async fn firecracker_transparent_egress_live() -> Result<()> {
-    ensure!(
-        cfg!(target_os = "linux"),
-        "this smoke test requires Linux/KVM"
-    );
     use crate::{
         FirecrackerConfig, FirecrackerSandboxBackend, ManagedSandboxBackend,
         SandboxLifecycleConfig, SandboxRequest, SandboxResourceShape, SandboxSpec,
     };
+    ensure!(
+        cfg!(target_os = "linux"),
+        "this smoke test requires Linux/KVM"
+    );
     let state_root = tempfile::Builder::new()
         .prefix("eg-")
         .tempdir_in("/var/lib/exo")?;
@@ -849,12 +855,13 @@ async fn managed_firecracker_egress_live() -> Result<()> {
         ManagedSandboxBackend, SandboxCommand, SandboxLifecycleConfig, SandboxRequest,
         SandboxResourceShape, SandboxScope, SandboxSpec,
     };
+    use tokio_util::compat::FuturesAsyncReadCompatExt;
     let mut config = crate::FirecrackerConfig::default();
     let state_root = format!(
         "/var/lib/exo/eg-{}",
         &uuid::Uuid::new_v4().simple().to_string()[..8]
     );
-    config.state_root = (&state_root).into();
+    config.state_root = std::path::PathBuf::from(&state_root);
     config.allowed_egress_cidrs = vec!["0.0.0.0/0".parse()?];
     let lima = crate::FirecrackerLimaConfig::default();
     #[cfg(target_os = "macos")]
@@ -968,14 +975,15 @@ print('PASS reconnect retains VM files and rejects the previous placeholder')
         println!("{}", check.stdout);
         let new_ca = new_handle.exec(&command("import os; print(os.environ['SSL_CERT_FILE'])".into())).await?.stdout;
         assert_ne!(new_ca, old_ca);
-        use tokio_util::compat::FuturesAsyncReadCompatExt;
         let process = new_handle.start_process(&run("assert get() == (200, 'authenticated-v2')\nprint('PASS managed process environment')")).await?;
         let mut stdout = process.stdout.compat();
         let mut stderr = process.stderr.compat();
         let mut out = String::new();
         let mut err = String::new();
         let (exit, stdout_result, stderr_result) = tokio::join!(process.wait, tokio::io::AsyncReadExt::read_to_string(&mut stdout, &mut out), tokio::io::AsyncReadExt::read_to_string(&mut stderr, &mut err));
-        let exit = exit?; stdout_result?; stderr_result?;
+        let exit = exit?;
+        stdout_result?;
+        stderr_result?;
         ensure!(exit == 0, "managed process failed: {err}");
         println!("{out}");
         *resolver.value.write().await = None;
@@ -1125,11 +1133,8 @@ async fn wildcard_listener_dns_replies_from_the_advertised_address_on_both_proto
 #[tokio::test]
 async fn response_connection_list_does_not_fail_a_completed_write() -> Result<()> {
     let upstream = Upstream::start().await?;
-    let proxy = upstream
-        .proxy(host_ip()?, "one", TestResolver::new())
-        .await?;
-    proxy.bind_source(host_ip()?).await?;
-    let response = client(&proxy)?.post("https://api.test/hop").send().await?;
+    let (proxy, proxy_client) = bound_proxy(&upstream, "one", TestResolver::new()).await?;
+    let response = proxy_client.post("https://api.test/hop").send().await?;
     assert_eq!(response.status(), StatusCode::OK);
     assert!(!response.headers().contains_key("x-hop"));
     assert_eq!(response.text().await?, "anonymous");
@@ -1167,10 +1172,7 @@ async fn pooled_clients_reuse_connections_but_follow_changed_dns() -> Result<()>
             "anonymous"
         );
     }
-    assert_eq!(
-        first.connections.load(std::sync::atomic::Ordering::SeqCst),
-        1
-    );
+    assert_eq!(first.connections.load(Ordering::SeqCst), 1);
     *upstream.0.write().await = second.config.clone();
     assert_eq!(
         state
@@ -1183,25 +1185,16 @@ async fn pooled_clients_reuse_connections_but_follow_changed_dns() -> Result<()>
             .await?,
         "anonymous"
     );
-    assert_eq!(
-        first.connections.load(std::sync::atomic::Ordering::SeqCst),
-        1
-    );
-    assert_eq!(
-        second.connections.load(std::sync::atomic::Ordering::SeqCst),
-        1
-    );
+    assert_eq!(first.connections.load(Ordering::SeqCst), 1);
+    assert_eq!(second.connections.load(Ordering::SeqCst), 1);
     Ok(())
 }
 
 #[tokio::test]
 async fn quiet_response_stream_survives_past_the_request_io_timeout() -> Result<()> {
     let upstream = Upstream::start().await?;
-    let proxy = upstream
-        .proxy(host_ip()?, "one", TestResolver::new())
-        .await?;
-    proxy.bind_source(host_ip()?).await?;
-    let mut response = client(&proxy)?
+    let (proxy, proxy_client) = bound_proxy(&upstream, "one", TestResolver::new()).await?;
+    let mut response = proxy_client
         .get("https://api.test/sse")
         .timeout(IO_TIMEOUT * 2)
         .send()

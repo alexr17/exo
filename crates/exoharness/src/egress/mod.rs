@@ -29,7 +29,7 @@ use tokio_rustls::TlsAcceptor;
 use tokio_rustls::rustls::{self, ServerConfig, pki_types::PrivatePkcs8KeyDer};
 use tokio_util::sync::CancellationToken;
 
-use crate::types::{canonical_egress_host as canonical_host, canonical_egress_hosts};
+use crate::types::{canonical_egress_host, canonical_egress_hosts};
 
 use crate::{
     CredentialNetworkPolicy, EgressCredentialBinding, EgressPolicy, SandboxEgressProxy,
@@ -81,6 +81,7 @@ impl UpstreamResolver for PublicUpstreamResolver {
         })
     }
 }
+
 type ProxyError = Box<dyn std::error::Error + Send + Sync>;
 type ProxyBody = BoxBody<Bytes, ProxyError>;
 
@@ -177,17 +178,19 @@ impl EgressProxy {
         })
     }
 
-    pub async fn bind_source(&self, source_ip: Ipv4Addr) -> Result<()> {
+    async fn bind_source(&self, source_ip: Ipv4Addr) -> Result<()> {
         self.transport.bind_source(source_ip).await
     }
 
-    pub fn endpoints(&self) -> SandboxEgressProxy {
+    fn endpoints(&self) -> SandboxEgressProxy {
         self.endpoints
     }
-    pub fn ca_pem(&self) -> &str {
+
+    fn ca_pem(&self) -> &str {
         &self.ca_pem
     }
-    pub fn environment(&self) -> &HashMap<String, String> {
+
+    fn environment(&self) -> &HashMap<String, String> {
         &self.environment
     }
 
@@ -311,7 +314,7 @@ impl State {
             .context("missing Host")?
             .to_str()?
             .parse()?;
-        let host = canonical_host(authority.host())?;
+        let host = canonical_egress_host(authority.host())?;
         ensure!(self.hosts.contains(&host), "host is not allowed");
         let port = if sni.is_some() { 443 } else { 80 };
         ensure!(
@@ -320,7 +323,7 @@ impl State {
         );
         if let Some(sni) = sni {
             ensure!(
-                canonical_host(sni)? == host,
+                canonical_egress_host(sni)? == host,
                 "TLS SNI and HTTP Host must match"
             );
         }
@@ -345,7 +348,7 @@ impl State {
             None => url.path().to_owned(),
         };
         let destination = EgressDestination {
-            host: host.clone(),
+            host,
             port,
             method: request.method().clone(),
             path,

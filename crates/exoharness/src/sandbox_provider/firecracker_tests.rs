@@ -782,9 +782,25 @@ fn snapshot_budget_counts_retained_logical_bytes_and_pending_capture() {
     assert!(enforce_snapshot_budget(&config, MAX_SNAPSHOT_BYTES - 1023).is_err());
 }
 
+fn test_shared(
+    config: FirecrackerConfig,
+    warm_machines: HashMap<SandboxId, WarmMachineEntry>,
+) -> Result<Arc<Shared>> {
+    let state_lock = File::create(config.state_root.join("backend.lock"))?;
+    Ok(Arc::new(Shared {
+        config,
+        host_fingerprint: test_host_runtime(),
+        _state_lock: state_lock,
+        warm_machines: Mutex::new(warm_machines),
+        egress_transports: StdMutex::new(HashMap::new()),
+        lifecycle_locks: MachineLifecycleLocks::default(),
+        capacity_gate: Mutex::new(()),
+        starting_machines: Arc::new(StdMutex::new(HashSet::new())),
+    }))
+}
+
 #[tokio::test]
 async fn idle_reap_closes_egress_before_machine_cleanup_can_fail() -> Result<()> {
-    use crate::egress::{EgressTransport, LocalEgressTransport};
     let directory = tempfile::tempdir()?;
     for name in ["manifests", "leases"] {
         fs::create_dir(directory.path().join(name))?;
@@ -806,16 +822,7 @@ async fn idle_reap_closes_egress_before_machine_cleanup_can_fail() -> Result<()>
         snapshot_network_slot: None,
     };
     write_manifest(directory.path(), &record)?;
-    let shared = Arc::new(Shared {
-        config,
-        host_fingerprint: test_host_runtime(),
-        _state_lock: File::create(directory.path().join("backend.lock"))?,
-        warm_machines: Mutex::new(HashMap::new()),
-        egress_transports: StdMutex::new(HashMap::new()),
-        lifecycle_locks: MachineLifecycleLocks::default(),
-        capacity_gate: Mutex::new(()),
-        starting_machines: Arc::new(StdMutex::new(HashSet::new())),
-    });
+    let shared = test_shared(config, HashMap::new())?;
     let pid_path = shared.pid_path(&record.machine_id);
     fs::create_dir_all(pid_path.parent().unwrap())?;
     fs::write(&pid_path, "invalid-pid")?;
@@ -901,11 +908,9 @@ impl DurableStopFixture {
             snapshot_network_slot: None,
         };
         write_manifest(directory.path(), &record)?;
-        let shared = Arc::new(Shared {
+        let shared = test_shared(
             config,
-            host_fingerprint: test_host_runtime(),
-            _state_lock: File::create(directory.path().join("backend.lock"))?,
-            warm_machines: Mutex::new(HashMap::from([(
+            HashMap::from([(
                 request.sandbox_id.clone(),
                 WarmMachineEntry {
                     egress_proxy: None,
@@ -914,12 +919,8 @@ impl DurableStopFixture {
                     idle_ttl: None,
                     last_used_at: Instant::now(),
                 },
-            )])),
-            egress_transports: StdMutex::new(HashMap::new()),
-            lifecycle_locks: MachineLifecycleLocks::default(),
-            capacity_gate: Mutex::new(()),
-            starting_machines: Arc::new(StdMutex::new(HashSet::new())),
-        });
+            )]),
+        )?;
         let machine = machine_from_record(&shared.config, record);
         fs::create_dir_all(machine.vsock_path.parent().unwrap())?;
         let listener = UnixListener::bind(&machine.vsock_path)?;

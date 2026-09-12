@@ -68,7 +68,7 @@ pub struct LimaFirecrackerSandboxBackend {
 }
 
 impl LimaFirecrackerSandboxBackend {
-    async fn terminate_raw(&self, request: SandboxRequest) -> Result<()> {
+    async fn terminate_request(&self, request: SandboxRequest) -> Result<()> {
         match self
             .request(FirecrackerBridgeRequest::Terminate {
                 config: self.config.clone(),
@@ -282,7 +282,7 @@ impl ManagedSandboxBackend for LimaFirecrackerSandboxBackend {
     async fn terminate(&self, request: SandboxRequest) -> Result<()> {
         let id = request.sandbox_id.clone();
         self.egress
-            .terminate(&id, self.terminate_raw(request))
+            .terminate(&id, self.terminate_request(request))
             .await
     }
 
@@ -487,9 +487,7 @@ impl ManagedSandboxHandle for LimaFirecrackerSandboxHandle {
 
     async fn snapshot(&self) -> Result<SnapshotPayload> {
         if self.egress.is_some() {
-            bail!(
-                "proxied Firecracker snapshots require a fresh egress binding; not implemented yet"
-            );
+            bail!(super::firecracker::PROXIED_SNAPSHOT_UNSUPPORTED);
         }
         if self.request.lifecycle.idle_ttl.is_none() {
             bail!("one-shot Firecracker Lima sandboxes cannot be snapshotted");
@@ -1496,15 +1494,21 @@ impl LimaEgressTransport {
                 loop {
                     let operation = async {
                         let permit = sender.reserve().await.context("egress receiver closed")?;
-                        let stream = connection
+                        match connection
                             .connect_tcp(FirecrackerBridgeRequest::EgressAccept {
                                 listener_id: listener_id.clone(),
                                 tls,
                             })
-                            .await;
-                        let failed = stream.is_err();
-                        permit.send(stream.map(|s| Box::pin(s) as BoxSandboxTcpStream));
-                        anyhow::ensure!(!failed, "egress bridge accept failed");
+                            .await
+                        {
+                            Ok(stream) => {
+                                permit.send(Ok(Box::pin(stream) as BoxSandboxTcpStream));
+                            }
+                            Err(error) => {
+                                permit.send(Err(error));
+                                bail!("egress bridge accept failed");
+                            }
+                        }
                         Ok::<_, anyhow::Error>(())
                     };
                     tokio::select! {

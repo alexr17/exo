@@ -74,7 +74,7 @@ impl SandboxEgress {
 
     pub(crate) fn command(&self, command: &SandboxCommand) -> Result<SandboxCommand> {
         ensure!(
-            !self.proxy.cancel.is_cancelled() && !self.proxy.transport.is_closed(),
+            self.is_open(),
             "sandbox egress proxy is closed; acquire the sandbox again"
         );
         let mut command = command.clone();
@@ -93,6 +93,10 @@ impl SandboxEgress {
 
     pub(crate) fn close(&self) {
         self.proxy.close();
+    }
+
+    fn is_open(&self) -> bool {
+        !self.proxy.cancel.is_cancelled() && !self.proxy.transport.is_closed()
     }
 }
 
@@ -129,6 +133,14 @@ impl<H: ManagedSandboxHandle + 'static> EgressRuntime<H> {
 
     fn sandboxes(&self) -> MutexGuard<'_, HashMap<String, CachedSandbox<H>>> {
         self.sandboxes.lock().expect("egress sandbox map poisoned")
+    }
+
+    fn ensure_open(&self) -> Result<()> {
+        ensure!(
+            !self.closed.is_cancelled(),
+            "sandbox egress runtime is shut down"
+        );
+        Ok(())
     }
 
     async fn lock(&self, id: &str) -> OwnedMutexGuard<()> {
@@ -169,19 +181,18 @@ impl<H: ManagedSandboxHandle + 'static> EgressRuntime<H> {
         let _guard = self.lock(&request.sandbox_id).await;
         let cached = self.sandboxes().get(&request.sandbox_id).map(|cached| {
             (
-                cached.request.clone(),
+                cached.request.spec == request.spec && cached.request.scope == request.scope,
                 cached.handle.clone(),
                 cached.egress.clone(),
             )
         });
-        if let Some((previous, handle, egress)) = cached {
+        if let Some((unchanged, handle, egress)) = cached {
             if let Some(handle) = handle
-                && !egress.proxy.cancel.is_cancelled()
-                && !egress.proxy.transport.is_closed()
+                && egress.is_open()
                 && handle.is_running().await? == Some(true)
             {
                 ensure!(
-                    previous.spec == request.spec && previous.scope == request.scope,
+                    unchanged,
                     "stop the protected sandbox before changing its configuration"
                 );
                 return Ok(handle);
@@ -192,10 +203,7 @@ impl<H: ManagedSandboxHandle + 'static> EgressRuntime<H> {
         if !request.spec.policy.requires_proxy() {
             return Ok(Arc::new(build(None).await?));
         }
-        ensure!(
-            !self.closed.is_cancelled(),
-            "sandbox egress runtime is shut down"
-        );
+        self.ensure_open()?;
         ensure!(
             request.lifecycle.idle_ttl.is_some(),
             "proxy egress requires a managed sandbox lifecycle"
@@ -219,10 +227,7 @@ impl<H: ManagedSandboxHandle + 'static> EgressRuntime<H> {
         });
         {
             let mut sandboxes = self.sandboxes();
-            ensure!(
-                !self.closed.is_cancelled(),
-                "sandbox egress runtime shut down during acquisition"
-            );
+            self.ensure_open()?;
             // Register before boot: shutdown must also close proxies belonging
             // to acquisitions that are still in flight.
             sandboxes.insert(
@@ -237,15 +242,14 @@ impl<H: ManagedSandboxHandle + 'static> EgressRuntime<H> {
         let handle = match build(Some(egress)).await {
             Ok(handle) => Arc::new(handle),
             Err(error) => {
-                self.remove(&request.sandbox_id).await?;
+                if let Err(cleanup) = self.remove(&request.sandbox_id).await {
+                    tracing::debug!(%cleanup, "egress cleanup after failed acquisition");
+                }
                 return Err(error);
             }
         };
         let mut sandboxes = self.sandboxes();
-        ensure!(
-            !self.closed.is_cancelled(),
-            "sandbox egress runtime shut down during acquisition"
-        );
+        self.ensure_open()?;
         sandboxes
             .get_mut(&request.sandbox_id)
             .expect("acquiring sandbox remains registered")

@@ -704,7 +704,7 @@ pub(crate) fn canonical_egress_host(host: &str) -> Result<String> {
 #[cfg(all(not(target_arch = "wasm32"), feature = "basic-backend"))]
 pub(crate) fn canonical_egress_hosts(
     hosts: &[String],
-) -> anyhow::Result<std::collections::HashSet<String>> {
+) -> Result<std::collections::HashSet<String>> {
     const MAX_ALLOWED_HOSTS: usize = 128;
     anyhow::ensure!(hosts.len() <= MAX_ALLOWED_HOSTS, "too many allowed hosts");
     hosts
@@ -755,6 +755,17 @@ pub struct CredentialInjectionLocation {
 impl EgressPolicy {
     pub fn networking_enabled(&self) -> bool {
         self.networking != SandboxNetworkPolicy::Disabled
+    }
+
+    #[cfg(all(not(target_arch = "wasm32"), feature = "basic-backend"))]
+    pub(crate) fn validate_basic(&self, provider: &str) -> Result<()> {
+        if !self.credentials.is_empty() {
+            anyhow::bail!("{provider} does not support policy.credentials");
+        }
+        if matches!(self.networking, SandboxNetworkPolicy::Limited { .. }) {
+            anyhow::bail!("{provider} does not support policy.networking.limited");
+        }
+        Ok(())
     }
 
     #[cfg(feature = "firecracker")]

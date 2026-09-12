@@ -3519,14 +3519,14 @@ async fn prepare_sandbox_request(
 
     let policy = request
         .policy
-        .or_else(|| harness.inner.sandbox_policy.clone());
-    let policy = policy.unwrap_or_else(|| {
-        if request.enable_networking.unwrap_or(true) {
-            SandboxNetworkPolicy::Unrestricted.into()
-        } else {
-            SandboxNetworkPolicy::Disabled.into()
-        }
-    });
+        .or_else(|| harness.inner.sandbox_policy.clone())
+        .unwrap_or_else(|| {
+            if request.enable_networking.unwrap_or(true) {
+                SandboxNetworkPolicy::Unrestricted.into()
+            } else {
+                SandboxNetworkPolicy::Disabled.into()
+            }
+        });
     Ok(PreparedSandboxRequest {
         name: request.name,
         provider: request.provider,

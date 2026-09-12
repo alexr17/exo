@@ -4,10 +4,11 @@ Sandbox policy is part of `SandboxSpec`. Each backend enforces the policy when
 it acquires, attaches, or restores a sandbox, before returning a usable handle.
 Unsupported policies fail with an error identifying the unsupported field.
 
-The existing `firecracker` build feature includes the proxy; there is no separate
-egress feature to enable. Firecracker implements credential substitution with a transparent HTTP/HTTPS
-proxy. Programs receive placeholder environment variables; the proxy resolves
-credentials outside the VM and substitutes them on authorized requests.
+The existing `firecracker` build feature includes the proxy; there is no
+separate egress feature to enable. Firecracker implements credential
+substitution with a transparent HTTP/HTTPS proxy. Programs receive placeholder
+environment variables; the proxy resolves credentials outside the VM and
+substitutes them on authorized requests.
 
 On macOS, TLS and credential resolution run in the native Exo process. The
 existing Lima bridge carries streams and DNS configuration, without receiving
@@ -57,11 +58,11 @@ only the placeholder. `Authorization`, `x-api-key`, and other ordinary headers
 work; routing and framing headers cannot contain placeholders.
 
 The CLI interprets binding names as names or IDs in the local encrypted secret
-store. Names resolve in the nearest scope: thread, then agent, then global.
-IDs must belong to one of those scopes. Missing, ambiguous, or non-key secrets fail the request. The same flag
-works with `exo repl` and a managed Firecracker sandbox. Tell the agent which
-variables it can use; the runtime currently injects the environment without
-adding a credential inventory to its prompt.
+store. Names resolve in the nearest scope: thread, then agent, then global. IDs
+must belong to one of those scopes. Missing, ambiguous, or non-key secrets fail
+the request. The same flag works with `exo repl` and a managed Firecracker
+sandbox. Tell the agent which variables it can use; the runtime currently
+injects the environment without adding a credential inventory to its prompt.
 
 ## Policy and credentials
 
@@ -83,13 +84,13 @@ async fn resolve(
 ```
 
 The caller selects bindings in `request.spec.policy.credentials`. Each use is
-resolved again, so rotation and revocation take effect without replacing the sandbox. Identity
-includes the sandbox ID and agent/thread scope; destination includes the host,
-port, method, and normalized path/query. A vault adapter can pin a binding to a
-vault/secret reference per thread and enforce its stored destination restrictions.
-The local CLI resolver assumes a single user owns the secret store; hosted
-resolvers must supply their own authorization. Resolver failures are sanitized
-before returning them to the guest.
+resolved again, so rotation and revocation take effect without replacing the
+sandbox. Identity includes the sandbox ID and agent/thread scope; destination
+includes the host, port, method, and normalized path/query. A vault adapter can
+pin a binding to a vault/secret reference per thread and enforce its stored
+destination restrictions. The local CLI resolver assumes a single user owns the
+secret store; hosted resolvers must supply their own authorization. Resolver
+failures are sanitized before returning them to the guest.
 
 ```rust
 let backend = firecracker_backend_with_credentials(config, lima, resolver).await?;
@@ -118,10 +119,10 @@ values in their responses.
 `BasicExoHarnessConfig.sandbox_policy` supplies a default, including for the
 CLI's `--egress-policy`. A selected policy takes precedence over the older
 `enable_networking` flag; without a policy that flag still applies. New CLI
-agents enable networking by default. The selected policy is persisted with the sandbox and
-included in its spec hash. New records store only the policy; legacy records with
-`enable_networking` remain readable. The event's legacy boolean is derived from
-the policy. Changing the default does not rewrite existing
+agents enable networking by default. The selected policy is persisted with the
+sandbox and included in its spec hash. New records store only the policy; legacy
+records with `enable_networking` remain readable. The event's legacy boolean is
+derived from the policy. Changing the default does not rewrite existing
 sandboxes. Binding values and proxy listener addresses are never in the policy.
 
 The Firecracker backend creates its listeners during acquisition. On Linux,
@@ -146,16 +147,17 @@ Lima, this configuration applies inside the Linux VM. Without an explicit
 configuration, the local transport selects the host's routed IPv4 address.
 
 The Firecracker and Lima backends own their proxies. `shutdown_egress()` closes
-all proxies while retaining the VMs, including when another acquisition is pending. A fresh backend can reacquire it with new
-listeners, trust, and placeholders; existing client processes must restart to
-receive those values. On Firecracker (including Lima), `stop` flushes durable
-filesystems before closing egress or stopping the VM. If the flush fails, the VM
-and its networking remain available for retry. `terminate` revokes egress and
-attempts the flush, but logs a sync failure or timeout and continues destroying
-the VM. Both release listener ports even while callers retain old handles.
-VM cleanup, including idle reaping, closes its listeners before releasing its
-network address. This also applies to the listeners inside the Lima bridge.
-Low-level callers that already own their proxy can pass endpoints to
+all proxies while retaining the VMs, including when another acquisition is
+pending. A fresh backend can reacquire it with new listeners, trust, and
+placeholders; existing client processes must restart to receive those values. On
+Firecracker (including Lima), `stop` flushes durable filesystems before closing
+egress or stopping the VM. If the flush fails, the VM and its networking remain
+available for retry. `terminate` revokes egress and attempts the flush, but logs
+a sync failure or timeout and continues destroying the VM. Both release listener
+ports even while callers retain old handles. VM cleanup, including idle reaping,
+closes its listeners before releasing its network address. This also applies to
+the listeners inside the Lima bridge. Low-level callers that already own their
+proxy can pass endpoints to
 `FirecrackerSandboxBackend::acquire_request(FirecrackerRequest)`.
 
 A hosted backend can implement `ManagedSandboxBackend::acquire` itself: choose
@@ -170,12 +172,13 @@ before NAT on a trusted local host. The production relay is not implemented here
 
 Vercel translates unrestricted, disabled, and exact-host policies to its native
 network policy. Exact-host rules pin the HTTP Host header. Acquisition updates
-an existing sandbox's policy before resuming its session; a failed update prevents
-resume. It skips the update when the returned policy exactly matches and skips
-resume when the session is already running. Vercel hides injected header values,
-so exact-host pinning must be reapplied. Placeholder credential bindings are rejected: native header transforms
-set whole values and do not implement Exo's per-request credential resolution.
-A Vercel forwarding adapter would be a separate implementation.
+an existing sandbox's policy before resuming its session; a failed update
+prevents resume. It skips the update when the returned policy exactly matches
+and skips resume when the session is already running. Vercel hides injected
+header values, so exact-host pinning must be reapplied. Placeholder credential
+bindings are rejected: native header transforms set whole values and do not
+implement Exo's per-request credential resolution. A Vercel forwarding adapter
+would be a separate implementation.
 
 Docker, Apple Containers, smolvm, E2B, and Daytona retain their existing enabled /
 disabled networking support. They reject limited networking and credential
@@ -187,9 +190,10 @@ not control the attached container's network.
 
 The proxy supports limited networking with exact hosts and HTTPS header
 substitution. Unrestricted networking with credential bindings is rejected until
-passthrough is implemented. Body substitution is not part of the policy yet. Standard ports 80/443 are supported;
-local gateways on other ports need additional transport support. Model
-credential bindings are not inferred automatically.
+passthrough is implemented. Body substitution is not part of the policy yet.
+Standard ports 80/443 are supported; local gateways on other ports need
+additional transport support. Model credential bindings are not inferred
+automatically.
 
 Firecracker proxy policies do not yet support snapshots/forks, external
 attachments, or one-shot sandboxes. HTTP/2, WebSockets, arbitrary TCP, Git Basic

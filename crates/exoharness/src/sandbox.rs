@@ -113,18 +113,6 @@ pub struct SandboxRequest {
     pub provider_state: Option<Value>,
 }
 
-impl EgressPolicy {
-    pub(crate) fn validate_basic(&self, provider: &str) -> Result<()> {
-        if !self.credentials.is_empty() {
-            bail!("{provider} does not support policy.credentials");
-        }
-        if matches!(self.networking, SandboxNetworkPolicy::Limited { .. }) {
-            bail!("{provider} does not support policy.networking.limited");
-        }
-        Ok(())
-    }
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SandboxCommand {
     pub argv: Vec<String>,
@@ -1412,7 +1400,7 @@ async fn create_named_warm_sandbox(
         &mut process,
         &request.spec.policy.networking,
         Some(DEFAULT_ENABLED_NETWORK_NAME),
-    )?;
+    );
     configure_mount_args(&mut process, &request.spec.mounts);
 
     process.arg(&request.spec.image);
@@ -1711,7 +1699,7 @@ async fn exec_one_shot(
 
     let mut process = Command::new(container_bin);
     process.arg("run").arg("--rm").arg("--workdir").arg(&cwd);
-    configure_network_args(&mut process, &spec.policy.networking, network_name)?;
+    configure_network_args(&mut process, &spec.policy.networking, network_name);
     configure_mount_args(&mut process, &spec.mounts);
     configure_env_args(&mut process, &command.env);
     process.arg(&spec.image);
@@ -1743,7 +1731,7 @@ async fn start_one_shot_process(
         .arg("--interactive")
         .arg("--workdir")
         .arg(&cwd);
-    configure_network_args(&mut process, &spec.policy.networking, network_name)?;
+    configure_network_args(&mut process, &spec.policy.networking, network_name);
     configure_mount_args(&mut process, &spec.mounts);
     configure_env_args(&mut process, &command.env);
     process.arg(&spec.image);
@@ -1895,7 +1883,7 @@ fn configure_network_args(
     process: &mut Command,
     policy: &SandboxNetworkPolicy,
     network_name: Option<&str>,
-) -> Result<()> {
+) {
     match policy {
         SandboxNetworkPolicy::Disabled | SandboxNetworkPolicy::Limited { .. } => {
             process.arg("--network").arg("none");
@@ -1906,7 +1894,6 @@ fn configure_network_args(
             }
         }
     }
-    Ok(())
 }
 
 fn configure_mount_args(process: &mut Command, mounts: &[SandboxMount]) {

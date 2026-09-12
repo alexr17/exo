@@ -21,7 +21,7 @@ use std::sync::{Arc, Mutex as StdMutex, Weak};
 use std::task::{Context as TaskContext, Poll};
 use std::time::{Duration, Instant, SystemTime};
 
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{Context, Result, anyhow, bail, ensure};
 use async_trait::async_trait;
 use bytes::Bytes;
 use exo_firecracker_protocol::{
@@ -146,6 +146,9 @@ static ONE_SHOT_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 // already differ by purpose and pid, so all the counter adds is uniqueness
 // within this process.
 static TEMPORARY_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+pub(super) const PROXIED_SNAPSHOT_UNSUPPORTED: &str =
+    "proxied Firecracker snapshots require a fresh egress binding; not implemented yet";
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -755,11 +758,11 @@ impl FirecrackerSandboxBackend {
             .lifecycle_locks
             .lock_machine(&state.machine_id)
             .await;
-        anyhow::ensure!(
+        ensure!(
             self.shared.is_running(&state.machine_id).await? == Some(true),
             "egress VM is no longer running"
         );
-        anyhow::ensure!(!transport.is_closed(), "egress listener is closed");
+        ensure!(!transport.is_closed(), "egress listener is closed");
         let previous = self
             .shared
             .egress_transports
@@ -772,6 +775,19 @@ impl FirecrackerSandboxBackend {
             previous.close();
         }
         Ok(())
+    }
+
+    async fn egress_transport(
+        &self,
+        allowed_hosts: &[String],
+    ) -> Result<Arc<dyn crate::egress::EgressTransport>> {
+        let transport = match self.shared.config.egress_listen {
+            Some(config) => {
+                crate::egress::LocalEgressTransport::with_config(config, allowed_hosts).await?
+            }
+            None => crate::egress::LocalEgressTransport::for_hosts(allowed_hosts).await?,
+        };
+        Ok(Arc::new(transport))
     }
 
     pub async fn new(config: FirecrackerConfig) -> Result<Self> {
@@ -1006,9 +1022,7 @@ impl FirecrackerSandboxBackend {
         lifecycle: SnapshotTemplateLifecycle,
     ) -> Result<CapturedSnapshot> {
         if request.egress_proxy.is_some() {
-            bail!(
-                "proxied Firecracker snapshots require a fresh egress binding; not implemented yet"
-            );
+            bail!(PROXIED_SNAPSHOT_UNSUPPORTED);
         }
         if !request.spec.durable_file_systems.is_empty() {
             bail!("Firecracker snapshotting does not support durable filesystems")
@@ -1104,9 +1118,7 @@ impl FirecrackerSandboxBackend {
         machine_id: String,
     ) -> Result<FirecrackerSandboxHandle> {
         if request.egress_proxy.is_some() {
-            bail!(
-                "proxied Firecracker snapshots require a fresh egress binding; not implemented yet"
-            );
+            bail!(PROXIED_SNAPSHOT_UNSUPPORTED);
         }
         let template_key = manifest.template_key.clone();
         let restore = async {
@@ -1314,21 +1326,6 @@ impl FirecrackerSandboxBackend {
             shared: Arc::clone(&self.shared),
             one_shot,
         })
-    }
-}
-
-impl FirecrackerSandboxBackend {
-    async fn egress_transport(
-        &self,
-        allowed_hosts: &[String],
-    ) -> Result<Arc<dyn crate::egress::EgressTransport>> {
-        let transport = match self.shared.config.egress_listen {
-            Some(config) => {
-                crate::egress::LocalEgressTransport::with_config(config, allowed_hosts).await?
-            }
-            None => crate::egress::LocalEgressTransport::for_hosts(allowed_hosts).await?,
-        };
-        Ok(Arc::new(transport))
     }
 }
 

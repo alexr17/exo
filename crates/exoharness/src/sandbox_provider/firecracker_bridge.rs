@@ -3,7 +3,7 @@ use std::io::ErrorKind;
 use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{Context, Result, anyhow, bail, ensure};
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
@@ -15,7 +15,7 @@ use tokio_util::compat::{FuturesAsyncReadCompatExt, FuturesAsyncWriteCompatExt};
 use crate::{
     FirecrackerConfig, FirecrackerRequest, FirecrackerSandboxBackend, ManagedSandboxBackend,
     ManagedSandboxHandle, SandboxCommand, SandboxCommandOutput, SandboxProcessParts,
-    SnapshotFormat, SnapshotPayload,
+    SandboxRequest, SnapshotFormat, SnapshotPayload,
 };
 
 const MAX_EGRESS_LISTENERS: usize = 256;
@@ -67,7 +67,7 @@ pub enum FirecrackerBridgeRequest {
     },
     IsRunning {
         config: FirecrackerConfig,
-        request: crate::SandboxRequest,
+        request: SandboxRequest,
     },
     Stop {
         config: FirecrackerConfig,
@@ -101,10 +101,10 @@ pub enum FirecrackerBridgeRequest {
 
 impl FirecrackerBridgeRequest {
     fn is_stream(&self) -> bool {
-        if matches!(self, Self::EgressAccept { .. }) {
-            return true;
-        }
-        matches!(self, Self::StartProcess { .. } | Self::ConnectTcp { .. })
+        matches!(
+            self,
+            Self::EgressAccept { .. } | Self::StartProcess { .. } | Self::ConnectTcp { .. }
+        )
     }
 }
 
@@ -373,7 +373,7 @@ async fn handle_request(
         } => {
             let mut listeners = backends.egress.lock().await;
             listeners.retain(|_, listener| !listener.is_closed());
-            anyhow::ensure!(
+            ensure!(
                 listeners.len() < MAX_EGRESS_LISTENERS,
                 "too many egress listeners"
             );

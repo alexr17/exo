@@ -52,6 +52,8 @@ pub struct LocalEgressTransport {
     https: Socket<TcpListener>,
     dns: Arc<Socket<UdpSocket>>,
     dns_tcp: Arc<Socket<TcpListener>>,
+    // Guest IPv4 admitted by accepts_peer. Zero means unbound; bind_source
+    // rejects 0.0.0.0 so the sentinel cannot collide with a real source.
     source: Arc<AtomicU32>,
     cancel: CancellationToken,
 }
@@ -216,9 +218,8 @@ impl EgressTransport for LocalEgressTransport {
                         Ok(_) => {},
                         Err(error) => {
                             tracing::debug!(%error, "egress accept failed; retrying");
-                            tokio::select! {
-                                _ = self.cancel.cancelled() => return Err(anyhow!("egress listener closed")),
-                                _ = tokio::time::sleep(ACCEPT_RETRY_DELAY) => {},
+                            if !retry_after_error(&self.cancel).await {
+                                return Err(anyhow!("egress listener closed"));
                             }
                         }
                     }
@@ -254,6 +255,14 @@ fn accepts_peer(source: &AtomicU32, peer: SocketAddr) -> bool {
     source != 0 && source == u32::from(ip)
 }
 
+// Back off briefly after a listener error. Returns false once cancelled.
+async fn retry_after_error(cancel: &CancellationToken) -> bool {
+    tokio::select! {
+        _ = cancel.cancelled() => false,
+        _ = tokio::time::sleep(ACCEPT_RETRY_DELAY) => true,
+    }
+}
+
 async fn serve_dns(
     dns: Arc<Socket<UdpSocket>>,
     tcp: Arc<Socket<TcpListener>>,
@@ -275,10 +284,10 @@ async fn serve_dns(
                     Ok(incoming) => incoming,
                     Err(error) => {
                         tracing::debug!(%error, "egress DNS receive failed; retrying");
-                        tokio::select! {
-                            _ = cancel.cancelled() => break,
-                            _ = tokio::time::sleep(ACCEPT_RETRY_DELAY) => continue,
+                        if retry_after_error(&cancel).await {
+                            continue;
                         }
+                        break;
                     }
                 };
                 if !accepts_peer(&source, peer) { continue; }
@@ -292,10 +301,10 @@ async fn serve_dns(
                     Ok(incoming) => incoming,
                     Err(error) => {
                         tracing::debug!(%error, "egress DNS accept failed; retrying");
-                        tokio::select! {
-                            _ = cancel.cancelled() => break,
-                            _ = tokio::time::sleep(ACCEPT_RETRY_DELAY) => continue,
+                        if retry_after_error(&cancel).await {
+                            continue;
                         }
+                        break;
                     }
                 };
                 if !accepts_peer(&source, peer) || tasks.len() >= MAX_DNS_TASKS { continue; }
