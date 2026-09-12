@@ -65,6 +65,10 @@ pub enum FirecrackerBridgeRequest {
         request: FirecrackerRequest,
         port: u16,
     },
+    IsRunning {
+        config: FirecrackerConfig,
+        request: crate::SandboxRequest,
+    },
     Stop {
         config: FirecrackerConfig,
         request: FirecrackerRequest,
@@ -112,6 +116,9 @@ pub enum FirecrackerBridgeResponse {
         endpoints: crate::SandboxEgressProxy,
     },
     Image(crate::ResolvedSandboxImage),
+    Running {
+        running: Option<bool>,
+    },
     Handle {
         id: String,
         provider_state: Option<Value>,
@@ -228,7 +235,21 @@ impl BridgeBackendCache {
         config: FirecrackerConfig,
         request: FirecrackerRequest,
     ) -> Result<Arc<dyn ManagedSandboxHandle>> {
-        self.backend(config).await?.acquire_request(request).await
+        let backend = self.backend(config).await?;
+        let endpoints = request.egress_proxy;
+        let handle = backend.acquire_request(request).await?;
+        if let Some(endpoints) = endpoints {
+            let transport = self
+                .egress
+                .lock()
+                .await
+                .values()
+                .find(|transport| transport.endpoints() == endpoints && !transport.is_closed())
+                .cloned()
+                .context("sandbox egress listener is no longer available")?;
+            backend.track_egress(handle.as_ref(), transport).await?;
+        }
+        Ok(handle)
     }
 }
 
@@ -343,6 +364,7 @@ async fn handle_request(
             listen,
         } => {
             let mut listeners = backends.egress.lock().await;
+            listeners.retain(|_, listener| !listener.is_closed());
             anyhow::ensure!(
                 listeners.len() < MAX_EGRESS_LISTENERS,
                 "too many egress listeners"
@@ -390,8 +412,8 @@ async fn handle_request(
             ))
         }
         FirecrackerBridgeRequest::Acquire { config, request } => {
-            let backend = backends.backend(config).await?;
-            let handle = backend.acquire_request(request).await?;
+            let backend = backends.backend(config.clone()).await?;
+            let handle = backends.acquire(config, request).await?;
             let source_ipv4 = backend.egress_source(handle.as_ref()).await?;
             Ok(FirecrackerBridgeResponse::Handle {
                 id: handle.id().to_string(),
@@ -411,8 +433,21 @@ async fn handle_request(
                 .exec(&command)
                 .await?,
         }),
+        FirecrackerBridgeRequest::IsRunning { config, request } => {
+            Ok(FirecrackerBridgeResponse::Running {
+                running: backends
+                    .backend(config)
+                    .await?
+                    .is_running_request(&request)
+                    .await?,
+            })
+        }
         FirecrackerBridgeRequest::Stop { config, request } => {
-            backends.acquire(config, request).await?.stop().await?;
+            backends
+                .backend(config)
+                .await?
+                .terminate(request.sandbox)
+                .await?;
             Ok(FirecrackerBridgeResponse::Unit)
         }
         FirecrackerBridgeRequest::Fork {

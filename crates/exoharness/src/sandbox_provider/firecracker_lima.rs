@@ -78,6 +78,7 @@ impl LimaFirecrackerSandboxBackend {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn with_egress(
         mut self,
         resolver: Option<Arc<dyn EgressCredentialResolver>>,
@@ -154,6 +155,15 @@ impl LimaFirecrackerSandboxBackend {
     }
 
     pub async fn new(config: FirecrackerConfig, lima: FirecrackerLimaConfig) -> Result<Self> {
+        Self::new_with_egress(config, lima, None, Arc::new(PublicUpstreamResolver)).await
+    }
+
+    pub(crate) async fn new_with_egress(
+        config: FirecrackerConfig,
+        lima: FirecrackerLimaConfig,
+        resolver: Option<Arc<dyn EgressCredentialResolver>>,
+        upstream: Arc<dyn UpstreamResolver>,
+    ) -> Result<Self> {
         let build_bridge = lima.bridge_binary.is_none();
         let bridge = Arc::new(LimaBridgeManager::new(
             lima.limactl,
@@ -167,7 +177,7 @@ impl LimaFirecrackerSandboxBackend {
         Ok(Self {
             config,
             bridge,
-            egress: Arc::new(EgressRuntime::new(None, Arc::new(PublicUpstreamResolver))),
+            egress: Arc::new(EgressRuntime::new(resolver, upstream)),
         })
     }
 
@@ -267,8 +277,9 @@ impl ManagedSandboxBackend for LimaFirecrackerSandboxBackend {
     }
 
     async fn terminate(&self, request: SandboxRequest) -> Result<()> {
+        let id = request.sandbox_id.clone();
         self.egress
-            .terminate(&request.sandbox_id, self.terminate_raw(request.clone()))
+            .terminate(&id, self.terminate_raw(request))
             .await
     }
 
@@ -377,13 +388,23 @@ impl ManagedSandboxHandle for LimaFirecrackerSandboxHandle {
         self.effective_image.clone()
     }
 
+    async fn is_running(&self) -> Result<Option<bool>> {
+        match self
+            .bridge
+            .request(FirecrackerBridgeRequest::IsRunning {
+                config: self.config.clone(),
+                request: self.request.sandbox.clone(),
+            })
+            .await?
+        {
+            FirecrackerBridgeResponse::Running { running } => Ok(running),
+            _ => bail!("Firecracker Lima bridge returned the wrong response to is_running"),
+        }
+    }
+
     async fn exec(&self, command: &SandboxCommand) -> Result<SandboxCommandOutput> {
-        let prepared = self
-            .egress
-            .as_ref()
-            .map(|egress| egress.command(command))
-            .transpose()?;
-        let command = prepared.as_ref().unwrap_or(command);
+        let command = SandboxEgress::prepare_command(self.egress.as_deref(), command)?;
+        let command = command.as_ref();
         let response = self
             .bridge
             .request(FirecrackerBridgeRequest::Exec {
@@ -399,12 +420,8 @@ impl ManagedSandboxHandle for LimaFirecrackerSandboxHandle {
     }
 
     async fn start_process(&self, command: &SandboxCommand) -> Result<SandboxProcessParts> {
-        let prepared = self
-            .egress
-            .as_ref()
-            .map(|egress| egress.command(command))
-            .transpose()?;
-        let command = prepared.as_ref().unwrap_or(command);
+        let command = SandboxEgress::prepare_command(self.egress.as_deref(), command)?;
+        let command = command.as_ref();
         self.bridge
             .start_process(FirecrackerBridgeRequest::StartProcess {
                 config: self.config.clone(),
@@ -1544,6 +1561,23 @@ impl crate::egress::EgressTransport for LimaEgressTransport {
             _ = self.cancel.cancelled() => bail!("egress bridge closed"),
             stream = async { receiver.lock().await.recv().await } => stream.context("egress bridge closed")?,
         }
+    }
+    async fn shutdown(&self) -> Result<()> {
+        self.cancel.cancel();
+        match self
+            .connection
+            .request(FirecrackerBridgeRequest::EgressClose {
+                listener_id: self.listener_id.clone(),
+            })
+            .await?
+        {
+            FirecrackerBridgeResponse::Unit => Ok(()),
+            _ => bail!("Lima bridge did not close egress listener"),
+        }
+    }
+
+    fn is_closed(&self) -> bool {
+        self.cancel.is_cancelled()
     }
     fn close(&self) {
         self.cancel.cancel();

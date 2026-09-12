@@ -780,3 +780,70 @@ fn snapshot_budget_counts_retained_logical_bytes_and_pending_capture() {
     assert!(enforce_snapshot_budget(&config, MAX_SNAPSHOT_BYTES - 1024).is_ok());
     assert!(enforce_snapshot_budget(&config, MAX_SNAPSHOT_BYTES - 1023).is_err());
 }
+
+#[tokio::test]
+async fn idle_reap_closes_egress_before_machine_cleanup_can_fail() -> Result<()> {
+    use crate::egress::{EgressTransport, LocalEgressTransport};
+    let directory = tempfile::tempdir()?;
+    for name in ["manifests", "leases"] {
+        fs::create_dir(directory.path().join(name))?;
+    }
+    let config = FirecrackerConfig {
+        state_root: directory.path().into(),
+        ..Default::default()
+    };
+    let record = MachineRecord {
+        machine_id: "fc-egress-reaped".into(),
+        spec_hash: "test".into(),
+        runtime: test_runtime(),
+        resolved_image: "/images/test.ext4".into(),
+        slot: 1,
+        network_enabled: false,
+        workspace_id: None,
+        idle_ttl_seconds: Some(0),
+        snapshot_template: None,
+        snapshot_network_slot: None,
+    };
+    write_manifest(directory.path(), &record)?;
+    let shared = Arc::new(Shared {
+        config,
+        host_fingerprint: test_host_runtime(),
+        _state_lock: File::create(directory.path().join("backend.lock"))?,
+        warm_machines: Mutex::new(HashMap::new()),
+        egress_transports: StdMutex::new(HashMap::new()),
+        lifecycle_locks: MachineLifecycleLocks::default(),
+        capacity_gate: Mutex::new(()),
+        starting_machines: Arc::new(StdMutex::new(HashSet::new())),
+    });
+    let pid_path = shared.pid_path(&record.machine_id);
+    fs::create_dir_all(pid_path.parent().unwrap())?;
+    fs::write(&pid_path, "invalid-pid")?;
+    let listener = Arc::new(LocalEgressTransport::for_hosts(&["api.test".into()]).await?);
+    shared
+        .egress_transports
+        .lock()
+        .unwrap()
+        .insert(record.machine_id.clone(), listener.clone());
+    let backend = FirecrackerSandboxBackend {
+        shared: shared.clone(),
+        egress: Arc::new(EgressRuntime::new(None, Arc::new(PublicUpstreamResolver))),
+    };
+    assert_eq!(shared.is_running(&record.machine_id).await?, Some(false));
+    assert!(backend.reap_expired_machines().await.is_err());
+    assert!(listener.is_closed());
+    assert!(shared.egress_transports.lock().unwrap().is_empty());
+    let endpoints = listener.endpoints();
+    let replacement = LocalEgressTransport::with_config(
+        crate::EgressListenConfig {
+            bind_address: *endpoints.http.ip(),
+            advertised_address: *endpoints.http.ip(),
+            http_port: endpoints.http.port(),
+            https_port: endpoints.https.port(),
+            dns_port: endpoints.dns.port(),
+        },
+        &[],
+    )
+    .await?;
+    replacement.close();
+    Ok(())
+}

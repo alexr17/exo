@@ -346,10 +346,6 @@ impl HarnessSelection {
             Self::Kind(_) | Self::TypeScriptModule(_) => None,
         }
     }
-
-    fn default_enable_networking(&self) -> bool {
-        matches!(self, Self::TypeScriptPreset(_))
-    }
 }
 
 impl FromStr for HarnessSelection {
@@ -456,7 +452,7 @@ fn read_config_file<T: serde::de::DeserializeOwned>(path: &std::path::Path) -> R
         .map(str::to_ascii_lowercase);
     match extension.as_deref() {
         Some("json") => serde_json::from_str(&contents).context("invalid JSON"),
-        Some("yaml" | "yml") => serde_yaml::from_str(&contents).context("invalid YAML"),
+        Some("yaml" | "yml") => serde_yaml_ng::from_str(&contents).context("invalid YAML"),
         Some("toml") => toml::from_str(&contents).context("invalid TOML"),
         _ => anyhow::bail!("configuration file must use .json, .yaml, .yml, or .toml"),
     }
@@ -1339,9 +1335,7 @@ async fn main() -> Result<()> {
                                 .map(str::to_string),
                             sandbox_provider: default_sandbox_provider,
                             sandbox_scope: None,
-                            enable_networking: harness_selection
-                                .as_ref()
-                                .is_some_and(HarnessSelection::default_enable_networking),
+                            enable_networking: true,
                             model,
                             max_output_tokens: None,
                             max_tool_round_trips: None,
@@ -1424,12 +1418,7 @@ async fn main() -> Result<()> {
                         .and_then(HarnessSelection::default_sandbox_image)
                         .map(str::to_string)
                 });
-                let enable_networking =
-                    networking.map(EnabledDisabled::enabled).unwrap_or_else(|| {
-                        harness_selection
-                            .as_ref()
-                            .is_some_and(HarnessSelection::default_enable_networking)
-                    });
+                let enable_networking = networking.map(EnabledDisabled::enabled).unwrap_or(true);
                 let agent = harness
                     .create_agent(CreateAgentRequest {
                         slug,

@@ -145,16 +145,24 @@ async fn configured_firecracker_backend(
     #[cfg(target_os = "linux")]
     let backend = {
         drop(lima);
-        FirecrackerSandboxBackend::new(config).await?
-    };
-    #[cfg(target_os = "macos")]
-    let backend = firecracker_lima::LimaFirecrackerSandboxBackend::new(config, lima).await?;
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
-    {
-        Ok(Arc::new(backend.with_egress(
+        FirecrackerSandboxBackend::new_with_egress(
+            config,
             resolver,
             Arc::new(crate::egress::PublicUpstreamResolver),
-        )))
+        )
+        .await?
+    };
+    #[cfg(target_os = "macos")]
+    let backend = firecracker_lima::LimaFirecrackerSandboxBackend::new_with_egress(
+        config,
+        lima,
+        resolver,
+        Arc::new(crate::egress::PublicUpstreamResolver),
+    )
+    .await?;
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    {
+        Ok(Arc::new(backend))
     }
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {

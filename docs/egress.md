@@ -57,7 +57,8 @@ only the placeholder. `Authorization`, `x-api-key`, and other ordinary headers
 work; routing and framing headers cannot contain placeholders.
 
 The CLI interprets binding names as names or IDs in the local encrypted secret
-store. Missing, ambiguous, or non-key secrets fail the request. The same flag
+store. Names resolve in the nearest scope: thread, then agent, then global.
+IDs must belong to one of those scopes. Missing, ambiguous, or non-key secrets fail the request. The same flag
 works with `exo repl` and a managed Firecracker sandbox. Tell the agent which
 variables it can use; the runtime currently injects the environment without
 adding a credential inventory to its prompt.
@@ -115,7 +116,9 @@ values in their responses.
 
 `CreateSandboxRequest.policy` supplies the policy through the Exoharness API.
 `BasicExoHarnessConfig.sandbox_policy` supplies a default, including for the
-CLI's `--egress-policy`. The selected policy is persisted with the sandbox and
+CLI's `--egress-policy`. A selected policy takes precedence over the older
+`enable_networking` flag; without a policy that flag still applies. New CLI
+agents enable networking by default. The selected policy is persisted with the sandbox and
 included in its spec hash. New records store only the policy; legacy records with
 `enable_networking` remain readable. The event's legacy boolean is derived from
 the policy. Changing the default does not rewrite existing
@@ -136,7 +139,9 @@ config.egress_listen = Some(EgressListenConfig {
 ```
 
 Use an address routed from the guest network. Zero ports allocate dynamically;
-fixed ports must be unique for each active sandbox on that address. With
+fixed ports must be unique for each active sandbox on that address. When binding
+to `0.0.0.0`, the advertised address must be assigned locally: DNS binds to that
+address so UDP replies have the source address the guest expects. With
 Lima, this configuration applies inside the Linux VM. Without an explicit
 configuration, the local transport selects the host's routed IPv4 address.
 
@@ -144,7 +149,10 @@ The Firecracker and Lima backends own their proxies. `shutdown_egress()` closes
 all proxies while retaining the VMs, including when another acquisition is pending. A fresh backend can reacquire it with new
 listeners, trust, and placeholders; existing client processes must restart to
 receive those values. `stop` and `terminate` preserve the provider's lifecycle
-behavior. Low-level callers that already own their proxy can pass endpoints to
+behavior and release the listener ports, even while callers retain old handles.
+VM cleanup, including idle reaping, closes its listeners before releasing its
+network address. This also applies to the listeners inside the Lima bridge.
+Low-level callers that already own their proxy can pass endpoints to
 `FirecrackerSandboxBackend::acquire_request(FirecrackerRequest)`.
 
 A hosted backend can implement `ManagedSandboxBackend::acquire` itself: choose

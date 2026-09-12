@@ -1,7 +1,14 @@
+//! HTTP/TLS handling and credential substitution outside the sandbox.
+//!
+//! `EgressTransport` supplies connections from the sandbox network. This module
+//! checks destinations, resolves credentials, and forwards requests. `sandbox`
+//! coordinates proxy setup with Firecracker/Lima acquisition; `transport`
+//! implements the listeners and DNS service on the VM host.
+
 use std::collections::{HashMap, HashSet};
 use std::convert::Infallible;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, ensure};
@@ -88,6 +95,9 @@ pub struct EgressDestination {
     pub path: String,
 }
 
+/// Looks up a binding for this sandbox's agent/thread on every use. The local
+/// implementation reads Exo's encrypted store; a hosted implementation can use
+/// its own vault and authorization. Only the proxy receives the returned value.
 #[async_trait]
 pub trait EgressCredentialResolver: Send + Sync {
     async fn resolve(
@@ -98,6 +108,8 @@ pub trait EgressCredentialResolver: Send + Sync {
     ) -> Result<String>;
 }
 
+// Owns one sandbox's TLS server, placeholders, and active proxy connections.
+// It does not create VMs or decide where credentials are stored.
 struct EgressProxy {
     endpoints: SandboxEgressProxy,
     transport: Arc<dyn EgressTransport>,
@@ -120,7 +132,15 @@ impl Binding {
     }
 }
 
+struct PooledClient {
+    addresses: Vec<SocketAddr>,
+    client: reqwest::Client,
+}
+
+// Request handling shared by all connections to one sandbox's proxy. Clients
+// are pooled by destination and replaced whenever its resolved addresses change.
 struct State {
+    clients: Mutex<HashMap<(String, u16), PooledClient>>,
     hosts: HashSet<String>,
     bindings: Vec<Binding>,
     identity: EgressIdentity,
@@ -237,6 +257,7 @@ impl State {
             });
         }
         Ok(Self {
+            clients: Mutex::new(HashMap::new()),
             hosts,
             bindings,
             identity,
@@ -393,21 +414,37 @@ impl State {
     }
 
     async fn client(&self, host: &str, port: u16) -> Result<reqwest::Client> {
-        let upstream = self
+        let mut upstream = self
             .upstream
             .resolve(host, port)
             .await
             .map_err(|_| anyhow!("upstream address resolution failed"))?;
+        upstream.addresses.sort_unstable();
+        upstream.addresses.dedup();
+        let mut clients = self.clients.lock().expect("egress client pool poisoned");
+        let key = (host.to_owned(), port);
+        if let Some(cached) = clients.get(&key)
+            && cached.addresses == upstream.addresses
+        {
+            return Ok(cached.client.clone());
+        }
         let mut builder = reqwest::Client::builder()
             .no_proxy()
             .redirect(reqwest::redirect::Policy::none())
             .connect_timeout(CONNECT_TIMEOUT)
-            .read_timeout(IO_TIMEOUT)
             .resolve_to_addrs(host, &upstream.addresses);
         if let Some(certificate) = upstream.root_certificate {
             builder = builder.add_root_certificate(certificate);
         }
-        Ok(builder.build()?)
+        let client = builder.build()?;
+        clients.insert(
+            key,
+            PooledClient {
+                addresses: upstream.addresses,
+                client: client.clone(),
+            },
+        );
+        Ok(client)
     }
 }
 
@@ -466,7 +503,7 @@ fn public_ipv4(ip: IpAddr) -> bool {
         || (a == 169 && b == 254)
         || (a == 172 && (16..=31).contains(&b))
         || (a == 192 && b == 168)
-        || (a == 192 && b == 0 && c <= 2)
+        || (a == 192 && b == 0 && (c == 0 || c == 2))
         || (a == 192 && b == 88 && c == 99)
         || (a == 198 && (b == 18 || b == 19))
         || (a == 198 && b == 51 && c == 100)
@@ -491,9 +528,12 @@ fn hop_header(name: &HeaderName) -> bool {
 fn strip_hop_headers(headers: &mut HeaderMap) -> Result<()> {
     let mut remove = Vec::new();
     for value in headers.get_all(CONNECTION) {
-        for name in value.to_str()?.split(',') {
-            remove.push(HeaderName::from_bytes(name.trim().as_bytes())?);
-        }
+        remove.extend(
+            value
+                .to_str()?
+                .split(',')
+                .filter_map(|name| HeaderName::from_bytes(name.trim().as_bytes()).ok()),
+        );
     }
     remove.extend(headers.keys().filter(|name| hop_header(name)).cloned());
     for name in remove {

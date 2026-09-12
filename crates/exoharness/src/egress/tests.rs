@@ -75,6 +75,7 @@ impl EgressCredentialResolver for TestResolver {
 }
 
 struct Upstream {
+    connections: Arc<std::sync::atomic::AtomicUsize>,
     config: TestUpstream,
     task: tokio::task::JoinHandle<()>,
 }
@@ -93,12 +94,15 @@ impl Upstream {
             address: listener.local_addr()?,
             ca_pem,
         };
+        let count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let connection_count = count.clone();
         let task = tokio::spawn(async move {
             let mut connections = JoinSet::new();
             loop {
                 tokio::select! {
                     incoming = listener.accept() => {
                         let Ok((stream, _)) = incoming else { break; };
+                        connection_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                         let tls = tls.clone();
                         connections.spawn(async move {
                             let stream = tls.accept(stream).await?;
@@ -114,7 +118,22 @@ impl Upstream {
                                     None => "anonymous",
                                     _ => "bad-auth",
                                 };
-                                let mut response = Response::new(Full::new(Bytes::from_static(message.as_bytes())));
+                                let body: BoxBody<Bytes, Infallible> = if request.uri().path() == "/sse" {
+                                    use futures::StreamExt;
+                                    let initial = futures::stream::once(async { Ok(Frame::data(Bytes::from_static(b"first\n"))) });
+                                    let delayed = futures::stream::once(async {
+                                        tokio::time::sleep(IO_TIMEOUT + Duration::from_secs(1)).await;
+                                        Ok(Frame::data(Bytes::from_static(b"last\n")))
+                                    });
+                                    BodyExt::boxed(StreamBody::new(initial.chain(delayed)))
+                                } else {
+                                    Full::new(Bytes::from_static(message.as_bytes())).boxed()
+                                };
+                                let mut response = Response::new(body);
+                                if request.uri().path() == "/hop" {
+                                    response.headers_mut().insert("connection", HeaderValue::from_static("x-hop, , invalid token,"));
+                                    response.headers_mut().insert("x-hop", HeaderValue::from_static("remove-me"));
+                                }
                                 if request.uri().path() == "/redirect" {
                                     *response.status_mut() = StatusCode::FOUND;
                                     response.headers_mut().insert("location", HeaderValue::from_static("https://public.test/auth"));
@@ -131,7 +150,11 @@ impl Upstream {
                 }
             }
         });
-        Ok(Self { config, task })
+        Ok(Self {
+            connections: count,
+            config,
+            task,
+        })
     }
 
     async fn proxy(
@@ -568,6 +591,7 @@ fn rejects_unsafe_policy_and_addresses() {
         assert!(!public_ipv4(ip.parse().unwrap()), "{ip}");
     }
     assert!(public_ipv4("8.8.8.8".parse().unwrap()));
+    assert!(public_ipv4("192.0.1.1".parse().unwrap()));
     let mut config = policy();
     config.credentials[0].networking = CredentialNetworkPolicy::Limited {
         allowed_hosts: vec!["blocked.test".into()],
@@ -649,8 +673,10 @@ fn dns_only_answers_exact_allowed_names() -> Result<()> {
             response.response_code(),
             if allowed {
                 ResponseCode::NoError
-            } else {
+            } else if host == "api.test" {
                 ResponseCode::Refused
+            } else {
+                ResponseCode::NXDomain
             }
         );
         assert_eq!(
@@ -731,8 +757,18 @@ async fn firecracker_transparent_egress_live() -> Result<()> {
     let one_request = request("egress-live-one");
     let two_request = request("egress-live-two");
     let result: Result<()> = async {
-        let (one, one_source) = backend.acquire_egress(one_request.clone(), proxy.endpoints()).await?;
-        let (two, two_source) = backend.acquire_egress(two_request.clone(), other.endpoints()).await?;
+        let one = backend.acquire_request(crate::FirecrackerRequest {
+            sandbox: one_request.clone(),
+            egress_proxy: Some(proxy.endpoints()),
+        }).await?;
+        backend.track_egress(one.as_ref(), proxy.transport.clone()).await?;
+        let one_source = backend.egress_source(one.as_ref()).await?.context("missing VM egress address")?;
+        let two = backend.acquire_request(crate::FirecrackerRequest {
+            sandbox: two_request.clone(),
+            egress_proxy: Some(other.endpoints()),
+        }).await?;
+        backend.track_egress(two.as_ref(), other.transport.clone()).await?;
+        let two_source = backend.egress_source(two.as_ref()).await?.context("missing VM egress address")?;
         proxy.bind_source(one_source).await?;
         other.bind_source(two_source).await?;
         let setup = r#"
@@ -1006,4 +1042,172 @@ async fn configured_listener_advertises_a_separate_address_and_binds_source() {
     assert_eq!(&buffer, b"request");
     transport.close();
     assert!(transport.accept(true).await.is_err());
+}
+
+#[tokio::test]
+async fn closing_transport_releases_fixed_ports_with_retained_handles() -> Result<()> {
+    let address = host_ip()?;
+    let transport = Arc::new(LocalEgressTransport::bind(address, &HashSet::new()).await?);
+    let endpoints = transport.endpoints();
+    let accepting_transport = transport.clone();
+    let accepting = tokio::spawn(async move { accepting_transport.accept(false).await });
+    tokio::task::yield_now().await;
+    transport.close();
+    let replacement = LocalEgressTransport::with_config(
+        crate::EgressListenConfig {
+            bind_address: address,
+            advertised_address: address,
+            http_port: endpoints.http.port(),
+            https_port: endpoints.https.port(),
+            dns_port: endpoints.dns.port(),
+        },
+        &[],
+    )
+    .await?;
+    assert!(
+        tokio::time::timeout(Duration::from_secs(1), accepting)
+            .await??
+            .is_err()
+    );
+    assert!(transport.is_closed());
+    assert_eq!(replacement.endpoints(), endpoints);
+    replacement.close();
+    Ok(())
+}
+
+#[tokio::test]
+async fn wildcard_listener_dns_replies_from_the_advertised_address_on_both_protocols() -> Result<()>
+{
+    use hickory_proto::{op::Query, rr::Name};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let address = host_ip()?;
+    let transport = LocalEgressTransport::with_config(
+        crate::EgressListenConfig {
+            bind_address: Ipv4Addr::UNSPECIFIED,
+            advertised_address: address,
+            http_port: 0,
+            https_port: 0,
+            dns_port: 0,
+        },
+        &["api.test".into()],
+    )
+    .await?;
+    transport.bind_source(address).await?;
+    let mut query = Message::new();
+    query.set_id(456).add_query(Query::query(
+        Name::from_ascii("blocked.test")?,
+        RecordType::A,
+    ));
+    let bytes = query.to_vec()?;
+    let udp = tokio::net::UdpSocket::bind((address, 0)).await?;
+    udp.connect(transport.endpoints().dns).await?;
+    udp.send(&bytes).await?;
+    let mut answer = [0; 4096];
+    let size = tokio::time::timeout(Duration::from_secs(1), udp.recv(&mut answer)).await??;
+    let response = Message::from_vec(&answer[..size])?;
+    assert_eq!(response.id(), 456);
+    assert_eq!(response.response_code(), ResponseCode::NXDomain);
+    let mut tcp = tokio::net::TcpStream::connect(transport.endpoints().dns).await?;
+    tcp.write_u16(bytes.len().try_into()?).await?;
+    tcp.write_all(&bytes).await?;
+    let size = tcp.read_u16().await?;
+    let mut answer = vec![0; usize::from(size)];
+    tcp.read_exact(&mut answer).await?;
+    assert_eq!(
+        Message::from_vec(&answer)?.response_code(),
+        ResponseCode::NXDomain
+    );
+    transport.close();
+    Ok(())
+}
+
+#[tokio::test]
+async fn response_connection_list_does_not_fail_a_completed_write() -> Result<()> {
+    let upstream = Upstream::start().await?;
+    let proxy = upstream
+        .proxy(host_ip()?, "one", TestResolver::new())
+        .await?;
+    proxy.bind_source(host_ip()?).await?;
+    let response = client(&proxy)?.post("https://api.test/hop").send().await?;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(!response.headers().contains_key("x-hop"));
+    assert_eq!(response.text().await?, "anonymous");
+    proxy.shutdown().await
+}
+
+#[tokio::test]
+async fn pooled_clients_reuse_connections_but_follow_changed_dns() -> Result<()> {
+    struct ChangingUpstream(RwLock<TestUpstream>);
+    #[async_trait]
+    impl UpstreamResolver for ChangingUpstream {
+        async fn resolve(&self, host: &str, port: u16) -> Result<ResolvedUpstream> {
+            self.0.read().await.resolve(host, port).await
+        }
+    }
+    let first = Upstream::start().await?;
+    let second = Upstream::start().await?;
+    let upstream = Arc::new(ChangingUpstream(RwLock::new(first.config.clone())));
+    let state = State::new(
+        identity("one"),
+        policy(),
+        Some(TestResolver::new()),
+        upstream.clone(),
+    )?;
+    for _ in 0..2 {
+        assert_eq!(
+            state
+                .client("api.test", 443)
+                .await?
+                .get("https://api.test/auth")
+                .send()
+                .await?
+                .text()
+                .await?,
+            "anonymous"
+        );
+    }
+    assert_eq!(
+        first.connections.load(std::sync::atomic::Ordering::SeqCst),
+        1
+    );
+    *upstream.0.write().await = second.config.clone();
+    assert_eq!(
+        state
+            .client("api.test", 443)
+            .await?
+            .get("https://api.test/auth")
+            .send()
+            .await?
+            .text()
+            .await?,
+        "anonymous"
+    );
+    assert_eq!(
+        first.connections.load(std::sync::atomic::Ordering::SeqCst),
+        1
+    );
+    assert_eq!(
+        second.connections.load(std::sync::atomic::Ordering::SeqCst),
+        1
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn quiet_response_stream_survives_past_the_request_io_timeout() -> Result<()> {
+    let upstream = Upstream::start().await?;
+    let proxy = upstream
+        .proxy(host_ip()?, "one", TestResolver::new())
+        .await?;
+    proxy.bind_source(host_ip()?).await?;
+    let mut response = client(&proxy)?
+        .get("https://api.test/sse")
+        .timeout(IO_TIMEOUT * 2)
+        .send()
+        .await?;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.chunk().await?.unwrap(), "first\n");
+    assert_eq!(response.chunk().await?.unwrap(), "last\n");
+    assert!(response.chunk().await?.is_none());
+    proxy.shutdown().await
 }

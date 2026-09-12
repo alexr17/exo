@@ -42,7 +42,6 @@ use tokio::net::{TcpStream, UnixStream};
 use tokio::sync::{Mutex, OwnedMutexGuard};
 use uuid::Uuid;
 
-#[cfg(target_os = "linux")]
 use crate::egress::{EgressCredentialResolver, UpstreamResolver};
 use crate::egress::{EgressRuntime, PublicUpstreamResolver, SandboxEgress};
 use crate::sandbox::{
@@ -609,9 +608,26 @@ struct Shared {
     // lock prevents concurrent controllers from racing that reconciliation.
     _state_lock: File,
     warm_machines: Mutex<HashMap<SandboxId, WarmMachineEntry>>,
+    // VM cleanup owns listener closure, including listeners supplied by Lima.
+    // Close these before releasing a VM's address for another allocation.
+    egress_transports: StdMutex<HashMap<String, Arc<dyn crate::egress::EgressTransport>>>,
     lifecycle_locks: MachineLifecycleLocks,
     capacity_gate: Mutex<()>,
     starting_machines: Arc<StdMutex<HashSet<String>>>,
+}
+
+impl Drop for Shared {
+    fn drop(&mut self) {
+        for transport in self
+            .egress_transports
+            .get_mut()
+            .expect("Firecracker egress map poisoned")
+            .drain()
+            .map(|(_, transport)| transport)
+        {
+            transport.close();
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -654,7 +670,7 @@ impl FirecrackerSandboxBackend {
         self.shared.cleanup_machine(&machine_id, true).await
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(all(test, target_os = "linux"))]
     pub(crate) fn with_egress(
         mut self,
         resolver: Option<Arc<dyn EgressCredentialResolver>>,
@@ -700,8 +716,63 @@ impl FirecrackerSandboxBackend {
         Ok(record.network_enabled.then(|| record.network().guest_ip))
     }
 
+    // Unlike acquire_request, this never boots a VM or refreshes its lease.
+    pub(super) async fn is_running_request(
+        &self,
+        request: &SandboxRequest,
+    ) -> Result<Option<bool>> {
+        let Some(state) = &request.provider_state else {
+            return Ok(Some(false));
+        };
+        let state = parse_provider_state(state)?;
+        self.shared.is_running(&state.machine_id).await
+    }
+
+    pub(super) async fn track_egress(
+        &self,
+        handle: &dyn ManagedSandboxHandle,
+        transport: Arc<dyn crate::egress::EgressTransport>,
+    ) -> Result<()> {
+        let state = parse_provider_state(
+            &handle
+                .provider_state()
+                .context("egress requires a managed VM")?,
+        )?;
+        let _guard = self
+            .shared
+            .lifecycle_locks
+            .lock_machine(&state.machine_id)
+            .await;
+        anyhow::ensure!(
+            self.shared.is_running(&state.machine_id).await? == Some(true),
+            "egress VM is no longer running"
+        );
+        anyhow::ensure!(!transport.is_closed(), "egress listener is closed");
+        let previous = self
+            .shared
+            .egress_transports
+            .lock()
+            .expect("Firecracker egress map poisoned")
+            .insert(state.machine_id, transport.clone());
+        if let Some(previous) = previous
+            && !Arc::ptr_eq(&previous, &transport)
+        {
+            previous.close();
+        }
+        Ok(())
+    }
+
     pub async fn new(config: FirecrackerConfig) -> Result<Self> {
-        tokio::task::spawn_blocking(move || Self::new_blocking(config))
+        Self::new_with_egress(config, None, Arc::new(PublicUpstreamResolver)).await
+    }
+
+    pub(crate) async fn new_with_egress(
+        config: FirecrackerConfig,
+        resolver: Option<Arc<dyn EgressCredentialResolver>>,
+        upstream: Arc<dyn UpstreamResolver>,
+    ) -> Result<Self> {
+        let egress = Arc::new(EgressRuntime::new(resolver, upstream));
+        tokio::task::spawn_blocking(move || Self::new_blocking(config, egress))
             .await
             .context("joining Firecracker backend construction")?
     }
@@ -732,7 +803,10 @@ impl FirecrackerSandboxBackend {
         Ok(machine_ids.len())
     }
 
-    fn new_blocking(mut config: FirecrackerConfig) -> Result<Self> {
+    fn new_blocking(
+        mut config: FirecrackerConfig,
+        egress: Arc<EgressRuntime<FirecrackerSandboxHandle>>,
+    ) -> Result<Self> {
         let firecracker_version = validate_host_blocking(&config)?;
         fs::create_dir_all(&config.state_root).with_context(|| {
             format!(
@@ -806,12 +880,13 @@ impl FirecrackerSandboxBackend {
         validate_jailed_socket_paths(&config)?;
 
         Ok(Self {
-            egress: Arc::new(EgressRuntime::new(None, Arc::new(PublicUpstreamResolver))),
+            egress,
             shared: Arc::new(Shared {
                 config,
                 host_fingerprint,
                 _state_lock: state_lock,
                 warm_machines: Mutex::new(HashMap::new()),
+                egress_transports: StdMutex::new(HashMap::new()),
                 lifecycle_locks: MachineLifecycleLocks::default(),
                 capacity_gate: Mutex::new(()),
                 starting_machines: Arc::new(StdMutex::new(HashSet::new())),
@@ -1290,6 +1365,7 @@ impl ManagedSandboxBackend for FirecrackerSandboxBackend {
                         .await?;
                     if let Some(egress) = egress {
                         let source = handle.machine.record.network().guest_ip;
+                        self.track_egress(&handle, egress.transport()).await?;
                         egress.initialize(&handle, source).await?;
                         handle.egress = Some(egress);
                     }
@@ -1314,8 +1390,9 @@ impl ManagedSandboxBackend for FirecrackerSandboxBackend {
 
     #[tracing::instrument(name = "firecracker.terminate", skip_all)]
     async fn terminate(&self, request: SandboxRequest) -> Result<()> {
+        let id = request.sandbox_id.clone();
         self.egress
-            .terminate(&request.sandbox_id, self.terminate_raw(request.clone()))
+            .terminate(&id, self.terminate_raw(request))
             .await
     }
 
@@ -1443,19 +1520,14 @@ impl ManagedSandboxHandle for FirecrackerSandboxHandle {
     }
 
     async fn is_running(&self) -> Result<Option<bool>> {
-        let pid_path = self.shared.pid_path(&self.machine.record.machine_id);
-        tokio::task::spawn_blocking(move || observe_machine_process(&pid_path))
+        self.shared
+            .is_running(&self.machine.record.machine_id)
             .await
-            .context("joining Firecracker liveness observation")?
     }
 
     async fn exec(&self, command: &SandboxCommand) -> Result<SandboxCommandOutput> {
-        let prepared = self
-            .egress
-            .as_ref()
-            .map(|egress| egress.command(command))
-            .transpose()?;
-        let command = prepared.as_ref().unwrap_or(command);
+        let command = SandboxEgress::prepare_command(self.egress.as_deref(), command)?;
+        let command = command.as_ref();
         let output = GuestClient::new(Arc::clone(&self.shared), self.machine.vsock_path.clone())
             .exec(&self.request.spec, command)
             .await;
@@ -1492,12 +1564,8 @@ impl ManagedSandboxHandle for FirecrackerSandboxHandle {
     }
 
     async fn start_process(&self, command: &SandboxCommand) -> Result<SandboxProcessParts> {
-        let prepared = self
-            .egress
-            .as_ref()
-            .map(|egress| egress.command(command))
-            .transpose()?;
-        let command = prepared.as_ref().unwrap_or(command);
+        let command = SandboxEgress::prepare_command(self.egress.as_deref(), command)?;
+        let command = command.as_ref();
         let cleanup_machine_id = self
             .one_shot
             .then(|| self.machine.record.machine_id.clone());
@@ -1526,12 +1594,8 @@ impl ManagedSandboxHandle for FirecrackerSandboxHandle {
         command: &SandboxCommand,
         size: SandboxTerminalSize,
     ) -> Result<SandboxTerminalParts> {
-        let prepared = self
-            .egress
-            .as_ref()
-            .map(|egress| egress.command(command))
-            .transpose()?;
-        let command = prepared.as_ref().unwrap_or(command);
+        let command = SandboxEgress::prepare_command(self.egress.as_deref(), command)?;
+        let command = command.as_ref();
         let cleanup_machine_id = self
             .one_shot
             .then(|| self.machine.record.machine_id.clone());
@@ -1634,6 +1698,34 @@ impl ManagedSandboxHandle for FirecrackerSandboxHandle {
 }
 
 impl Shared {
+    async fn is_running(&self, machine_id: &str) -> Result<Option<bool>> {
+        if !valid_machine_id(machine_id) {
+            bail!("invalid Firecracker machine id");
+        }
+        let pid_path = self.pid_path(machine_id);
+        let state_root = self.config.state_root.clone();
+        let machine_id = machine_id.to_owned();
+        tokio::task::spawn_blocking(move || {
+            if machine_lease_expired(&state_root, &machine_id, SystemTime::now())? {
+                return Ok(Some(false));
+            }
+            observe_machine_process(&pid_path)
+        })
+        .await
+        .context("joining Firecracker liveness observation")?
+    }
+
+    fn close_egress(&self, machine_id: &str) {
+        if let Some(transport) = self
+            .egress_transports
+            .lock()
+            .expect("Firecracker egress map poisoned")
+            .remove(machine_id)
+        {
+            transport.close();
+        }
+    }
+
     async fn delete_snapshot(&self, payload: SnapshotPayload) -> Result<()> {
         let manifest = FirecrackerSnapshotManifest::from_payload(payload)?;
         let config = self.config.clone();
@@ -2006,6 +2098,7 @@ impl Shared {
 
     #[tracing::instrument(name = "firecracker.cleanup", skip_all)]
     async fn cleanup_machine(&self, machine_id: &str, delete_rootfs: bool) -> Result<()> {
+        self.close_egress(machine_id);
         if !valid_machine_id(machine_id) {
             bail!("invalid Firecracker machine id: {machine_id}");
         }

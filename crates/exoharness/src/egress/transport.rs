@@ -1,13 +1,17 @@
 use std::collections::HashSet;
+use std::future::poll_fn;
+use std::io;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::{Arc, Mutex};
+use std::task::Poll;
+use std::time::Duration;
 
 use anyhow::{Result, anyhow, ensure};
 use async_trait::async_trait;
 use hickory_proto::op::{Message, MessageType, OpCode, ResponseCode};
 use hickory_proto::rr::{DNSClass, RData, Record, RecordType, rdata::A};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncReadExt, AsyncWriteExt, ReadBuf};
 use tokio::net::{TcpListener, UdpSocket};
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
@@ -18,23 +22,103 @@ use crate::{BoxSandboxTcpStream, SandboxEgressProxy};
 
 const MAX_DNS_TASKS: usize = 32;
 const DNS_BUFFER_SIZE: usize = 4096;
+const DNS_BIND_ATTEMPTS: usize = 16;
+const ACCEPT_RETRY_DELAY: Duration = Duration::from_millis(100);
 
 const SYNTHETIC_IP: Ipv4Addr = Ipv4Addr::new(192, 0, 2, 1);
 
+/// The network side of a proxy: endpoint addresses and incoming byte streams.
+/// Local Firecracker uses host sockets; Lima forwards those streams over its
+/// bridge. This layer never receives credentials or the TLS signing key.
 #[async_trait]
 pub trait EgressTransport: Send + Sync {
     fn endpoints(&self) -> SandboxEgressProxy;
+    /// Admit the VM only after acquisition has established its source address.
     async fn bind_source(&self, source_ip: Ipv4Addr) -> Result<()>;
     async fn accept(&self, tls: bool) -> Result<BoxSandboxTcpStream>;
+    fn is_closed(&self) -> bool;
+    /// Stop admission and initiate cleanup, including when called from Drop.
     fn close(&self);
+    /// Wait for remote listeners to be released before reusing their ports.
+    async fn shutdown(&self) -> Result<()> {
+        self.close();
+        Ok(())
+    }
 }
 
 pub struct LocalEgressTransport {
     endpoints: SandboxEgressProxy,
-    http: TcpListener,
-    https: TcpListener,
+    http: Socket<TcpListener>,
+    https: Socket<TcpListener>,
+    dns: Arc<Socket<UdpSocket>>,
+    dns_tcp: Arc<Socket<TcpListener>>,
     source: Arc<AtomicU32>,
     cancel: CancellationToken,
+}
+
+// Poll under a short lock instead of holding an Arc to the OS socket across
+// await. close() can then drop the descriptor immediately and free its port.
+struct Socket<T>(Mutex<Option<T>>);
+
+impl<T> Socket<T> {
+    fn new(socket: T) -> Self {
+        Self(Mutex::new(Some(socket)))
+    }
+
+    fn poll<R>(&self, f: impl FnOnce(&T) -> Poll<io::Result<R>>) -> Poll<io::Result<R>> {
+        match self.0.lock().expect("egress socket poisoned").as_ref() {
+            Some(socket) => f(socket),
+            None => Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::NotConnected,
+                "egress listener closed",
+            ))),
+        }
+    }
+
+    fn close(&self) {
+        self.0.lock().expect("egress socket poisoned").take();
+    }
+}
+
+impl Socket<TcpListener> {
+    async fn accept(&self) -> io::Result<(tokio::net::TcpStream, SocketAddr)> {
+        poll_fn(|cx| self.poll(|socket| socket.poll_accept(cx))).await
+    }
+}
+
+impl Socket<UdpSocket> {
+    async fn recv_from(&self, buffer: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
+        let mut buffer = ReadBuf::new(buffer);
+        let peer = poll_fn(|cx| self.poll(|socket| socket.poll_recv_from(cx, &mut buffer))).await?;
+        Ok((buffer.filled().len(), peer))
+    }
+
+    async fn send_to(&self, buffer: &[u8], peer: SocketAddr) -> io::Result<usize> {
+        poll_fn(|cx| self.poll(|socket| socket.poll_send_to(cx, buffer, peer))).await
+    }
+}
+
+async fn bind_dns(config: &crate::EgressListenConfig) -> io::Result<(TcpListener, UdpSocket)> {
+    let address = if config.bind_address.is_unspecified() {
+        config.advertised_address
+    } else {
+        config.bind_address
+    };
+    for attempt in 0..DNS_BIND_ATTEMPTS {
+        let tcp = TcpListener::bind((address, config.dns_port)).await?;
+        match UdpSocket::bind(tcp.local_addr()?).await {
+            Ok(udp) => return Ok((tcp, udp)),
+            Err(error)
+                if error.kind() == io::ErrorKind::AddrInUse
+                    && config.dns_port == 0
+                    && attempt + 1 < DNS_BIND_ATTEMPTS =>
+            {
+                continue;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    unreachable!("last DNS bind attempt returns its error")
 }
 
 impl LocalEgressTransport {
@@ -71,8 +155,7 @@ impl LocalEgressTransport {
         let host_ip = config.advertised_address;
         let http = TcpListener::bind((config.bind_address, config.http_port)).await?;
         let https = TcpListener::bind((config.bind_address, config.https_port)).await?;
-        let dns = UdpSocket::bind((config.bind_address, config.dns_port)).await?;
-        let dns_tcp = TcpListener::bind(dns.local_addr()?).await?;
+        let (dns_tcp, dns) = bind_dns(&config).await?;
         let endpoints = SandboxEgressProxy {
             http: SocketAddrV4::new(host_ip, http.local_addr()?.port()),
             https: SocketAddrV4::new(host_ip, https.local_addr()?.port()),
@@ -81,17 +164,21 @@ impl LocalEgressTransport {
         endpoints.validate()?;
         let source = Arc::new(AtomicU32::new(0));
         let cancel = CancellationToken::new();
+        let dns = Arc::new(Socket::new(dns));
+        let dns_tcp = Arc::new(Socket::new(dns_tcp));
         tokio::spawn(serve_dns(
-            dns,
-            dns_tcp,
+            dns.clone(),
+            dns_tcp.clone(),
             hosts.clone(),
             source.clone(),
             cancel.clone(),
         ));
         Ok(Self {
             endpoints,
-            http,
-            https,
+            http: Socket::new(http),
+            https: Socket::new(https),
+            dns,
+            dns_tcp,
             source,
             cancel,
         })
@@ -109,6 +196,7 @@ impl EgressTransport for LocalEgressTransport {
             !source_ip.is_unspecified() && !source_ip.is_multicast() && !source_ip.is_broadcast(),
             "invalid proxy source address"
         );
+        ensure!(!self.is_closed(), "egress listener closed");
         self.source
             .compare_exchange(0, u32::from(source_ip), Ordering::SeqCst, Ordering::SeqCst)
             .map_err(|_| anyhow!("proxy source identity is already bound"))?;
@@ -122,15 +210,32 @@ impl EgressTransport for LocalEgressTransport {
                 biased;
                 _ = self.cancel.cancelled() => return Err(anyhow!("egress listener closed")),
                 incoming = listener.accept() => {
-                    let (stream, peer) = incoming?;
-                    if accepts_peer(&self.source, peer) { return Ok(Box::pin(stream)); }
+                    match incoming {
+                        Ok((stream, peer)) if accepts_peer(&self.source, peer) => return Ok(Box::pin(stream)),
+                        Ok(_) => {},
+                        Err(error) => {
+                            tracing::debug!(%error, "egress accept failed; retrying");
+                            tokio::select! {
+                                _ = self.cancel.cancelled() => return Err(anyhow!("egress listener closed")),
+                                _ = tokio::time::sleep(ACCEPT_RETRY_DELAY) => {},
+                            }
+                        }
+                    }
                 }
             }
         }
     }
 
+    fn is_closed(&self) -> bool {
+        self.cancel.is_cancelled()
+    }
+
     fn close(&self) {
         self.cancel.cancel();
+        self.http.close();
+        self.https.close();
+        self.dns.close();
+        self.dns_tcp.close();
     }
 }
 
@@ -149,8 +254,8 @@ fn accepts_peer(source: &AtomicU32, peer: SocketAddr) -> bool {
 }
 
 async fn serve_dns(
-    dns: UdpSocket,
-    tcp: TcpListener,
+    dns: Arc<Socket<UdpSocket>>,
+    tcp: Arc<Socket<TcpListener>>,
     hosts: HashSet<String>,
     source: Arc<AtomicU32>,
     cancel: CancellationToken,
@@ -165,7 +270,16 @@ async fn serve_dns(
                 if !matches!(result, Ok(Ok(()))) { tracing::debug!("egress DNS connection failed"); }
             }
             incoming = dns.recv_from(&mut buffer) => {
-                let Ok((size, peer)) = incoming else { break; };
+                let (size, peer) = match incoming {
+                    Ok(incoming) => incoming,
+                    Err(error) => {
+                        tracing::debug!(%error, "egress DNS receive failed; retrying");
+                        tokio::select! {
+                            _ = cancel.cancelled() => break,
+                            _ = tokio::time::sleep(ACCEPT_RETRY_DELAY) => continue,
+                        }
+                    }
+                };
                 if !accepts_peer(&source, peer) { continue; }
                 if let Ok(answer) = dns_response(&hosts, &buffer[..size])
                     && dns.send_to(&answer, peer).await.is_err() {
@@ -173,13 +287,22 @@ async fn serve_dns(
                 }
             }
             incoming = tcp.accept() => {
-                let Ok((mut stream, peer)) = incoming else { break; };
+                let (mut stream, peer) = match incoming {
+                    Ok(incoming) => incoming,
+                    Err(error) => {
+                        tracing::debug!(%error, "egress DNS accept failed; retrying");
+                        tokio::select! {
+                            _ = cancel.cancelled() => break,
+                            _ = tokio::time::sleep(ACCEPT_RETRY_DELAY) => continue,
+                        }
+                    }
+                };
                 if !accepts_peer(&source, peer) || tasks.len() >= MAX_DNS_TASKS { continue; }
                 let hosts = hosts.clone();
                 tasks.spawn(async move {
                     tokio::time::timeout(IO_TIMEOUT, async {
                         let size = stream.read_u16().await?;
-                        ensure!(size <= 4096, "DNS request too large");
+                        ensure!(usize::from(size) <= DNS_BUFFER_SIZE, "DNS request too large");
                         let mut bytes = vec![0; size as usize];
                         stream.read_exact(&mut bytes).await?;
                         let answer = dns_response(&hosts, &bytes)?;
@@ -214,8 +337,10 @@ pub(super) fn dns_response(hosts: &HashSet<String>, bytes: &[u8]) -> Result<Vec<
         .to_ascii()
         .trim_end_matches('.')
         .to_ascii_lowercase();
-    if question.query_class() != DNSClass::IN || !hosts.contains(&host) {
+    if question.query_class() != DNSClass::IN {
         response.set_response_code(ResponseCode::Refused);
+    } else if !hosts.contains(&host) {
+        response.set_response_code(ResponseCode::NXDomain);
     } else if question.query_type() == RecordType::A {
         response.add_answer(Record::from_rdata(
             question.name().clone(),

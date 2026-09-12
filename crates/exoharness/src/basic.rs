@@ -3500,11 +3500,6 @@ async fn prepare_sandbox_request(
     let policy = request
         .policy
         .or_else(|| harness.inner.sandbox_policy.clone());
-    if let (Some(policy), Some(enabled)) = (&policy, request.enable_networking)
-        && enabled != policy.networking_enabled()
-    {
-        bail!("enable_networking conflicts with sandbox policy.networking");
-    }
     let policy = policy.unwrap_or_else(|| {
         if request.enable_networking.unwrap_or(true) {
             SandboxNetworkPolicy::Unrestricted.into()
@@ -4891,25 +4886,84 @@ struct LocalEgressResolver {
 impl crate::egress::EgressCredentialResolver for LocalEgressResolver {
     async fn resolve(
         &self,
-        _identity: &crate::egress::EgressIdentity,
+        identity: &crate::egress::EgressIdentity,
         binding_name: &str,
         _destination: &crate::egress::EgressDestination,
     ) -> Result<String> {
-        let stored = self
-            .storage
-            .list_json_matching_suffix::<StoredSecret>(Path::new("secrets"), ".json")
-            .await?;
-        let mut matches = stored.into_iter().filter(|s| {
-            s.metadata.name == binding_name || s.metadata.id.to_string() == binding_name
-        });
-        let record = matches.next().context("egress credential not found")?;
-        if matches.next().is_some() {
-            bail!("egress credential reference is ambiguous; use its id");
+        for directory in self.secret_directories(identity).await? {
+            let stored = self
+                .storage
+                .list_json_matching_suffix::<StoredSecret>(&directory, ".json")
+                .await?;
+            let mut matches = stored.into_iter().filter(|s| {
+                s.metadata.name == binding_name || s.metadata.id.to_string() == binding_name
+            });
+            let Some(record) = matches.next() else {
+                continue;
+            };
+            anyhow::ensure!(
+                matches.next().is_none(),
+                "egress credential reference is ambiguous; use its id"
+            );
+            return match self.cipher.decrypt_secret(&record.secret)? {
+                Secret::Key { value } => Ok(value),
+                Secret::Oauth { .. } => bail!("egress credential must be an API key"),
+            };
         }
-        match self.cipher.decrypt_secret(&record.secret)? {
-            Secret::Key { value } => Ok(value),
-            Secret::Oauth { .. } => bail!("egress credential must be an API key"),
+        bail!("egress credential not found")
+    }
+}
+
+#[cfg(feature = "firecracker")]
+impl LocalEgressResolver {
+    async fn secret_directories(
+        &self,
+        identity: &crate::egress::EgressIdentity,
+    ) -> Result<Vec<PathBuf>> {
+        let mut directories = Vec::new();
+        let agent_dir = match &identity.scope {
+            Some(SandboxScope::Agent { agent_id }) => {
+                let agent_id: AgentId =
+                    agent_id.parse().context("invalid egress agent identity")?;
+                Some(PathBuf::from("agents").join(agent_id.to_string()))
+            }
+            Some(SandboxScope::Thread { thread_id }) => {
+                let thread_id: ConversationId = thread_id
+                    .parse()
+                    .context("invalid egress thread identity")?;
+                let suffix = format!("/conversations/{thread_id}/record.json");
+                let keys = self.storage.list_keys(Path::new("agents")).await?;
+                let mut records = keys.iter().filter(|key| {
+                    key.ends_with(&suffix) && Path::new(key).components().count() == 5
+                });
+                let record = records.next().context("egress thread not found")?;
+                anyhow::ensure!(
+                    records.next().is_none(),
+                    "egress thread identity is ambiguous"
+                );
+                let thread_dir = Path::new(record)
+                    .parent()
+                    .context("invalid thread record path")?;
+                directories.push(thread_dir.join("secrets"));
+                Some(
+                    thread_dir
+                        .parent()
+                        .and_then(Path::parent)
+                        .context("invalid thread agent path")?
+                        .to_path_buf(),
+                )
+            }
+            None => None,
+        };
+        if let Some(agent_dir) = agent_dir {
+            self.storage
+                .get_json::<AgentRecord>(agent_dir.join("record.json"))
+                .await
+                .context("egress agent not found")?;
+            directories.push(agent_dir.join("secrets"));
         }
+        directories.push(PathBuf::from("secrets"));
+        Ok(directories)
     }
 }
 
@@ -4986,5 +5040,166 @@ mod stored_policy_tests {
             }))
             .is_err()
         );
+    }
+}
+
+#[cfg(all(test, feature = "firecracker"))]
+mod egress_resolution_tests {
+    use super::*;
+    use crate::egress::{EgressCredentialResolver, EgressDestination, EgressIdentity};
+
+    #[tokio::test]
+    async fn local_credentials_follow_scope_and_reject_other_threads() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let harness =
+            BasicExoHarness::new(crate::test_support::local_test_config(directory.path())).await?;
+        let resolver = LocalEgressResolver {
+            storage: harness.inner.storage.clone(),
+            cipher: harness.inner.secret_cipher.clone(),
+        };
+        let secret = |value: &str| PutSecretRequest {
+            name: "token".into(),
+            secret: Secret::Key {
+                value: value.into(),
+            },
+        };
+        let global_id = harness.put_secret(secret("global")).await?;
+        let agent = harness
+            .new_agent(NewAgentRequest {
+                slug: "agent".into(),
+                name: "agent".into(),
+            })
+            .await?;
+        agent.put_secret(secret("agent")).await?;
+        let first = agent
+            .new_conversation(NewConversationRequest::default())
+            .await?;
+        let second = agent
+            .new_conversation(NewConversationRequest::default())
+            .await?;
+        let first_id = first.put_secret(secret("first")).await?;
+        second.put_secret(secret("second")).await?;
+        let destination = EgressDestination {
+            host: "api.test".into(),
+            port: 443,
+            method: hyper::Method::GET,
+            path: "/".into(),
+        };
+        for (scope, expected) in [
+            (None, "global"),
+            (
+                Some(SandboxScope::Agent {
+                    agent_id: agent.record().id.to_string(),
+                }),
+                "agent",
+            ),
+            (
+                Some(SandboxScope::Thread {
+                    thread_id: first.record().id.to_string(),
+                }),
+                "first",
+            ),
+            (
+                Some(SandboxScope::Thread {
+                    thread_id: second.record().id.to_string(),
+                }),
+                "second",
+            ),
+        ] {
+            let identity = EgressIdentity {
+                sandbox_id: "test".into(),
+                scope,
+            };
+            assert_eq!(
+                resolver.resolve(&identity, "token", &destination).await?,
+                expected
+            );
+        }
+        let second_identity = EgressIdentity {
+            sandbox_id: "second".into(),
+            scope: Some(SandboxScope::Thread {
+                thread_id: second.record().id.to_string(),
+            }),
+        };
+        assert!(
+            resolver
+                .resolve(&second_identity, &first_id.to_string(), &destination)
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            resolver
+                .resolve(&second_identity, &global_id.to_string(), &destination)
+                .await?,
+            "global"
+        );
+        let inherited = agent
+            .new_conversation(NewConversationRequest::default())
+            .await?;
+        let mut identity = EgressIdentity {
+            sandbox_id: "test".into(),
+            scope: Some(SandboxScope::Thread {
+                thread_id: inherited.record().id.to_string(),
+            }),
+        };
+        assert_eq!(
+            resolver.resolve(&identity, "token", &destination).await?,
+            "agent"
+        );
+        for thread_id in [Uuid7::now().to_string(), "../../secrets".into()] {
+            identity.scope = Some(SandboxScope::Thread { thread_id });
+            assert!(
+                resolver
+                    .resolve(&identity, "token", &destination)
+                    .await
+                    .is_err()
+            );
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn policy_overrides_the_legacy_networking_flag() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let mut config = crate::test_support::local_test_config(directory.path());
+        let limited: crate::EgressPolicy = SandboxNetworkPolicy::Limited {
+            allowed_hosts: vec!["api.test".into()],
+        }
+        .into();
+        config.sandbox_policy = Some(limited.clone());
+        let harness = BasicExoHarness::new(config).await?;
+        let request = CreateSandboxRequest {
+            name: None,
+            provider: SandboxProvider::LocalProcess,
+            image: "".into(),
+            resources: Default::default(),
+            default_workdir: None,
+            file_system_mounts: None,
+            durable_file_systems: None,
+            policy: None,
+            enable_networking: Some(false),
+            idle_seconds: None,
+        };
+        assert_eq!(
+            prepare_sandbox_request(&harness, request.clone())
+                .await?
+                .policy,
+            limited
+        );
+        assert_eq!(
+            prepare_sandbox_request(
+                &harness,
+                CreateSandboxRequest {
+                    policy: Some(SandboxNetworkPolicy::Disabled.into()),
+                    enable_networking: Some(true),
+                    ..request
+                }
+            )
+            .await?
+            .policy
+            .networking,
+            SandboxNetworkPolicy::Disabled
+        );
+        Ok(())
     }
 }
