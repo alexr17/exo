@@ -262,7 +262,7 @@ impl ManagedSandboxBackend for LimaFirecrackerSandboxBackend {
                 },
             )
             .await
-            .map(|handle| handle as Arc<dyn ManagedSandboxHandle>)
+            .map(|handle| crate::with_process_management(handle))
     }
 
     async fn attach(
@@ -318,13 +318,15 @@ impl ManagedSandboxBackend for LimaFirecrackerSandboxBackend {
         else {
             bail!("Firecracker Lima bridge returned the wrong response to fork");
         };
-        Ok(Arc::new(self.bound_handle(
-            target.into(),
-            id,
-            provider_state,
-            effective_image,
-            source_ipv4,
-        )?))
+        Ok(crate::with_process_management(Arc::new(
+            self.bound_handle(
+                target.into(),
+                id,
+                provider_state,
+                effective_image,
+                source_ipv4,
+            )?,
+        )))
     }
 
     async fn acquire_from_snapshot(
@@ -356,13 +358,15 @@ impl ManagedSandboxBackend for LimaFirecrackerSandboxBackend {
         else {
             bail!("Firecracker Lima bridge returned the wrong response to snapshot restore");
         };
-        Ok(Arc::new(self.bound_handle(
-            request.into(),
-            id,
-            provider_state,
-            effective_image,
-            source_ipv4,
-        )?))
+        Ok(crate::with_process_management(Arc::new(
+            self.bound_handle(
+                request.into(),
+                id,
+                provider_state,
+                effective_image,
+                source_ipv4,
+            )?,
+        )))
     }
 }
 

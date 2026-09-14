@@ -703,7 +703,9 @@ impl FirecrackerSandboxBackend {
         &self,
         request: FirecrackerRequest,
     ) -> Result<Arc<dyn ManagedSandboxHandle>> {
-        Ok(Arc::new(self.acquire_raw(request).await?))
+        Ok(crate::with_process_management(Arc::new(
+            self.acquire_raw(request).await?,
+        )))
     }
 
     #[tracing::instrument(name = "firecracker.acquire", skip_all)]
@@ -1382,7 +1384,7 @@ impl ManagedSandboxBackend for FirecrackerSandboxBackend {
                 },
             )
             .await
-            .map(|handle| handle as Arc<dyn ManagedSandboxHandle>)
+            .map(|handle| crate::with_process_management(handle))
     }
 
     async fn attach(
@@ -1461,7 +1463,7 @@ impl ManagedSandboxBackend for FirecrackerSandboxBackend {
             SnapshotTemplateLifecycle::Machine,
         )
         .await?;
-        Ok(Arc::new(
+        Ok(crate::with_process_management(Arc::new(
             self.restore_snapshot_locked(
                 target,
                 captured.manifest,
@@ -1471,7 +1473,7 @@ impl ManagedSandboxBackend for FirecrackerSandboxBackend {
                 target_machine_id,
             )
             .await?,
-        ))
+        )))
     }
 
     #[tracing::instrument(name = "firecracker.restore", skip_all)]
@@ -1486,10 +1488,10 @@ impl ManagedSandboxBackend for FirecrackerSandboxBackend {
             .validate_basic("Firecracker snapshot restore")?;
         let manifest = FirecrackerSnapshotManifest::from_payload(payload)?;
         let request = self.resolve_request(request.into()).await?;
-        Ok(Arc::new(
+        Ok(crate::with_process_management(Arc::new(
             self.restore_snapshot(request, manifest, SnapshotTemplateLifecycle::Snapshot, None)
                 .await?,
-        ))
+        )))
     }
 }
 
