@@ -209,14 +209,12 @@ impl EgressProxy {
         self.transport.close();
     }
 
-    async fn join(&mut self) -> Result<()> {
-        (&mut self.task).await.context("joining egress proxy")?;
-        Ok(())
-    }
-
     async fn join_with_timeout(&mut self) -> Result<()> {
-        match tokio::time::timeout(IO_TIMEOUT, self.join()).await {
-            Ok(result) => result,
+        match tokio::time::timeout(IO_TIMEOUT, &mut self.task).await {
+            Ok(result) => {
+                result.context("joining egress proxy")?;
+                Ok(())
+            }
             Err(_) => {
                 self.task.abort();
                 Err(anyhow!("timed out joining egress proxy"))

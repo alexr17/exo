@@ -18,7 +18,8 @@ const GIT_AUTHORIZATION: &str = "Basic eC1hY2Nlc3MtdG9rZW46Y2FuYXJ5LXYx";
 impl EgressProxy {
     async fn shutdown(mut self) -> Result<()> {
         self.close();
-        self.join().await
+        (&mut self.task).await.context("joining egress proxy")?;
+        Ok(())
     }
 }
 

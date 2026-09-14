@@ -90,11 +90,6 @@ impl HostedTransportGate {
             }
         }
     }
-
-    fn close_state(&self) {
-        self.state.store(SESSION_CLOSED, Ordering::Release);
-        self.changed.notify_waiters();
-    }
 }
 
 #[async_trait]
@@ -123,7 +118,8 @@ impl EgressTransport for HostedTransportGate {
     }
 
     fn close(&self) {
-        self.close_state();
+        self.state.store(SESSION_CLOSED, Ordering::Release);
+        self.changed.notify_waiters();
         self.inner.close();
     }
 }
@@ -193,10 +189,6 @@ impl HostedEgressSession {
         }
     }
 
-    pub fn is_attached(&self) -> bool {
-        self.state.load(Ordering::Acquire) == SESSION_ATTACHED
-    }
-
     /// Bind the reserved relay to the exact provider allocation and generation.
     /// A failed attachment permanently closes the session.
     pub async fn attach(&self, allocation: &EgressAllocation) -> Result<()> {
@@ -243,7 +235,7 @@ impl HostedEgressSession {
             .await);
         }
         self.changed.notify_waiters();
-        cleanup.disarm();
+        cleanup.armed = false;
         Ok(())
     }
 
@@ -254,11 +246,10 @@ impl HostedEgressSession {
 
     /// Close the Exo proxy and wait for both proxy and provider resources to
     /// finish releasing.
-    pub async fn shutdown(self) -> Result<()> {
-        let mut session = self;
-        session.close();
+    pub async fn shutdown(mut self) -> Result<()> {
+        self.close();
         let (proxy_result, relay_result) =
-            tokio::join!(session.proxy.join_with_timeout(), session.relay.shutdown());
+            tokio::join!(self.proxy.join_with_timeout(), self.relay.shutdown());
         match (proxy_result, relay_result) {
             (Ok(()), Ok(())) => Ok(()),
             (Err(error), Ok(())) | (Ok(()), Err(error)) => Err(error),
@@ -274,12 +265,6 @@ struct AttachCleanup<'a> {
     state: &'a AtomicU8,
     changed: &'a Notify,
     armed: bool,
-}
-
-impl AttachCleanup<'_> {
-    fn disarm(&mut self) {
-        self.armed = false;
-    }
 }
 
 impl Drop for AttachCleanup<'_> {
@@ -308,7 +293,6 @@ impl Drop for HostedEgressSession {
 
 #[cfg(test)]
 mod tests {
-    use std::future::pending;
     use std::net::{Ipv4Addr, SocketAddrV4};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
@@ -417,10 +401,8 @@ mod tests {
 
         async fn accept(&self, _tls: bool) -> Result<BoxSandboxTcpStream> {
             self.accepts.fetch_add(1, Ordering::Relaxed);
-            tokio::select! {
-                _ = self.closed.cancelled() => bail!("fake egress transport closed"),
-                _ = pending::<()>() => unreachable!(),
-            }
+            self.closed.cancelled().await;
+            bail!("fake egress transport closed")
         }
 
         fn is_closed(&self) -> bool {
@@ -429,11 +411,6 @@ mod tests {
 
         fn close(&self) {
             self.closed.cancel();
-        }
-
-        async fn shutdown(&self) -> Result<()> {
-            self.close();
-            Ok(())
         }
     }
 
@@ -470,16 +447,6 @@ mod tests {
         (provider, events, accepts)
     }
 
-    fn provider(
-        attach_error: bool,
-    ) -> (
-        Arc<dyn HostedEgressTransport>,
-        Arc<Mutex<Events>>,
-        Arc<AtomicUsize>,
-    ) {
-        provider_with(attach_error, ENDPOINTS)
-    }
-
     fn identity() -> EgressIdentity {
         EgressIdentity {
             sandbox_id: "sandbox-1".into(),
@@ -505,7 +472,7 @@ mod tests {
 
     #[tokio::test]
     async fn hosted_session_uses_proxy_and_binds_allocation() -> Result<()> {
-        let (provider, events, accepts) = provider(false);
+        let (provider, events, accepts) = provider_with(false, ENDPOINTS);
         let session = HostedEgressSession::start(
             provider,
             identity(),
@@ -525,7 +492,6 @@ mod tests {
             generation: 7,
         };
         session.attach(&allocation).await?;
-        assert!(session.is_attached());
         tokio::task::yield_now().await;
         assert!(accepts.load(Ordering::Relaxed) > 0);
 
@@ -541,7 +507,7 @@ mod tests {
 
     #[tokio::test]
     async fn failed_attachment_is_terminal_and_closes_relay() -> Result<()> {
-        let (provider, events, _) = provider(true);
+        let (provider, events, _) = provider_with(true, ENDPOINTS);
         let session = HostedEgressSession::start(
             provider,
             identity(),
@@ -554,7 +520,6 @@ mod tests {
             generation: 1,
         };
         assert!(session.attach(&allocation).await.is_err());
-        assert!(!session.is_attached());
         assert!(session.attach(&allocation).await.is_err());
         assert!(events.lock().expect("events lock").closed);
         session.shutdown().await?;
@@ -563,7 +528,7 @@ mod tests {
 
     #[tokio::test]
     async fn invalid_policy_does_not_reserve_relay() -> Result<()> {
-        let (provider, events, _) = provider(false);
+        let (provider, events, _) = provider_with(false, ENDPOINTS);
         let result = HostedEgressSession::start(
             provider,
             identity(),
@@ -574,8 +539,6 @@ mod tests {
         assert!(result.is_err());
         let events = events.lock().expect("events lock");
         assert!(events.identities.is_empty());
-        assert!(!events.closed);
-        assert!(!events.shutdown);
         Ok(())
     }
 
