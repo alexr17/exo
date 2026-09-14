@@ -8,8 +8,8 @@ use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
 
 use super::{
-    EgressCredentialResolver, EgressIdentity, EgressProxy, EgressTransport, PublicUpstreamResolver,
-    State,
+    EgressCredentialResolver, EgressIdentity, EgressProxy, EgressProxyConfig, EgressTransport,
+    PublicUpstreamResolver,
 };
 use crate::{EgressPolicy, SandboxEgressProxy};
 
@@ -142,14 +142,13 @@ impl HostedEgressSession {
         policy: EgressPolicy,
         resolver: Option<Arc<dyn EgressCredentialResolver>>,
     ) -> Result<Self> {
-        let state = State::new(
+        let proxy_config = EgressProxyConfig::new(
             identity.clone(),
             policy,
             resolver,
             Arc::new(PublicUpstreamResolver),
         )?;
-        let mut allowed_hosts = state.hosts.iter().cloned().collect::<Vec<_>>();
-        allowed_hosts.sort_unstable();
+        let allowed_hosts = proxy_config.allowed_hosts();
         let relay = transport.reserve(&identity, &allowed_hosts).await?;
         let session_state = Arc::new(AtomicU8::new(SESSION_RESERVED));
         let changed = Arc::new(Notify::new());
@@ -158,12 +157,9 @@ impl HostedEgressSession {
             state: session_state.clone(),
             changed: changed.clone(),
         });
-        let proxy = match EgressProxy::start_with_transport(
-            gated_transport,
-            state,
-            CancellationToken::new(),
-        )
-        .await
+        let proxy = match proxy_config
+            .start(gated_transport, CancellationToken::new())
+            .await
         {
             Ok(proxy) => proxy,
             Err(error) => return Err(cleanup_hosted_relay(relay.as_ref(), error).await),

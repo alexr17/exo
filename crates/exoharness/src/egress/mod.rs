@@ -161,6 +161,38 @@ struct State {
     upstream: Arc<dyn UpstreamResolver>,
 }
 
+// Policy validation and proxy state are shared by native and hosted backends.
+// Backends create their transport after this step so they can use the
+// canonicalized host set to configure their network path.
+struct EgressProxyConfig {
+    state: State,
+}
+
+impl EgressProxyConfig {
+    fn new(
+        identity: EgressIdentity,
+        policy: EgressPolicy,
+        resolver: Option<Arc<dyn EgressCredentialResolver>>,
+        upstream: Arc<dyn UpstreamResolver>,
+    ) -> Result<Self> {
+        State::new(identity, policy, resolver, upstream).map(|state| Self { state })
+    }
+
+    fn allowed_hosts(&self) -> Vec<String> {
+        let mut hosts = self.state.hosts.iter().cloned().collect::<Vec<_>>();
+        hosts.sort_unstable();
+        hosts
+    }
+
+    async fn start(
+        self,
+        transport: Arc<dyn EgressTransport>,
+        cancel: CancellationToken,
+    ) -> Result<EgressProxy> {
+        EgressProxy::start_with_transport(transport, self.state, cancel).await
+    }
+}
+
 impl EgressProxy {
     async fn start_with_transport(
         transport: Arc<dyn EgressTransport>,
