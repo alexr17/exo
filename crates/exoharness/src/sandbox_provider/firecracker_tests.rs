@@ -958,6 +958,7 @@ impl DurableStopFixture {
                         one_shot: false,
                     })
                 },
+                async { panic!("successful acquisition must not terminate the sandbox") },
             )
             .await?;
         Ok(Self {

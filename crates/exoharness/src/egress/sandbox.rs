@@ -169,6 +169,7 @@ impl<H: ManagedSandboxHandle + 'static> EgressRuntime<H> {
         request: SandboxRequest,
         transport: T,
         build: B,
+        terminate: impl Future<Output = Result<()>>,
     ) -> Result<Arc<H>>
     where
         T: FnOnce(Vec<String>) -> TF,
@@ -239,22 +240,28 @@ impl<H: ManagedSandboxHandle + 'static> EgressRuntime<H> {
                 },
             );
         }
-        let handle = match build(Some(egress)).await {
-            Ok(handle) => Arc::new(handle),
-            Err(error) => {
-                if let Err(cleanup) = self.remove(&request.sandbox_id).await {
-                    tracing::debug!(%cleanup, "egress cleanup after failed acquisition");
-                }
-                return Err(error);
+        let result = async {
+            let handle = Arc::new(build(Some(egress.clone())).await?);
+            let mut sandboxes = self.sandboxes();
+            self.ensure_open()?;
+            sandboxes
+                .get_mut(&request.sandbox_id)
+                .expect("acquiring sandbox remains registered")
+                .handle = Some(handle.clone());
+            Ok(handle)
+        }
+        .await;
+        if result.is_err() {
+            self.sandboxes().remove(&request.sandbox_id);
+            egress.close();
+            if let Err(cleanup) = egress.proxy.transport.shutdown().await {
+                tracing::warn!(sandbox_id = %request.sandbox_id, %cleanup, "egress cleanup after failed acquisition");
             }
-        };
-        let mut sandboxes = self.sandboxes();
-        self.ensure_open()?;
-        sandboxes
-            .get_mut(&request.sandbox_id)
-            .expect("acquiring sandbox remains registered")
-            .handle = Some(handle.clone());
-        Ok(handle)
+            if let Err(cleanup) = terminate.await {
+                tracing::warn!(sandbox_id = %request.sandbox_id, %cleanup, "sandbox cleanup after failed acquisition");
+            }
+        }
+        result
     }
 
     async fn remove(&self, id: &str) -> Result<()> {
@@ -387,9 +394,56 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn failed_acquisition_terminates_the_vm_and_preserves_the_original_error() -> Result<()> {
+        for fail_termination in [false, true] {
+            let runtime = EgressRuntime::<Handle>::new(None, Arc::new(PublicUpstreamResolver));
+            let transport = Arc::new(Transport::default());
+            let running = AtomicBool::new(false);
+            let result = runtime
+                .acquire(
+                    request("one"),
+                    |_| async { Ok(transport.clone() as Arc<dyn EgressTransport>) },
+                    |_| async {
+                        running.store(true, Ordering::SeqCst);
+                        anyhow::bail!("TLS trust preparation failed")
+                    },
+                    async {
+                        assert!(transport.shutdown_completed.load(Ordering::SeqCst));
+                        assert!(runtime.sandboxes().is_empty());
+                        assert!(running.swap(false, Ordering::SeqCst));
+                        tokio::task::yield_now().await;
+                        ensure!(!fail_termination, "VM cleanup failed");
+                        Ok(())
+                    },
+                )
+                .await;
+            assert_eq!(
+                result.err().unwrap().to_string(),
+                "TLS trust preparation failed"
+            );
+            assert!(!running.load(Ordering::SeqCst));
+            assert!(transport.is_closed());
+            assert!(runtime.sandboxes().is_empty());
+            let replacement = Arc::new(Transport::default());
+            runtime
+                .acquire(
+                    request("one"),
+                    |_| async { Ok(replacement.clone() as Arc<dyn EgressTransport>) },
+                    |_| async { Ok(Handle(Some(true))) },
+                    async { panic!("successful acquisition must not terminate the sandbox") },
+                )
+                .await?;
+            assert!(!replacement.is_closed());
+            runtime.shutdown();
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn shutdown_closes_proxies_while_acquisition_is_pending() -> Result<()> {
         let runtime = EgressRuntime::<Handle>::new(None, Arc::new(PublicUpstreamResolver));
         let transport = Arc::new(Transport::default());
+        let terminated = AtomicBool::new(false);
         let (started, ready) = tokio::sync::oneshot::channel();
         let (release, released) = tokio::sync::oneshot::channel();
         let acquiring = runtime.acquire(
@@ -399,6 +453,11 @@ mod tests {
                 started.send(()).unwrap();
                 released.await?;
                 Ok(Handle(Some(true)))
+            },
+            async {
+                assert!(transport.shutdown_completed.load(Ordering::SeqCst));
+                terminated.store(true, Ordering::SeqCst);
+                Ok(())
             },
         );
         let shutdown = async {
@@ -410,6 +469,7 @@ mod tests {
         };
         let (result, ()) = tokio::join!(acquiring, shutdown);
         assert!(result.err().unwrap().to_string().contains("shut down"));
+        assert!(terminated.load(Ordering::SeqCst));
         Ok(())
     }
 
@@ -427,6 +487,7 @@ mod tests {
                 Ok(transport.clone() as Arc<dyn EgressTransport>)
             },
             |_| async { panic!("closed runtime must not start a sandbox") },
+            async { panic!("no sandbox was allocated") },
         );
         let shutdown = async {
             ready.await.unwrap();
@@ -454,6 +515,7 @@ mod tests {
                 released.await?;
                 Ok(Handle(Some(true)))
             },
+            async { panic!("successful acquisition must not terminate the sandbox") },
         );
         let terminating = async {
             ready.await?;
@@ -485,6 +547,7 @@ mod tests {
                     request("one"),
                     |_| async { Ok(old.clone() as Arc<dyn EgressTransport>) },
                     |_| async { Ok(Handle(running)) },
+                    async { panic!("successful acquisition must not terminate the sandbox") },
                 )
                 .await?;
             let mut changed = request("one");
@@ -498,6 +561,7 @@ mod tests {
                         Ok(new.clone() as Arc<dyn EgressTransport>)
                     },
                     |_| async { Ok(Handle(Some(true))) },
+                    async { panic!("successful acquisition must not terminate the sandbox") },
                 )
                 .await?;
             assert!(!Arc::ptr_eq(&retained, &replacement));

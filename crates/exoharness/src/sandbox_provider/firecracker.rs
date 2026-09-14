@@ -1363,6 +1363,7 @@ impl ManagedSandboxBackend for FirecrackerSandboxBackend {
     }
 
     async fn acquire(&self, request: SandboxRequest) -> Result<Arc<dyn ManagedSandboxHandle>> {
+        let terminate = self.shutdown_request(request.clone(), ShutdownMode::Terminate);
         self.egress
             .acquire(
                 request.clone(),
@@ -1382,6 +1383,7 @@ impl ManagedSandboxBackend for FirecrackerSandboxBackend {
                     }
                     Ok(handle)
                 },
+                terminate,
             )
             .await
             .map(|handle| crate::with_process_management(handle))

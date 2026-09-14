@@ -240,6 +240,7 @@ impl ManagedSandboxBackend for LimaFirecrackerSandboxBackend {
     }
 
     async fn acquire(&self, request: SandboxRequest) -> Result<Arc<dyn ManagedSandboxHandle>> {
+        let terminate = self.terminate_request(request.clone());
         self.egress
             .acquire(
                 request.clone(),
@@ -260,6 +261,7 @@ impl ManagedSandboxBackend for LimaFirecrackerSandboxBackend {
                     }
                     Ok(handle)
                 },
+                terminate,
             )
             .await
             .map(|handle| crate::with_process_management(handle))
@@ -1617,6 +1619,137 @@ mod egress_cleanup_tests {
     use crate::egress::EgressTransport;
 
     #[tokio::test]
+    async fn failed_lima_egress_setup_terminates_the_allocated_vm() -> Result<()> {
+        for fail_proxy_cleanup in [false, true] {
+            let (outgoing, mut receiver) = mpsc::channel(8);
+            let connection = Arc::new(LimaBridgeConnection {
+                outgoing,
+                state: Arc::new(LimaBridgeClientState::default()),
+                next_id: AtomicU64::new(1),
+            });
+            let backend = LimaFirecrackerSandboxBackend {
+                egress: Arc::new(EgressRuntime::new(None, Arc::new(PublicUpstreamResolver))),
+                config: FirecrackerConfig::default(),
+                bridge: Arc::new(LimaBridgeManager {
+                    limactl: "unused-limactl".into(),
+                    instance: "test".into(),
+                    bridge_binary: "unused-bridge".into(),
+                    build_bridge: false,
+                    connection: Mutex::new(Some(connection.clone())),
+                }),
+            };
+            let request = SandboxRequest {
+                sandbox_id: "failed-egress-setup".into(),
+                scope: None,
+                provider_state: None,
+                spec: crate::SandboxSpec {
+                    image: "test".into(),
+                    resources: Default::default(),
+                    mounts: vec![],
+                    durable_file_systems: vec![],
+                    default_workdir: "/workspace".into(),
+                    policy: crate::SandboxNetworkPolicy::Limited {
+                        allowed_hosts: vec!["api.test".into()],
+                    }
+                    .into(),
+                },
+                lifecycle: crate::SandboxLifecycleConfig {
+                    idle_ttl: Some(std::time::Duration::from_secs(60)),
+                },
+            };
+            let reply = async {
+                let mut operations = Vec::new();
+                while let Some(frame) = receiver.recv().await {
+                    let FirecrackerBridgeClientFrame::Request { id, request } = frame else {
+                        continue;
+                    };
+                    let response = match *request {
+                        FirecrackerBridgeRequest::EgressCreate { .. } => {
+                            operations.push("create");
+                            Ok(FirecrackerBridgeResponse::Egress {
+                                listener_id: "listener".into(),
+                                endpoints: crate::SandboxEgressProxy {
+                                    http: "192.0.2.1:80".parse()?,
+                                    https: "192.0.2.1:443".parse()?,
+                                    dns: "192.0.2.1:53".parse()?,
+                                },
+                            })
+                        }
+                        FirecrackerBridgeRequest::EgressAccept { .. } => continue,
+                        FirecrackerBridgeRequest::Acquire { request, .. } => {
+                            assert_eq!(request.sandbox_id, "failed-egress-setup");
+                            assert!(request.egress_proxy.is_some());
+                            operations.push("acquire");
+                            Ok(FirecrackerBridgeResponse::Handle {
+                                id: "firecracker:test-vm".into(),
+                                provider_state: None,
+                                effective_image: Some("/images/test.ext4".into()),
+                                source_ipv4: Some("192.0.2.2".parse()?),
+                            })
+                        }
+                        FirecrackerBridgeRequest::EgressBind { .. } => {
+                            operations.push("bind");
+                            Ok(FirecrackerBridgeResponse::Unit)
+                        }
+                        FirecrackerBridgeRequest::Exec { .. } => {
+                            operations.push("initialize");
+                            Err("TLS trust preparation failed".into())
+                        }
+                        FirecrackerBridgeRequest::EgressClose { listener_id } => {
+                            assert_eq!(listener_id, "listener");
+                            operations.push("close");
+                            if fail_proxy_cleanup {
+                                Err("listener cleanup failed".into())
+                            } else {
+                                Ok(FirecrackerBridgeResponse::Unit)
+                            }
+                        }
+                        FirecrackerBridgeRequest::Terminate { request, .. } => {
+                            assert_eq!(request.sandbox_id, "failed-egress-setup");
+                            operations.push("terminate");
+                            Ok(FirecrackerBridgeResponse::Unit)
+                        }
+                        request => bail!("unexpected bridge request: {request:?}"),
+                    };
+                    connection.state.handle_frame(
+                        FirecrackerBridgeServerFrame::Response {
+                            id,
+                            result: response,
+                        },
+                        &connection.outgoing,
+                    )?;
+                    if operations.last() == Some(&"terminate") {
+                        assert_eq!(
+                            operations,
+                            [
+                                "create",
+                                "acquire",
+                                "bind",
+                                "initialize",
+                                "close",
+                                "terminate"
+                            ]
+                        );
+                        return Ok::<_, anyhow::Error>(());
+                    }
+                }
+                bail!("bridge closed before VM termination")
+            };
+            let (result, replied) =
+                tokio::time::timeout(std::time::Duration::from_secs(1), async {
+                    tokio::join!(backend.acquire(request), reply)
+                })
+                .await?;
+            replied?;
+            assert_eq!(
+                result.err().unwrap().to_string(),
+                "TLS trust preparation failed"
+            );
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn concurrent_shutdown_and_drop_send_one_close_request() -> Result<()> {
         let (outgoing, mut receiver) = mpsc::channel(8);
         let connection = Arc::new(LimaBridgeConnection {
@@ -1721,6 +1854,7 @@ mod egress_cleanup_tests {
                         bridge,
                     })
                 },
+                async { panic!("successful acquisition must not terminate the sandbox") },
             )
             .await?;
         for response in [
