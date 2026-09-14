@@ -7,7 +7,9 @@
 
 use std::collections::{HashMap, HashSet};
 use std::convert::Infallible;
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+#[cfg(any(feature = "firecracker", test))]
+use std::net::Ipv4Addr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -38,7 +40,14 @@ use crate::{
 
 mod transport;
 pub use transport::{EgressTransport, LocalEgressTransport};
+mod hosted;
+pub use hosted::{
+    EgressAllocation, EgressGuestConfig, HostedEgressSession, HostedEgressTransport,
+    HostedEgressTransportSession,
+};
+#[cfg(feature = "firecracker")]
 mod sandbox;
+#[cfg(feature = "firecracker")]
 pub(crate) use sandbox::{EgressRuntime, SandboxEgress};
 
 const PLACEHOLDER_PREFIX: &str = "exo_egress_";
@@ -178,6 +187,7 @@ impl EgressProxy {
         })
     }
 
+    #[cfg(any(feature = "firecracker", test))]
     async fn bind_source(&self, source_ip: Ipv4Addr) -> Result<()> {
         self.transport.bind_source(source_ip).await
     }
@@ -197,6 +207,21 @@ impl EgressProxy {
     fn close(&self) {
         self.cancel.cancel();
         self.transport.close();
+    }
+
+    async fn join(&mut self) -> Result<()> {
+        (&mut self.task).await.context("joining egress proxy")?;
+        Ok(())
+    }
+
+    async fn join_with_timeout(&mut self) -> Result<()> {
+        match tokio::time::timeout(IO_TIMEOUT, self.join()).await {
+            Ok(result) => result,
+            Err(_) => {
+                self.task.abort();
+                Err(anyhow!("timed out joining egress proxy"))
+            }
+        }
     }
 }
 

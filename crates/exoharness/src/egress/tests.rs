@@ -18,8 +18,7 @@ const GIT_AUTHORIZATION: &str = "Basic eC1hY2Nlc3MtdG9rZW46Y2FuYXJ5LXYx";
 impl EgressProxy {
     async fn shutdown(mut self) -> Result<()> {
         self.close();
-        (&mut self.task).await.context("joining egress proxy")?;
-        Ok(())
+        self.join().await
     }
 }
 
@@ -842,6 +841,7 @@ fn dns_only_answers_exact_allowed_names() -> Result<()> {
     Ok(())
 }
 
+#[cfg(feature = "firecracker")]
 async fn guest(
     handle: &Arc<dyn crate::ManagedSandboxHandle>,
     proxy: &EgressProxy,
@@ -867,6 +867,7 @@ async fn guest(
     Ok(output.stdout)
 }
 
+#[cfg(feature = "firecracker")]
 #[tokio::test]
 #[ignore = "requires root, Linux/KVM, and the Exo Firecracker artifact bundle"]
 async fn firecracker_transparent_egress_live() -> Result<()> {
