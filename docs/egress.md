@@ -201,11 +201,14 @@ requests are also outside this initial implementation.
 
 ## Git over HTTPS
 
-Git read operations use ordinary smart HTTP:
+Git read and write operations use ordinary smart HTTP. A read uses
 `GET /repo.git/info/refs?service=git-upload-pack` followed by
-`POST /repo.git/git-upload-pack`. A binding's environment variable is injected
-as an `exo_egress_...` placeholder inside the sandbox. Configure it with Git's
-`http.<url>.extraHeader` setting:
+`POST /repo.git/git-upload-pack`; a write uses
+`GET /repo.git/info/refs?service=git-receive-pack` followed by
+`POST /repo.git/git-receive-pack`. These paths are forwarded when the caller's
+`EgressCredentialResolver` authorizes the destination and operation. A binding's
+environment variable is injected as an `exo_egress_...` placeholder inside the
+sandbox. Configure it with Git's `http.<url>.extraHeader` setting:
 
 ```bash
 git -C "$repo" config --local \
@@ -213,12 +216,13 @@ git -C "$repo" config --local \
   "Authorization: Basic $GIT_AUTH"
 ```
 
-The resolver returns a header-ready Base64 payload for `x-access-token:<token>`;
-the proxy substitutes it for the placeholder. `Git-Protocol: version=2` passes
-through unchanged, and `GIT_SSL_CAINFO` provides trust for the proxy's
-certificate. Redirects are not followed. Repository authorization remains the
-caller's responsibility; Exo only resolves the selected binding and forwards the
-request. This section covers Git reads only.
+For Basic authentication, the resolver returns the Base64 payload expected after
+`Basic`, and the proxy substitutes it for the placeholder. `Git-Protocol: version=2`
+passes through unchanged, and `GIT_SSL_CAINFO` provides trust for the
+proxy's certificate. Redirects are not followed. Request bodies over 8 MiB are
+rejected, so larger push packfiles need additional support. Repository and
+operation authorization remain the caller's responsibility; Exo resolves the
+selected binding and forwards only requests the resolver authorizes.
 
 ## Tests
 

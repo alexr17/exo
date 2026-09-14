@@ -10,7 +10,9 @@ use tokio::net::TcpListener;
 use tokio::sync::RwLock;
 
 const GIT_REFS_PATH: &str = "/authorized-repo.git/info/refs?service=git-upload-pack";
+const GIT_RECEIVE_REFS_PATH: &str = "/authorized-repo.git/info/refs?service=git-receive-pack";
 const GIT_UPLOAD_PACK_PATH: &str = "/authorized-repo.git/git-upload-pack";
+const GIT_RECEIVE_PACK_PATH: &str = "/authorized-repo.git/git-receive-pack";
 const GIT_AUTHORIZATION: &str = "Basic eC1hY2Nlc3MtdG9rZW46Y2FuYXJ5LXYx";
 
 impl EgressProxy {
@@ -89,13 +91,16 @@ impl EgressCredentialResolver for GitResolver {
         binding_name: &str,
         destination: &EgressDestination,
     ) -> Result<String> {
-        let read_path = (destination.method == Method::GET && destination.path == GIT_REFS_PATH)
-            || (destination.method == Method::POST && destination.path == GIT_UPLOAD_PACK_PATH);
+        let authorized_path = (destination.method == Method::GET
+            && (destination.path == GIT_REFS_PATH || destination.path == GIT_RECEIVE_REFS_PATH))
+            || (destination.method == Method::POST
+                && (destination.path == GIT_UPLOAD_PACK_PATH
+                    || destination.path == GIT_RECEIVE_PACK_PATH));
         ensure!(
             binding_name == "test-credential"
                 && destination.host == "api.test"
                 && destination.port == 443
-                && read_path,
+                && authorized_path,
             "git request is not authorized"
         );
         Ok("eC1hY2Nlc3MtdG9rZW46Y2FuYXJ5LXYx".into())
@@ -148,6 +153,16 @@ impl Upstream {
                                     && request.headers().get("git-protocol")
                                         .and_then(|h| h.to_str().ok()) == Some("version=2")
                                     && authorization == Some(GIT_AUTHORIZATION);
+                                let git_receive_pack = request.method() == Method::POST
+                                    && request.uri().path() == GIT_RECEIVE_PACK_PATH
+                                    && request.headers().get("git-protocol")
+                                        .and_then(|h| h.to_str().ok()) == Some("version=2")
+                                    && authorization == Some(GIT_AUTHORIZATION);
+                                let git_receive_refs = request.method() == Method::GET
+                                    && request.uri().path_and_query().is_some_and(|path| path.as_str() == GIT_RECEIVE_REFS_PATH)
+                                    && request.headers().get("git-protocol")
+                                        .and_then(|h| h.to_str().ok()) == Some("version=2")
+                                    && authorization == Some(GIT_AUTHORIZATION);
                                 let message = match authorization {
                                     Some("Bearer canary-v1") => "authenticated-v1",
                                     Some("canary-v1") => "raw-v1",
@@ -158,6 +173,8 @@ impl Upstream {
                                 };
                                 let body: BoxBody<Bytes, Infallible> = if git_refs {
                                     Full::new(Bytes::from_static(b"refs")).boxed()
+                                } else if git_receive_refs {
+                                    Full::new(Bytes::from_static(b"receive-refs")).boxed()
                                 } else if git_upload_pack {
                                     use futures::StreamExt;
                                     let initial = futures::stream::once(async {
@@ -168,6 +185,8 @@ impl Upstream {
                                         Ok(Frame::data(Bytes::from_static(b"pack-2")))
                                     });
                                     BodyExt::boxed(StreamBody::new(initial.chain(delayed)))
+                                } else if git_receive_pack {
+                                    Full::new(Bytes::from_static(b"receive-ok")).boxed()
                                 } else if request.uri().path() == "/sse" {
                                     use futures::StreamExt;
                                     let initial = futures::stream::once(async { Ok(Frame::data(Bytes::from_static(b"first\n"))) });
@@ -516,7 +535,7 @@ async fn proxy_substitutes_placeholders_in_header_formats() -> Result<()> {
 }
 
 #[tokio::test]
-async fn proxy_supports_read_only_git_smart_http() -> Result<()> {
+async fn proxy_supports_git_smart_http() -> Result<()> {
     use futures::StreamExt;
 
     let upstream = Upstream::start().await?;
@@ -552,6 +571,25 @@ async fn proxy_supports_read_only_git_smart_http() -> Result<()> {
     assert_eq!(second, Bytes::from_static(b"pack-2"));
     assert!(pack.next().await.is_none());
 
+    let receive_refs = proxy_client
+        .get(format!("https://api.test{GIT_RECEIVE_REFS_PATH}"))
+        .header("authorization", &authorization)
+        .header("git-protocol", "version=2")
+        .send()
+        .await?;
+    assert_eq!(receive_refs.status(), StatusCode::OK);
+    assert_eq!(receive_refs.text().await?, "receive-refs");
+
+    let receive = proxy_client
+        .post(format!("https://api.test{GIT_RECEIVE_PACK_PATH}"))
+        .header("authorization", &authorization)
+        .header("git-protocol", "version=2")
+        .body("request")
+        .send()
+        .await?;
+    assert_eq!(receive.status(), StatusCode::OK);
+    assert_eq!(receive.text().await?, "receive-ok");
+
     assert_eq!(
         proxy_client
             .get("https://api.test/ungranted-repo.git/info/refs?service=git-upload-pack")
@@ -563,8 +601,9 @@ async fn proxy_supports_read_only_git_smart_http() -> Result<()> {
     );
     assert_eq!(
         proxy_client
-            .post("https://api.test/authorized-repo.git/git-receive-pack")
+            .post("https://api.test/ungranted-repo.git/git-receive-pack")
             .header("authorization", &authorization)
+            .header("git-protocol", "version=2")
             .body("request")
             .send()
             .await?
