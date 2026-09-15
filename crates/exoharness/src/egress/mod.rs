@@ -108,11 +108,29 @@ pub struct EgressDestination {
     pub path: String,
 }
 
+#[derive(Debug, Default)]
+pub struct EgressRequestContext {
+    /// Names of credential bindings whose placeholders appeared in the request.
+    /// This contains no credential values.
+    pub credential_bindings: Vec<String>,
+}
+
 /// Looks up a binding for this sandbox's agent/thread on every use. The local
 /// implementation reads Exo's encrypted store; a hosted implementation can use
 /// its own vault and authorization. Only the proxy receives the returned value.
 #[async_trait]
 pub trait EgressCredentialResolver: Send + Sync {
+    /// Optionally authorize the normalized request before Exo resolves or
+    /// forwards any credential. The default preserves host-only policies.
+    async fn authorize(
+        &self,
+        _identity: &EgressIdentity,
+        _destination: &EgressDestination,
+        _context: &EgressRequestContext,
+    ) -> Result<()> {
+        Ok(())
+    }
+
     async fn resolve(
         &self,
         identity: &EgressIdentity,
@@ -334,7 +352,8 @@ impl State {
     ) -> Result<Response<ProxyBody>> {
         let (destination, url) = self.destination(&request, sni)?;
         let mut headers = request.headers().clone();
-        self.validate_credentials(&headers, &destination.host, sni.is_some())?;
+        let context = self.validate_credentials(&headers, &destination.host, sni.is_some())?;
+        self.authorize(&destination, &context).await?;
         strip_hop_headers(&mut headers)?;
         let client = self.client(&destination.host, destination.port).await?;
         self.substitute_credentials(&mut headers, &destination)
@@ -411,7 +430,13 @@ impl State {
         Ok((destination, url))
     }
 
-    fn validate_credentials(&self, headers: &HeaderMap, host: &str, tls: bool) -> Result<()> {
+    fn validate_credentials(
+        &self,
+        headers: &HeaderMap,
+        host: &str,
+        tls: bool,
+    ) -> Result<EgressRequestContext> {
+        let mut credential_bindings = HashSet::new();
         for (header, value) in headers {
             if !contains_placeholder(value.as_bytes()) {
                 continue;
@@ -427,8 +452,9 @@ impl State {
             );
             let mut unresolved = value.to_str()?.to_owned();
             for binding in &self.bindings {
-                if binding.permits_header(host) {
+                if binding.permits_header(host) && unresolved.contains(&binding.placeholder) {
                     unresolved = unresolved.replace(&binding.placeholder, "");
+                    credential_bindings.insert(binding.config.name.clone());
                 }
             }
             ensure!(
@@ -436,7 +462,28 @@ impl State {
                 "credential placeholder does not match this request"
             );
         }
-        Ok(())
+        let mut credential_bindings = credential_bindings.into_iter().collect::<Vec<_>>();
+        credential_bindings.sort_unstable();
+        Ok(EgressRequestContext {
+            credential_bindings,
+        })
+    }
+
+    async fn authorize(
+        &self,
+        destination: &EgressDestination,
+        context: &EgressRequestContext,
+    ) -> Result<()> {
+        let Some(resolver) = &self.resolver else {
+            return Ok(());
+        };
+        let result = tokio::time::timeout(
+            IO_TIMEOUT,
+            resolver.authorize(&self.identity, destination, context),
+        )
+        .await
+        .map_err(|_| anyhow!("request authorization timed out"))?;
+        result.map_err(|_| anyhow!("request is not authorized"))
     }
 
     async fn substitute_credentials(

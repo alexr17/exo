@@ -83,6 +83,13 @@ Binding names are scoped references, not storage IDs. Two threads can both
 request `notion` and resolve different secrets. Implement `EgressCredentialResolver`:
 
 ```rust
+async fn authorize(
+    &self,
+    identity: &EgressIdentity,
+    destination: &EgressDestination,
+    context: &EgressRequestContext,
+) -> anyhow::Result<()>;
+
 async fn resolve(
     &self,
     identity: &EgressIdentity,
@@ -96,9 +103,12 @@ resolved again, so rotation and revocation take effect without replacing the
 sandbox. Identity includes the sandbox ID and agent/thread scope; destination
 includes the host, port, method, and normalized path/query. A vault adapter can
 pin a binding to a vault/secret reference per thread and enforce its stored
-destination restrictions. The local CLI resolver assumes a single user owns the
-secret store; hosted resolvers must supply their own authorization. Resolver
-failures are sanitized before returning them to the guest.
+destination restrictions. `authorize` runs before forwarding even when no
+placeholder is present; its context lists only the credential binding names used
+by the request and never contains credential values. The local CLI resolver uses
+the default allow-all authorization; hosted resolvers must supply their own
+authorization. Resolver failures are sanitized before returning them to the
+guest.
 
 ```rust
 let backend = firecracker_backend_with_credentials(config, lima, resolver).await?;
@@ -228,8 +238,9 @@ For Basic authentication, the resolver returns the Base64 payload expected after
 `Basic`, and the proxy substitutes it for the placeholder. `Git-Protocol: version=2`
 passes through unchanged, and `GIT_SSL_CAINFO` provides trust for the
 proxy's certificate. Redirects are not followed. Request bodies over 8 MiB are
-rejected, so larger push packfiles need additional support. Repository and
-operation authorization remain the caller's responsibility; Exo resolves the
+rejected, so larger push packfiles need additional support. The resolver's
+`authorize` method must reject repositories and operations outside the caller's
+grant, including requests that omit the credential placeholder; Exo resolves the
 selected binding and forwards only requests the resolver authorizes.
 
 ## Tests
