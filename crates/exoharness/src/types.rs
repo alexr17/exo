@@ -472,6 +472,8 @@ pub enum EventData {
     },
     Error {
         message: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        metadata: Option<serde_json::Value>,
     },
     ArtifactWritten {
         artifact_id: ArtifactId,
@@ -1412,6 +1414,29 @@ mod tests {
             serde_json::json!(source_thread_id)
         );
         assert!(value.get("source_conversation_id").is_none());
+    }
+
+    #[test]
+    fn error_event_serializes_optional_metadata() {
+        let event = EventData::Error {
+            message: "request failed".to_string(),
+            metadata: Some(serde_json::json!({"source": "example"})),
+        };
+        assert_eq!(
+            serde_json::to_value(event).expect("event should serialize"),
+            serde_json::json!({
+                "type": "error",
+                "message": "request failed",
+                "metadata": {"source": "example"},
+            })
+        );
+
+        let legacy: EventData = serde_json::from_value(serde_json::json!({
+            "type": "error",
+            "message": "request failed",
+        }))
+        .expect("event without metadata should parse");
+        assert!(matches!(legacy, EventData::Error { metadata: None, .. }));
     }
 
     #[test]
