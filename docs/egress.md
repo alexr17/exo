@@ -4,11 +4,10 @@ Sandbox policy is part of `SandboxSpec`. Each backend enforces the policy when
 it acquires, attaches, or restores a sandbox, before returning a usable handle.
 Unsupported policies fail with an error identifying the unsupported field.
 
-The existing `firecracker` build feature includes the proxy; there is no
-separate egress feature to enable. Firecracker implements credential
-substitution with a transparent HTTP/HTTPS proxy. Programs receive placeholder
-environment variables; the proxy resolves credentials outside the VM and
-substitutes them on authorized requests.
+The `egress` build feature includes the transparent HTTP/HTTPS proxy without a
+VM backend. The `firecracker` feature includes `egress` and adds VM integration.
+Programs receive placeholder environment variables; the proxy resolves
+credentials outside the VM and substitutes them on authorized requests.
 
 On macOS, TLS and credential resolution run in the native Exo process. The
 existing Lima bridge carries streams and DNS configuration, without receiving
@@ -167,6 +166,12 @@ the listeners inside the Lima bridge. Low-level callers that already own their
 proxy can pass endpoints to
 `FirecrackerSandboxBackend::acquire_request(FirecrackerRequest)`.
 
+`EgressProxy::start(identity, policy, resolver, transport, cancel)` starts the
+proxy using the existing `EgressPolicy` and an `EgressTransport`. It exposes
+listener endpoints, the CA certificate, and placeholder environment variables.
+This is a transparent proxy; an explicit `HTTPS_PROXY`/CONNECT listener is not
+implemented here.
+
 A hosted backend can implement `ManagedSandboxBackend::acquire` itself: choose
 the sandbox node, establish an authenticated relay to the credential service,
 install routing, and only then return a handle. No proxy hooks are required on
@@ -232,6 +237,12 @@ operation authorization remain the caller's responsibility; Exo resolves the
 selected binding and forwards only requests the resolver authorizes.
 
 ## Tests
+
+Run the shared proxy tests without a VM backend:
+
+```bash
+cargo test -p exoharness --features egress --lib egress::
+```
 
 With the [Firecracker artifacts](../support/firecracker/README.md) installed:
 

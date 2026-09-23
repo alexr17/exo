@@ -38,7 +38,9 @@ use crate::{
 
 mod transport;
 pub use transport::{EgressTransport, LocalEgressTransport};
+#[cfg(feature = "firecracker")]
 mod sandbox;
+#[cfg(feature = "firecracker")]
 pub(crate) use sandbox::{EgressRuntime, SandboxEgress};
 
 const PLACEHOLDER_PREFIX: &str = "exo_egress_";
@@ -114,7 +116,7 @@ pub trait EgressCredentialResolver: Send + Sync {
 
 // Owns one sandbox's TLS server, placeholders, and active proxy connections.
 // It does not create VMs or decide where credentials are stored.
-struct EgressProxy {
+pub struct EgressProxy {
     endpoints: SandboxEgressProxy,
     transport: Arc<dyn EgressTransport>,
     ca_pem: String,
@@ -152,6 +154,17 @@ struct State {
 }
 
 impl EgressProxy {
+    pub async fn start(
+        identity: EgressIdentity,
+        policy: EgressPolicy,
+        resolver: Option<Arc<dyn EgressCredentialResolver>>,
+        transport: Arc<dyn EgressTransport>,
+        cancel: CancellationToken,
+    ) -> Result<Self> {
+        let state = State::new(identity, policy, resolver, Arc::new(PublicUpstreamResolver))?;
+        Self::start_with_transport(transport, state, cancel).await
+    }
+
     async fn start_with_transport(
         transport: Arc<dyn EgressTransport>,
         state: State,
@@ -177,23 +190,23 @@ impl EgressProxy {
         })
     }
 
-    async fn bind_source(&self, source_ip: Ipv4Addr) -> Result<()> {
+    pub async fn bind_source(&self, source_ip: Ipv4Addr) -> Result<()> {
         self.transport.bind_source(source_ip).await
     }
 
-    fn endpoints(&self) -> SandboxEgressProxy {
+    pub fn endpoints(&self) -> SandboxEgressProxy {
         self.endpoints
     }
 
-    fn ca_pem(&self) -> &str {
+    pub fn ca_pem(&self) -> &str {
         &self.ca_pem
     }
 
-    fn environment(&self) -> &HashMap<String, String> {
+    pub fn environment(&self) -> &HashMap<String, String> {
         &self.environment
     }
 
-    fn close(&self) {
+    pub fn close(&self) {
         self.cancel.cancel();
         self.transport.close();
     }

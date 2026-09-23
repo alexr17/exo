@@ -864,6 +864,7 @@ fn dns_only_answers_exact_allowed_names() -> Result<()> {
     Ok(())
 }
 
+#[cfg(feature = "firecracker")]
 async fn guest(
     handle: &Arc<dyn crate::ManagedSandboxHandle>,
     proxy: &EgressProxy,
@@ -889,6 +890,7 @@ async fn guest(
     Ok(output.stdout)
 }
 
+#[cfg(feature = "firecracker")]
 #[tokio::test]
 #[ignore = "requires root, Linux/KVM, and the Exo Firecracker artifact bundle"]
 async fn firecracker_transparent_egress_live() -> Result<()> {
@@ -1380,4 +1382,26 @@ async fn quiet_response_stream_survives_past_the_request_io_timeout() -> Result<
     assert_eq!(response.chunk().await?.unwrap(), "last\n");
     assert!(response.chunk().await?.is_none());
     proxy.shutdown().await
+}
+
+#[tokio::test]
+async fn proxy_starts_without_a_sandbox_backend() -> Result<()> {
+    let transport = Arc::new(
+        LocalEgressTransport::bind(host_ip()?, &HashSet::from(["api.test".into()])).await?,
+    );
+    let proxy = EgressProxy::start(
+        identity("hosted"),
+        policy(),
+        Some(TestResolver::new()),
+        transport.clone(),
+        CancellationToken::new(),
+    )
+    .await?;
+    proxy.bind_source(host_ip()?).await?;
+    assert_eq!(proxy.endpoints(), transport.endpoints());
+    assert!(proxy.ca_pem().contains("BEGIN CERTIFICATE"));
+    assert!(proxy.environment()["TEST_API_KEY"].starts_with(PLACEHOLDER_PREFIX));
+    proxy.shutdown().await?;
+    assert!(transport.is_closed());
+    Ok(())
 }
