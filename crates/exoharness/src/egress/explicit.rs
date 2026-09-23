@@ -1,14 +1,84 @@
 use super::*;
 use base64::Engine;
+use tokio::io::AsyncWriteExt;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::task::JoinSet;
+
+const MAX_PROXY_PASSWORD_BYTES: usize = 8 * 1024;
+
+/// Authenticates Basic proxy credentials and selects the sandbox session.
+/// Return `None` to reject access (407) or an error if authorization is unavailable (503).
+#[async_trait]
+pub trait ProxyAuthorizer: Send + Sync {
+    async fn authorize(
+        &self,
+        username: &str,
+        password: &str,
+        host: &str,
+    ) -> Result<Option<ProxySession>>;
+}
+
+/// Authorized sandbox policy, TLS configuration, and credential placeholders.
+#[derive(Clone)]
+pub struct ProxySession {
+    pub(super) state: Arc<State>,
+    pub(super) tls: TlsAcceptor,
+}
+
+impl ProxySession {
+    pub fn new(
+        identity: EgressIdentity,
+        policy: EgressPolicy,
+        resolver: Option<Arc<dyn EgressCredentialResolver>>,
+        tls: TlsAcceptor,
+        placeholders: &HashMap<String, String>,
+    ) -> Result<Self> {
+        Ok(Self {
+            state: Arc::new(State::new_with_placeholders(
+                identity,
+                policy,
+                resolver,
+                Arc::new(PublicUpstreamResolver),
+                Some(placeholders),
+            )?),
+            tls,
+        })
+    }
+}
+
+struct FixedAuthorizer {
+    password: String,
+    session: ProxySession,
+}
+
+#[async_trait]
+impl ProxyAuthorizer for FixedAuthorizer {
+    async fn authorize(
+        &self,
+        username: &str,
+        password: &str,
+        _host: &str,
+    ) -> Result<Option<ProxySession>> {
+        Ok((username == "exo" && password == self.password).then(|| self.session.clone()))
+    }
+}
+
+/// Serves CONNECT requests, selecting a session through the authorizer before
+/// accepting each tunnel. The session's policy is enforced before forwarding.
+pub async fn serve_connect_proxy(
+    listener: TcpListener,
+    authorizer: Arc<dyn ProxyAuthorizer>,
+    shutdown: CancellationToken,
+) -> Result<()> {
+    serve_explicit(listener, authorizer, shutdown, false, MAX_CONNECTIONS).await
+}
 
 pub struct ExplicitProxy {
     pub environment: HashMap<String, String>,
     pub ca_pem: String,
     pub ca_path: String,
     cancel: CancellationToken,
-    task: tokio::task::JoinHandle<()>,
+    task: tokio::task::JoinHandle<Result<()>>,
 }
 
 impl ExplicitProxy {
@@ -29,10 +99,6 @@ impl ExplicitProxy {
         advertised_host: &str,
     ) -> Result<Self> {
         let password = uuid::Uuid::new_v4().simple().to_string();
-        let authorization = HeaderValue::from_str(&format!(
-            "Basic {}",
-            base64::engine::general_purpose::STANDARD.encode(format!("exo:{password}"))
-        ))?;
         let proxy_url = format!(
             "http://exo:{password}@{advertised_host}:{}",
             listener.local_addr()?.port()
@@ -69,10 +135,16 @@ impl ExplicitProxy {
         let cancel = CancellationToken::new();
         let task = tokio::spawn(serve_explicit(
             listener,
-            Arc::new(state),
-            tls,
-            authorization,
+            Arc::new(FixedAuthorizer {
+                password,
+                session: ProxySession {
+                    state: Arc::new(state),
+                    tls,
+                },
+            }),
             cancel.clone(),
+            true,
+            MAX_CONNECTIONS,
         ));
         Ok(Self {
             environment,
@@ -109,15 +181,15 @@ impl Drop for ExplicitProxy {
     }
 }
 
-async fn serve_explicit(
+pub(super) async fn serve_explicit(
     listener: TcpListener,
-    state: Arc<State>,
-    tls: TlsAcceptor,
-    authorization: HeaderValue,
+    authorizer: Arc<dyn ProxyAuthorizer>,
     cancel: CancellationToken,
-) {
+    allow_http: bool,
+    max_connections: usize,
+) -> Result<()> {
     let mut tasks = JoinSet::new();
-    let permits = Arc::new(Semaphore::new(MAX_CONNECTIONS));
+    let permits = Arc::new(Semaphore::new(max_connections));
     loop {
         tokio::select! {
             _ = cancel.cancelled() => break,
@@ -127,7 +199,7 @@ async fn serve_explicit(
                 }
             }
             incoming = listener.accept() => {
-                let (stream, _) = match incoming {
+                let (mut stream, _) = match incoming {
                     Ok(incoming) => incoming,
                     Err(error) => {
                         tracing::debug!(%error, "explicit egress accept failed; retrying");
@@ -137,13 +209,29 @@ async fn serve_explicit(
                         continue;
                     }
                 };
-                let Ok(permit) = permits.clone().try_acquire_owned() else { continue; };
-                tasks.spawn(explicit_connection(stream, state.clone(), tls.clone(), authorization.clone(), cancel.clone(), Arc::new(permit)));
+                let Ok(permit) = permits.clone().try_acquire_owned() else {
+                    tokio::select! {
+                        _ = cancel.cancelled() => break,
+                        result = tokio::time::timeout(Duration::from_secs(1), async {
+                            stream.write_all(
+                                b"HTTP/1.1 503 Service Unavailable\r\nConnection: close\r\nContent-Length: 0\r\n\r\n",
+                            ).await?;
+                            stream.shutdown().await
+                        }) => {
+                            if !matches!(result, Ok(Ok(()))) {
+                                tracing::debug!("could not send proxy overload response");
+                            }
+                        }
+                    }
+                    continue;
+                };
+                tasks.spawn(explicit_connection(stream, authorizer.clone(), cancel.clone(), Arc::new(permit), allow_http));
             }
         }
     }
     cancel.cancel();
     tasks.shutdown().await;
+    Ok(())
 }
 
 fn error_response(status: StatusCode) -> Response<ProxyBody> {
@@ -155,50 +243,33 @@ fn error_response(status: StatusCode) -> Response<ProxyBody> {
     let mut response = Response::new(body);
     *response.status_mut() = status;
     response
+        .headers_mut()
+        .insert(CONNECTION, HeaderValue::from_static("close"));
+    if status == StatusCode::PROXY_AUTHENTICATION_REQUIRED {
+        response.headers_mut().insert(
+            "proxy-authenticate",
+            HeaderValue::from_static("Basic realm=\"Exo\""),
+        );
+    }
+    response
 }
 
 async fn explicit_connection(
     stream: TcpStream,
-    state: Arc<State>,
-    tls: TlsAcceptor,
-    authorization: HeaderValue,
+    authorizer: Arc<dyn ProxyAuthorizer>,
     cancel: CancellationToken,
     permit: Arc<tokio::sync::OwnedSemaphorePermit>,
+    allow_http: bool,
 ) -> Result<()> {
     let connection_cancel = cancel.clone();
-    let service = service_fn(move |mut request: Request<Incoming>| {
-        let state = state.clone();
-        let tls = tls.clone();
+    let service = service_fn(move |request: Request<Incoming>| {
+        let authorizer = authorizer.clone();
         let cancel = cancel.clone();
         let permit = permit.clone();
-        let authorized = request
-            .headers()
-            .get_all("proxy-authorization")
-            .iter()
-            .count()
-            == 1
-            && request.headers().get("proxy-authorization") == Some(&authorization);
         async move {
-            if !authorized {
-                let mut response = error_response(StatusCode::PROXY_AUTHENTICATION_REQUIRED);
-                response.headers_mut().insert(
-                    "proxy-authenticate",
-                    HeaderValue::from_static("Basic realm=\"Exo\""),
-                );
-                return Ok::<_, Infallible>(response);
-            }
-            let result = if request.method() == Method::CONNECT {
-                connect(&mut request, state, tls, cancel, permit).await
-            } else {
-                forward_http(request, state).await
-            };
-            Ok(match result {
-                Ok(response) => response,
-                Err(error) => {
-                    tracing::debug!(%error, "explicit egress request failed");
-                    error_response(StatusCode::BAD_GATEWAY)
-                }
-            })
+            Ok::<_, Infallible>(
+                proxy_request(request, authorizer, cancel, permit, allow_http).await,
+            )
         }
     });
     tokio::select! {
@@ -210,6 +281,132 @@ async fn explicit_connection(
                 Ok(())
             }
     }
+}
+
+async fn proxy_request(
+    mut request: Request<Incoming>,
+    authorizer: Arc<dyn ProxyAuthorizer>,
+    cancel: CancellationToken,
+    permit: Arc<tokio::sync::OwnedSemaphorePermit>,
+    allow_http: bool,
+) -> Response<ProxyBody> {
+    let host = if request.method() == Method::CONNECT {
+        match connect_target(&request) {
+            Ok(host) => host,
+            Err(_) => return error_response(StatusCode::BAD_REQUEST),
+        }
+    } else {
+        if !allow_http {
+            return error_response(StatusCode::METHOD_NOT_ALLOWED);
+        }
+        match request.uri().host().map(canonical_egress_host).transpose() {
+            Ok(Some(host)) => host,
+            _ => return error_response(StatusCode::BAD_REQUEST),
+        }
+    };
+    let (username, password) = match basic_credentials(request.headers()) {
+        Ok(credentials) => credentials,
+        Err(_) => return error_response(StatusCode::PROXY_AUTHENTICATION_REQUIRED),
+    };
+    let session = match tokio::time::timeout(
+        CONNECT_TIMEOUT,
+        authorizer.authorize(&username, &password, &host),
+    )
+    .await
+    {
+        Ok(Ok(Some(session))) => session,
+        Ok(Ok(None)) => return error_response(StatusCode::PROXY_AUTHENTICATION_REQUIRED),
+        Ok(Err(_)) | Err(_) => return error_response(StatusCode::SERVICE_UNAVAILABLE),
+    };
+    let result = if request.method() == Method::CONNECT {
+        connect(&mut request, session.state, session.tls, cancel, permit).await
+    } else {
+        forward_http(request, session.state).await
+    };
+    match result {
+        Ok(response) => response,
+        Err(error) => {
+            tracing::debug!(%error, "explicit egress request failed");
+            error_response(StatusCode::BAD_GATEWAY)
+        }
+    }
+}
+
+fn connect_target(request: &Request<Incoming>) -> Result<String> {
+    let uri = request.uri();
+    ensure!(
+        uri.scheme().is_none() && uri.path().is_empty() && uri.query().is_none(),
+        "CONNECT requires authority form"
+    );
+    let authority = uri.authority().context("CONNECT authority is required")?;
+    ensure!(
+        !authority.as_str().contains('@') && authority.port_u16() == Some(443),
+        "CONNECT requires a host and port 443"
+    );
+    let host = canonical_egress_host(authority.host())?;
+    ensure!(
+        request.headers().get_all(HOST).iter().count() == 1,
+        "exactly one Host header is required"
+    );
+    let header: hyper::http::uri::Authority = request
+        .headers()
+        .get(HOST)
+        .context("Host header is required")?
+        .to_str()?
+        .parse()?;
+    ensure!(
+        !header.as_str().contains('@')
+            && header.port_u16().is_none_or(|port| port == 443)
+            && canonical_egress_host(header.host())? == host,
+        "Host must match CONNECT authority",
+    );
+    ensure!(
+        request.headers().get_all("content-length").iter().count() <= 1
+            && request
+                .headers()
+                .get("content-length")
+                .is_none_or(|length| length == "0")
+            && !request.headers().contains_key("transfer-encoding"),
+        "CONNECT body is not supported",
+    );
+    Ok(host)
+}
+
+fn basic_credentials(headers: &HeaderMap) -> Result<(String, String)> {
+    ensure!(
+        headers.get_all("proxy-authorization").iter().count() == 1,
+        "exactly one Proxy-Authorization header is required"
+    );
+    let mut fields = headers
+        .get("proxy-authorization")
+        .context("Proxy-Authorization is required")?
+        .to_str()?
+        .split_whitespace();
+    ensure!(
+        fields
+            .next()
+            .is_some_and(|scheme| scheme.eq_ignore_ascii_case("Basic")),
+        "Basic proxy authentication is required"
+    );
+    let encoded = fields.next().context("Basic credentials are required")?;
+    ensure!(
+        fields.next().is_none() && encoded.len() <= MAX_PROXY_PASSWORD_BYTES * 2,
+        "invalid Basic credentials"
+    );
+    let decoded = base64::engine::general_purpose::STANDARD.decode(encoded)?;
+    let decoded = std::str::from_utf8(&decoded)?;
+    let (username, password) = decoded
+        .split_once(':')
+        .context("Basic credentials require username and password")?;
+    ensure!(
+        !username.is_empty()
+            && username.bytes().all(|byte| byte.is_ascii_graphic())
+            && !password.is_empty()
+            && password.len() <= MAX_PROXY_PASSWORD_BYTES
+            && password.bytes().all(|byte| byte.is_ascii_graphic()),
+        "invalid Basic credentials",
+    );
+    Ok((username.to_owned(), password.to_owned()))
 }
 
 async fn forward_http(

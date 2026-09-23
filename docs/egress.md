@@ -184,11 +184,25 @@ intercepts credential hosts and tunnels other HTTPS destinations unchanged.
 Proxy configuration alone does not prevent clients from bypassing the proxy;
 network isolation requires separate sandbox routing or firewall enforcement.
 
-For a hosted listener, the caller authenticates CONNECT and passes its
-post-200 stream to `serve_https_connect` with the CONNECT authority, a TLS
-acceptor trusted by the sandbox, and the sandbox's stable placeholders. Exo
-checks CONNECT host, SNI, and HTTP Host before forwarding. The caller owns the
-listener and TLS material.
+For a shared hosted listener, call
+`serve_connect_proxy(listener, authorizer, shutdown)`. Implement `ProxyAuthorizer`
+to validate the Basic proxy username/password and return the authorized
+`ProxySession` for the requested host. Construct sessions with
+`ProxySession::new(identity, policy, resolver, tls, placeholders)` using TLS
+material trusted by that sandbox and its stable credential placeholders. Sessions
+can be cached and cloned; authentication still runs for every CONNECT request.
+Returning `None` rejects authentication with 407; errors or a 10-second timeout
+return 503. Exo validates CONNECT framing, enforces the session's egress policy,
+and owns connection limits, upgrades, and shutdown. The hosted listener accepts
+only CONNECT on port 443. `ExplicitProxy` uses the same server with a fixed
+sandbox session and generated password, and also accepts plain HTTP requests.
+
+Callers that already own an authenticated CONNECT listener can instead pass its
+post-200 stream to `serve_https_connect` with the CONNECT authority, TLS acceptor,
+and stable placeholders. Exo checks CONNECT host, SNI, and HTTP Host before
+forwarding. Session selection and credential resolution are separate: the
+hosted caller must authenticate access to the sandbox even when the request
+uses no credential.
 
 A hosted backend can implement `ManagedSandboxBackend::acquire` itself: choose
 the sandbox node, establish an authenticated relay to the credential service,

@@ -38,7 +38,7 @@ use crate::{
 };
 
 mod explicit;
-pub use explicit::ExplicitProxy;
+pub use explicit::{ExplicitProxy, ProxyAuthorizer, ProxySession, serve_connect_proxy};
 mod transport;
 pub use transport::{EgressTransport, LocalEgressTransport};
 #[cfg(feature = "firecracker")]
@@ -236,15 +236,9 @@ pub async fn serve_https_connect<T>(
 where
     T: AsyncRead + AsyncWrite + Send + Unpin + 'static,
 {
-    let state = State::new_with_placeholders(
-        identity,
-        policy,
-        resolver,
-        Arc::new(PublicUpstreamResolver),
-        Some(placeholders),
-    )?;
-    let host = state.connect_host(connect_authority)?;
-    https_connection(stream, tls, Arc::new(state), Some(&host)).await
+    let session = ProxySession::new(identity, policy, resolver, tls, placeholders)?;
+    let host = session.state.connect_host(connect_authority)?;
+    https_connection(stream, session.tls, session.state, Some(&host)).await
 }
 
 impl Drop for EgressProxy {

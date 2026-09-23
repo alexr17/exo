@@ -1693,3 +1693,262 @@ async fn explicit_proxy_enforces_host_policy_without_credentials() -> Result<()>
     proxy.close();
     Ok(())
 }
+
+struct TestProxyAuthorizer {
+    sessions: HashMap<String, ProxySession>,
+    ca_pem: String,
+    calls: AtomicUsize,
+}
+
+impl TestProxyAuthorizer {
+    fn new(upstream: &Upstream) -> Result<Arc<Self>> {
+        let (ca_pem, tls) = tls_configuration(vec!["api.test".into(), "public.test".into()])?;
+        let mut sessions = HashMap::new();
+        for (name, value) in [("first", "canary-v1"), ("second", "canary-v2")] {
+            let resolver = Arc::new(TestResolver {
+                value: RwLock::new(Some(value.into())),
+                uses: RwLock::new(Vec::new()),
+            });
+            let state = State::new(
+                identity(name),
+                policy(),
+                Some(resolver),
+                Arc::new(upstream.config.clone()),
+            )?;
+            sessions.insert(
+                name.into(),
+                ProxySession {
+                    state: Arc::new(state),
+                    tls: tls.clone(),
+                },
+            );
+        }
+        Ok(Arc::new(Self {
+            sessions,
+            ca_pem,
+            calls: AtomicUsize::new(0),
+        }))
+    }
+}
+
+#[async_trait]
+impl ProxyAuthorizer for TestProxyAuthorizer {
+    async fn authorize(
+        &self,
+        username: &str,
+        password: &str,
+        _host: &str,
+    ) -> Result<Option<ProxySession>> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        if password == "unavailable" {
+            bail!("authorization service unavailable");
+        }
+        if password == "slow" {
+            return std::future::pending().await;
+        }
+        Ok((username == "sandbox")
+            .then(|| self.sessions.get(password).cloned())
+            .flatten())
+    }
+}
+
+async fn send_proxy_request(
+    address: SocketAddr,
+    request: &str,
+) -> Result<(tokio::net::TcpStream, String)> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let mut stream = tokio::net::TcpStream::connect(address).await?;
+    stream.write_all(request.as_bytes()).await?;
+    let response = tokio::time::timeout(IO_TIMEOUT, async {
+        let mut response = Vec::new();
+        loop {
+            response.push(stream.read_u8().await?);
+            if response.ends_with(b"\r\n\r\n") {
+                return Ok::<_, anyhow::Error>(String::from_utf8(response)?);
+            }
+        }
+    })
+    .await??;
+    Ok((stream, response))
+}
+
+fn proxy_connect_request(password: &str) -> String {
+    format!(
+        "CONNECT api.test:443 HTTP/1.1\r\nHost: api.test:443\r\nProxy-Authorization: Basic {}\r\n\r\n",
+        base64::engine::general_purpose::STANDARD.encode(format!("sandbox:{password}")),
+    )
+}
+
+#[tokio::test]
+async fn hosted_proxy_selects_and_isolates_sessions_on_one_listener() -> Result<()> {
+    let upstream = Upstream::start().await?;
+    let authorizer = TestProxyAuthorizer::new(&upstream)?;
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
+    let address = listener.local_addr()?;
+    let cancel = CancellationToken::new();
+    let server = tokio::spawn(serve_connect_proxy(
+        listener,
+        authorizer.clone(),
+        cancel.clone(),
+    ));
+    let valid = proxy_connect_request("first");
+    for request in [
+        valid.replacen("CONNECT api.test:443", "CONNECT api.test:8443", 1),
+        valid.replace("Host: api.test:443", "Host: public.test:443"),
+        valid.replace(
+            "Host: api.test:443",
+            "Host: api.test:443\r\nHost: api.test:443",
+        ),
+        valid.replacen("CONNECT api.test:443", "CONNECT user@api.test:443", 1),
+        valid.replacen("CONNECT api.test:443", "CONNECT https://api.test:443/", 1),
+        valid.replace(
+            "Host: api.test:443",
+            "Host: api.test:443\r\nContent-Length: 1",
+        ),
+        valid.replace(
+            "Host: api.test:443",
+            "Host: api.test:443\r\nTransfer-Encoding: chunked",
+        ),
+    ] {
+        let (_, response) = send_proxy_request(address, &request).await?;
+        assert!(response.starts_with("HTTP/1.1 400"), "{response}");
+    }
+    for request in [
+        "CONNECT api.test:443 HTTP/1.1\r\nHost: api.test:443\r\n\r\n",
+        "CONNECT api.test:443 HTTP/1.1\r\nHost: api.test:443\r\nProxy-Authorization: Basic bad\r\n\r\n",
+    ] {
+        let (_, response) = send_proxy_request(address, request).await?;
+        assert!(response.starts_with("HTTP/1.1 407"), "{response}");
+    }
+    let (_, response) = send_proxy_request(
+        address,
+        "GET http://api.test/ HTTP/1.1\r\nHost: api.test\r\n\r\n",
+    )
+    .await?;
+    assert!(response.starts_with("HTTP/1.1 405"));
+    assert_eq!(authorizer.calls.load(Ordering::SeqCst), 0);
+    for (password, status) in [("unknown", "407"), ("unavailable", "503")] {
+        let (_, response) = send_proxy_request(address, &proxy_connect_request(password)).await?;
+        assert!(
+            response.starts_with(&format!("HTTP/1.1 {status}")),
+            "{response}"
+        );
+    }
+    assert_eq!(upstream.connections.load(Ordering::SeqCst), 0);
+    for (password, expected) in [
+        ("first", "authenticated-v1"),
+        ("second", "authenticated-v2"),
+    ] {
+        let client = reqwest::Client::builder()
+            .proxy(reqwest::Proxy::all(format!(
+                "http://sandbox:{password}@{address}"
+            ))?)
+            .add_root_certificate(reqwest::Certificate::from_pem(
+                authorizer.ca_pem.as_bytes(),
+            )?)
+            .timeout(Duration::from_secs(5))
+            .build()?;
+        let session = &authorizer.sessions[password];
+        assert_eq!(
+            client
+                .get("https://api.test/auth")
+                .bearer_auth(&session.state.bindings[0].placeholder)
+                .send()
+                .await?
+                .text()
+                .await?,
+            expected,
+        );
+        let other = &authorizer.sessions[if password == "first" {
+            "second"
+        } else {
+            "first"
+        }];
+        assert_eq!(
+            client
+                .get("https://api.test/auth")
+                .bearer_auth(&other.state.bindings[0].placeholder)
+                .send()
+                .await?
+                .status(),
+            StatusCode::BAD_GATEWAY,
+        );
+        assert!(
+            client
+                .get("https://blocked.test/auth")
+                .send()
+                .await
+                .is_err()
+        );
+    }
+    cancel.cancel();
+    server.await??;
+    Ok(())
+}
+
+#[tokio::test]
+async fn hosted_proxy_bounds_connections_and_cancels_pending_tls() -> Result<()> {
+    use tokio::io::AsyncReadExt;
+    let upstream = Upstream::start().await?;
+    let authorizer = TestProxyAuthorizer::new(&upstream)?;
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
+    let address = listener.local_addr()?;
+    let cancel = CancellationToken::new();
+    let server = tokio::spawn(explicit::serve_explicit(
+        listener,
+        authorizer,
+        cancel.clone(),
+        false,
+        1,
+    ));
+    let (mut active, response) =
+        send_proxy_request(address, &proxy_connect_request("first")).await?;
+    assert!(response.starts_with("HTTP/1.1 200"));
+    let (_, overloaded) = send_proxy_request(address, &proxy_connect_request("first"))
+        .await
+        .context("reading overload response")?;
+    assert!(overloaded.starts_with("HTTP/1.1 503"));
+    cancel.cancel();
+    tokio::time::timeout(Duration::from_secs(1), server).await???;
+    let mut byte = [0];
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(1), active.read(&mut byte))
+            .await?
+            .context("checking tunnel closed")?,
+        0
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn hosted_proxy_times_out_authorization_before_accepting_a_tunnel() -> Result<()> {
+    let upstream = Upstream::start().await?;
+    let authorizer = TestProxyAuthorizer::new(&upstream)?;
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
+    let address = listener.local_addr()?;
+    let cancel = CancellationToken::new();
+    let server = tokio::spawn(serve_connect_proxy(
+        listener,
+        authorizer.clone(),
+        cancel.clone(),
+    ));
+    let client =
+        tokio::spawn(
+            async move { send_proxy_request(address, &proxy_connect_request("slow")).await },
+        );
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while authorizer.calls.load(Ordering::SeqCst) == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await?;
+    tokio::time::pause();
+    tokio::time::advance(CONNECT_TIMEOUT + Duration::from_secs(1)).await;
+    tokio::time::resume();
+    let (_, response) = client.await??;
+    assert!(response.starts_with("HTTP/1.1 503"));
+    assert_eq!(upstream.connections.load(Ordering::SeqCst), 0);
+    cancel.cancel();
+    server.await??;
+    Ok(())
+}
