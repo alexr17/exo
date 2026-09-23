@@ -256,7 +256,7 @@ fn accepts_peer(source: &AtomicU32, peer: SocketAddr) -> bool {
 }
 
 // Back off briefly after a listener error. Returns false once cancelled.
-async fn retry_after_error(cancel: &CancellationToken) -> bool {
+pub(super) async fn retry_after_error(cancel: &CancellationToken) -> bool {
     tokio::select! {
         _ = cancel.cancelled() => false,
         _ = tokio::time::sleep(ACCEPT_RETRY_DELAY) => true,

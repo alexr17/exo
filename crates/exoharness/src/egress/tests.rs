@@ -868,15 +868,16 @@ fn credential_networking_is_independent_of_environment_networking() -> Result<()
     );
     let mut config = policy();
     config.networking = SandboxNetworkPolicy::Unrestricted;
-    assert!(
-        State::new(
-            identity("one"),
-            config,
-            Some(TestResolver::new()),
-            Arc::new(PublicUpstreamResolver)
-        )
-        .is_err()
-    );
+    let state = State::new(
+        identity("one"),
+        config,
+        Some(TestResolver::new()),
+        Arc::new(PublicUpstreamResolver),
+    )?;
+    assert!(state.unrestricted);
+    assert!(state.hosts.contains("api.test"));
+    assert!(!state.hosts.contains("public.test"));
+    assert!(!state.bindings[0].permits_header("public.test"));
     Ok(())
 }
 
@@ -1478,5 +1479,217 @@ async fn proxy_starts_without_a_sandbox_backend() -> Result<()> {
     assert!(proxy.environment()["TEST_API_KEY"].starts_with(PLACEHOLDER_PREFIX));
     proxy.shutdown().await?;
     assert!(transport.is_closed());
+    Ok(())
+}
+
+#[tokio::test]
+async fn explicit_proxy_reuses_credential_substitution_and_isolates_sandboxes() -> Result<()> {
+    use super::explicit::ExplicitProxy;
+    let upstream = Upstream::start().await?;
+    let resolver = TestResolver::new();
+    let mut config = policy();
+    config.networking = SandboxNetworkPolicy::Unrestricted;
+    let start = |id| {
+        State::new(
+            identity(id),
+            config.clone(),
+            Some(resolver.clone()),
+            Arc::new(upstream.config.clone()),
+        )
+    };
+    let first = ExplicitProxy::with_listener(
+        start("first")?,
+        TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?,
+        "127.0.0.1",
+    )
+    .await?;
+    let second = ExplicitProxy::with_listener(
+        start("second")?,
+        TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?,
+        "127.0.0.1",
+    )
+    .await?;
+    let port = url::Url::parse(&first.environment["HTTPS_PROXY"])?
+        .port()
+        .unwrap();
+    assert!(
+        tokio::net::TcpStream::connect((host_ip()?, port))
+            .await
+            .is_err()
+    );
+    let client = reqwest::Client::builder()
+        .proxy(reqwest::Proxy::all(&first.environment["HTTPS_PROXY"])?)
+        .add_root_certificate(reqwest::Certificate::from_pem(first.ca_pem.as_bytes())?)
+        .add_root_certificate(reqwest::Certificate::from_pem(
+            upstream.config.ca_pem.as_bytes(),
+        )?)
+        .redirect(reqwest::redirect::Policy::none())
+        .timeout(Duration::from_secs(45))
+        .build()?;
+    let placeholder = &first.environment["TEST_API_KEY"];
+    assert!(placeholder.starts_with(PLACEHOLDER_PREFIX));
+    for (value, expected) in [
+        ("canary-v1", "authenticated-v1"),
+        ("canary-v2", "authenticated-v2"),
+    ] {
+        *resolver.value.write().await = Some(value.into());
+        assert_eq!(
+            client
+                .get("https://api.test/auth")
+                .bearer_auth(placeholder)
+                .send()
+                .await?
+                .text()
+                .await?,
+            expected
+        );
+    }
+    assert_eq!(
+        client
+            .get("https://api.test/auth")
+            .bearer_auth(&second.environment["TEST_API_KEY"])
+            .send()
+            .await?
+            .status(),
+        StatusCode::BAD_GATEWAY
+    );
+    assert_eq!(
+        client
+            .get("https://public.test/auth")
+            .send()
+            .await?
+            .text()
+            .await?,
+        "anonymous"
+    );
+    let mut stream = client.get("https://api.test/sse").send().await?;
+    assert_eq!(
+        stream
+            .chunk()
+            .await?
+            .context("missing first stream event")?
+            .as_ref(),
+        b"first\n"
+    );
+    tokio::time::pause();
+    tokio::time::advance(IO_TIMEOUT + Duration::from_secs(1)).await;
+    tokio::time::resume();
+    assert_eq!(
+        stream
+            .chunk()
+            .await?
+            .context("missing last stream event")?
+            .as_ref(),
+        b"last\n"
+    );
+    *resolver.value.write().await = Some("canary-v1".into());
+    assert_eq!(
+        client
+            .get(format!("https://api.test{GIT_REFS_PATH}"))
+            .basic_auth("x-access-token", Some(placeholder))
+            .header("git-protocol", "version=2")
+            .send()
+            .await?
+            .text()
+            .await?,
+        "refs"
+    );
+    assert_eq!(
+        client
+            .get("https://api.test/auth")
+            .basic_auth("x-access-token", Some(&second.environment["TEST_API_KEY"]))
+            .send()
+            .await?
+            .status(),
+        StatusCode::BAD_GATEWAY
+    );
+    assert_eq!(
+        client
+            .get("http://api.test/auth")
+            .basic_auth("x-access-token", Some(placeholder))
+            .send()
+            .await?
+            .status(),
+        StatusCode::BAD_GATEWAY
+    );
+    *resolver.value.write().await = None;
+    let rejected = client
+        .get("https://api.test/auth")
+        .bearer_auth(placeholder)
+        .send()
+        .await?;
+    assert_eq!(rejected.status(), StatusCode::BAD_GATEWAY);
+    assert!(!rejected.text().await?.contains("canary"));
+    assert!(
+        resolver
+            .uses
+            .read()
+            .await
+            .iter()
+            .all(|(sandbox, _, host)| sandbox == "first" && host == "api.test")
+    );
+    let mut unauthenticated = url::Url::parse(&first.environment["HTTPS_PROXY"])?;
+    unauthenticated.set_username("").unwrap();
+    unauthenticated.set_password(None).unwrap();
+    let denied = reqwest::Client::builder()
+        .proxy(reqwest::Proxy::all(unauthenticated.as_str())?)
+        .build()?;
+    assert_eq!(
+        denied.get("http://api.test/auth").send().await?.status(),
+        StatusCode::PROXY_AUTHENTICATION_REQUIRED
+    );
+    assert!(denied.get("https://api.test/auth").send().await.is_err());
+    first.close();
+    assert!(client.get("https://api.test/auth").send().await.is_err());
+    second.close();
+    Ok(())
+}
+
+#[tokio::test]
+async fn explicit_proxy_enforces_host_policy_without_credentials() -> Result<()> {
+    let upstream = Upstream::start().await?;
+    let resolver = TestResolver::new();
+    let state = State::new(
+        identity("limited"),
+        policy(),
+        Some(resolver.clone()),
+        Arc::new(upstream.config.clone()),
+    )?;
+    let proxy = ExplicitProxy::with_listener(
+        state,
+        TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?,
+        "127.0.0.1",
+    )
+    .await?;
+    let client = reqwest::Client::builder()
+        .proxy(reqwest::Proxy::all(&proxy.environment["HTTPS_PROXY"])?)
+        .add_root_certificate(reqwest::Certificate::from_pem(proxy.ca_pem.as_bytes())?)
+        .timeout(Duration::from_secs(5))
+        .build()?;
+    for url in ["https://blocked.test/auth", "https://api.test:8443/auth"] {
+        assert!(client.get(url).send().await.is_err(), "{url}");
+    }
+    assert_eq!(upstream.connections.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        client
+            .get("https://api.test/auth")
+            .header(HOST, "public.test")
+            .send()
+            .await?
+            .status(),
+        StatusCode::BAD_GATEWAY
+    );
+    assert_eq!(upstream.connections.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        client
+            .get("https://public.test/auth")
+            .send()
+            .await?
+            .text()
+            .await?,
+        "anonymous"
+    );
+    assert!(resolver.uses.read().await.is_empty());
+    proxy.close();
     Ok(())
 }

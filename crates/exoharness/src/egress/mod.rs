@@ -13,6 +13,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, ensure};
 use async_trait::async_trait;
+use base64::Engine;
 use bytes::Bytes;
 use futures::TryStreamExt;
 use http_body_util::{BodyExt, Full, Limited, StreamBody, combinators::BoxBody};
@@ -36,6 +37,8 @@ use crate::{
     SandboxNetworkPolicy,
 };
 
+mod explicit;
+pub use explicit::ExplicitProxy;
 mod transport;
 pub use transport::{EgressTransport, LocalEgressTransport};
 #[cfg(feature = "firecracker")]
@@ -147,6 +150,7 @@ struct PooledClient {
 struct State {
     clients: Mutex<HashMap<(String, u16), PooledClient>>,
     hosts: HashSet<String>,
+    unrestricted: bool,
     bindings: Vec<Binding>,
     identity: EgressIdentity,
     resolver: Option<Arc<dyn EgressCredentialResolver>>,
@@ -170,6 +174,10 @@ impl EgressProxy {
         state: State,
         cancel: CancellationToken,
     ) -> Result<Self> {
+        ensure!(
+            !state.unrestricted,
+            "transparent egress proxy requires limited networking"
+        );
         let endpoints = transport.endpoints();
         endpoints.validate()?;
         let (ca_pem, tls) = tls_configuration(state.hosts.iter().cloned().collect())?;
@@ -228,12 +236,6 @@ pub async fn serve_https_connect<T>(
 where
     T: AsyncRead + AsyncWrite + Send + Unpin + 'static,
 {
-    let authority: hyper::http::uri::Authority = connect_authority.parse()?;
-    ensure!(
-        authority.port_u16() == Some(443),
-        "CONNECT requires port 443"
-    );
-    let host = canonical_egress_host(authority.host())?;
     let state = State::new_with_placeholders(
         identity,
         policy,
@@ -241,7 +243,7 @@ where
         Arc::new(PublicUpstreamResolver),
         Some(placeholders),
     )?;
-    ensure!(state.hosts.contains(&host), "host is not allowed");
+    let host = state.connect_host(connect_authority)?;
     https_connection(stream, tls, Arc::new(state), Some(&host)).await
 }
 
@@ -273,12 +275,24 @@ impl State {
             !identity.sandbox_id.is_empty(),
             "egress identity is required"
         );
-        let SandboxNetworkPolicy::Limited { allowed_hosts } = policy.networking else {
-            return Err(anyhow!(
-                "egress proxy currently requires limited networking; unrestricted passthrough is not implemented"
-            ));
+        let unrestricted = policy.networking == SandboxNetworkPolicy::Unrestricted;
+        let hosts = match &policy.networking {
+            SandboxNetworkPolicy::Limited { allowed_hosts } => {
+                canonical_egress_hosts(allowed_hosts)?
+            }
+            SandboxNetworkPolicy::Unrestricted => {
+                policy
+                    .credentials
+                    .iter()
+                    .try_fold(HashSet::new(), |mut hosts, binding| {
+                        let CredentialNetworkPolicy::Limited { allowed_hosts } =
+                            &binding.networking;
+                        hosts.extend(canonical_egress_hosts(allowed_hosts)?);
+                        Ok::<_, anyhow::Error>(hosts)
+                    })?
+            }
+            SandboxNetworkPolicy::Disabled => anyhow::bail!("credential proxy requires networking"),
         };
-        let hosts = canonical_egress_hosts(&allowed_hosts)?;
         ensure!(
             policy.credentials.is_empty() || resolver.is_some(),
             "credential substitution requires an egress credential resolver"
@@ -340,11 +354,26 @@ impl State {
         Ok(Self {
             clients: Mutex::new(HashMap::new()),
             hosts,
+            unrestricted,
             bindings,
             identity,
             resolver,
             upstream,
         })
+    }
+
+    fn connect_host(&self, authority: &str) -> Result<String> {
+        let authority: hyper::http::uri::Authority = authority.parse()?;
+        ensure!(
+            authority.port_u16() == Some(443),
+            "CONNECT requires port 443"
+        );
+        let host = canonical_egress_host(authority.host())?;
+        ensure!(
+            self.unrestricted || self.hosts.contains(&host),
+            "host is not allowed"
+        );
+        Ok(host)
     }
 
     async fn forward(
@@ -390,7 +419,10 @@ impl State {
             .to_str()?
             .parse()?;
         let host = canonical_egress_host(authority.host())?;
-        ensure!(self.hosts.contains(&host), "host is not allowed");
+        ensure!(
+            self.unrestricted || self.hosts.contains(&host),
+            "host is not allowed"
+        );
         let port = if sni.is_some() { 443 } else { 80 };
         ensure!(
             authority.port_u16().unwrap_or(port) == port,
@@ -433,7 +465,12 @@ impl State {
 
     fn validate_credentials(&self, headers: &HeaderMap, host: &str, tls: bool) -> Result<()> {
         for (header, value) in headers {
-            if !contains_placeholder(value.as_bytes()) {
+            let basic = basic_credential_placeholder(header, value)?;
+            let value = basic
+                .as_deref()
+                .map(str::as_bytes)
+                .unwrap_or(value.as_bytes());
+            if !contains_placeholder(value) {
                 continue;
             }
             ensure!(tls, "credential substitution requires HTTPS");
@@ -445,7 +482,7 @@ impl State {
                 headers.get_all(header).iter().count() == 1,
                 "duplicate credential header"
             );
-            let mut unresolved = value.to_str()?.to_owned();
+            let mut unresolved = std::str::from_utf8(value)?.to_owned();
             for binding in &self.bindings {
                 if binding.permits_header(host) {
                     unresolved = unresolved.replace(&binding.placeholder, "");
@@ -464,11 +501,16 @@ impl State {
         headers: &mut HeaderMap,
         destination: &EgressDestination,
     ) -> Result<()> {
-        for (_, header_value) in headers.iter_mut() {
-            if !contains_placeholder(header_value.as_bytes()) {
+        for (header, header_value) in headers.iter_mut() {
+            let basic = basic_credential_placeholder(header, header_value)?;
+            if basic.is_none() && !contains_placeholder(header_value.as_bytes()) {
                 continue;
             }
-            let mut replacement = header_value.to_str()?.to_owned();
+            let encode_basic = basic.is_some();
+            let mut replacement = match basic {
+                Some(value) => value,
+                None => header_value.to_str()?.to_owned(),
+            };
             for binding in &self.bindings {
                 if !binding.permits_header(&destination.host)
                     || !replacement.contains(&binding.placeholder)
@@ -485,6 +527,12 @@ impl State {
                 .await?
                 .map_err(|_| anyhow!("credential is unavailable or not authorized"))?;
                 replacement = replacement.replace(&binding.placeholder, &value);
+            }
+            if encode_basic {
+                replacement = format!(
+                    "Basic {}",
+                    base64::engine::general_purpose::STANDARD.encode(replacement)
+                );
             }
             let mut value = HeaderValue::from_str(&replacement)
                 .map_err(|_| anyhow!("credential cannot be used in an HTTP header"))?;
@@ -527,6 +575,24 @@ impl State {
         );
         Ok(client)
     }
+}
+
+fn basic_credential_placeholder(
+    header: &HeaderName,
+    value: &HeaderValue,
+) -> Result<Option<String>> {
+    if header == hyper::header::AUTHORIZATION
+        && let Ok(value) = value.to_str()
+        && let Some((scheme, encoded)) = value.split_once(' ')
+        && scheme.eq_ignore_ascii_case("basic")
+        && let Ok(decoded) = base64::engine::general_purpose::STANDARD.decode(encoded)
+        && contains_placeholder(&decoded)
+    {
+        return Ok(Some(
+            String::from_utf8(decoded).context("invalid Basic credential")?,
+        ));
+    }
+    Ok(None)
 }
 
 fn contains_placeholder(value: &[u8]) -> bool {
