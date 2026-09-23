@@ -4,8 +4,8 @@ Sandbox policy is part of `SandboxSpec`. Each backend enforces the policy when
 it acquires, attaches, or restores a sandbox, before returning a usable handle.
 Unsupported policies fail with an error identifying the unsupported field.
 
-The existing `firecracker` build feature includes the proxy; there is no
-separate egress feature to enable. Firecracker implements credential
+The `egress` build feature exposes request-level forwarding without a VM or
+listener. The `firecracker` feature includes it. Firecracker implements credential
 substitution with a transparent HTTP/HTTPS proxy. Programs receive placeholder
 environment variables; the proxy resolves credentials outside the VM and
 substitutes them on authorized requests.
@@ -82,6 +82,13 @@ Binding names are scoped references, not storage IDs. Two threads can both
 request `notion` and resolve different secrets. Implement `EgressCredentialResolver`:
 
 ```rust
+async fn authorize(
+    &self,
+    identity: &EgressIdentity,
+    destination: &EgressDestination,
+    context: &EgressRequestContext,
+) -> anyhow::Result<()>;
+
 async fn resolve(
     &self,
     identity: &EgressIdentity,
@@ -93,10 +100,12 @@ async fn resolve(
 The caller selects bindings in `request.spec.policy.credentials`. Each use is
 resolved again, so rotation and revocation take effect without replacing the
 sandbox. Identity includes the sandbox ID and agent/thread scope; destination
-includes the host, port, method, and normalized path/query. A vault adapter can
+includes the scheme, host, port, method, and normalized path/query. `authorize`
+runs on that rewritten destination before DNS resolution or forwarding, even
+without a credential placeholder. A vault adapter can
 pin a binding to a vault/secret reference per thread and enforce its stored
 destination restrictions. The local CLI resolver assumes a single user owns the
-secret store; hosted resolvers must supply their own authorization. Resolver
+secret store; request-level callers supply their own authorization. Resolver
 failures are sanitized before returning them to the guest.
 
 ```rust
@@ -167,13 +176,30 @@ the listeners inside the Lima bridge. Low-level callers that already own their
 proxy can pass endpoints to
 `FirecrackerSandboxBackend::acquire_request(FirecrackerRequest)`.
 
-A hosted backend can implement `ManagedSandboxBackend::acquire` itself: choose
-the sandbox node, establish an authenticated relay to the credential service,
-install routing, and only then return a handle. No proxy hooks are required on
-the shared sandbox traits. The credential service can run inside Loop while
-the node relays opaque streams. Relay authorization must bind the stream to the
-sandbox allocation and its generation; raw source-IP binding is only suitable
-before NAT on a trusted local host. The production relay is not implemented here.
+## Request-level forwarding
+
+`EgressEngine::forward_http_request` accepts a sandbox identity, an
+`EgressRequestPolicy`, a resolver, an inbound URL, the name of the capability
+header, and an HTTP request on every call. The caller validates its capability
+before calling Exo. Exo removes that header before forwarding. No listener,
+network interception, or process-local sandbox session is required.
+
+`EgressRequestPolicy.rules` contains `EgressRule` values with an inbound URL
+prefix, an upstream URL prefix, and allowed HTTP methods. The engine matches a
+path segment boundary, appends the remaining path and query to the upstream
+prefix, and authorizes the resulting destination. An empty method list permits
+all methods except CONNECT. For example, a rule from
+`https://gateway.example/service` to `https://api.example/v1` maps
+`/service/items?id=1` to `/v1/items?id=1`. Adding another service is another
+rule, without a forwarding handler. Both sides require exact DNS hostnames and
+standard HTTP or HTTPS ports.
+
+`EgressRequestPolicy.credentials` supplies placeholders and their destination
+allowlists for that request. The resolver supplies the actual credential only
+after authorization. Request bodies are binary-safe and bounded to 8 MiB;
+responses stream. The engine pins public IPv4 DNS answers, verifies upstream
+TLS, and does not follow redirects. The Firecracker listener applies its
+existing exact-host policy as identity rules and calls the same engine.
 
 ## Other backends
 
@@ -233,10 +259,17 @@ selected binding and forwards only requests the resolver authorizes.
 
 ## Tests
 
-With the [Firecracker artifacts](../support/firecracker/README.md) installed:
+Run the request engine and listener unit tests:
 
 ```bash
-cargo test -p exoharness --features firecracker --lib
+cargo check -p exoharness --features egress --lib
+cargo test -p exoharness --features firecracker --lib egress::tests::
+```
+
+With the [Firecracker artifacts](../support/firecracker/README.md) installed,
+run the VM smoke tests:
+
+```bash
 bash support/firecracker/egress-smoke.sh
 bash support/firecracker/managed-egress-smoke.sh
 ```

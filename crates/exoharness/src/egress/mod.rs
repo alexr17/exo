@@ -1,13 +1,15 @@
-//! HTTP/TLS handling and credential substitution outside the sandbox.
+//! Request-level egress authorization, rewriting, and forwarding.
 //!
-//! `EgressTransport` supplies connections from the sandbox network. This module
-//! checks destinations, resolves credentials, and forwards requests. `sandbox`
-//! coordinates proxy setup with Firecracker/Lima acquisition; `transport`
-//! implements the listeners and DNS service on the VM host.
+//! The public engine accepts an identity and policy on every request. With the
+//! `firecracker` feature, `EgressTransport` supplies sandbox connections and
+//! the listener passes their requests through the same engine.
 
 use std::collections::{HashMap, HashSet};
+#[cfg(feature = "firecracker")]
 use std::convert::Infallible;
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+#[cfg(feature = "firecracker")]
+use std::net::Ipv4Addr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -15,37 +17,57 @@ use anyhow::{Context, Result, anyhow, ensure};
 use async_trait::async_trait;
 use bytes::Bytes;
 use futures::TryStreamExt;
-use http_body_util::{BodyExt, Full, Limited, StreamBody, combinators::BoxBody};
-use hyper::body::{Frame, Incoming};
+#[cfg(feature = "firecracker")]
+use http_body_util::Full;
+use http_body_util::{BodyExt, Limited, StreamBody, combinators::BoxBody};
+#[cfg(feature = "firecracker")]
+use hyper::StatusCode;
+#[cfg(feature = "firecracker")]
+use hyper::body::Incoming;
+use hyper::body::{Body, Frame};
 use hyper::header::{CONNECTION, HOST, HeaderMap, HeaderName, HeaderValue};
+#[cfg(feature = "firecracker")]
 use hyper::service::service_fn;
-use hyper::{Method, Request, Response, StatusCode};
+use hyper::{Method, Request, Response};
+#[cfg(feature = "firecracker")]
 use hyper_util::rt::{TokioIo, TokioTimer};
+#[cfg(feature = "firecracker")]
 use rcgen::{BasicConstraints, CertificateParams, DnType, IsCa, Issuer, KeyPair, KeyUsagePurpose};
+#[cfg(feature = "firecracker")]
 use tokio::io::{AsyncRead, AsyncWrite};
+#[cfg(feature = "firecracker")]
 use tokio::sync::Semaphore;
+#[cfg(feature = "firecracker")]
 use tokio::task::JoinSet;
+#[cfg(feature = "firecracker")]
 use tokio_rustls::TlsAcceptor;
+#[cfg(feature = "firecracker")]
 use tokio_rustls::rustls::{self, ServerConfig, pki_types::PrivatePkcs8KeyDer};
+#[cfg(feature = "firecracker")]
 use tokio_util::sync::CancellationToken;
 
 use crate::types::{canonical_egress_host, canonical_egress_hosts};
 
-use crate::{
-    CredentialNetworkPolicy, EgressCredentialBinding, EgressPolicy, SandboxEgressProxy,
-    SandboxNetworkPolicy,
-};
+use crate::{CredentialNetworkPolicy, EgressCredentialBinding};
+#[cfg(feature = "firecracker")]
+use crate::{EgressPolicy, SandboxEgressProxy, SandboxNetworkPolicy};
 
+#[cfg(feature = "firecracker")]
 mod transport;
+#[cfg(feature = "firecracker")]
 pub use transport::{EgressTransport, LocalEgressTransport};
+#[cfg(feature = "firecracker")]
 mod sandbox;
+#[cfg(feature = "firecracker")]
 pub(crate) use sandbox::{EgressRuntime, SandboxEgress};
 
 const PLACEHOLDER_PREFIX: &str = "exo_egress_";
 const IO_TIMEOUT: Duration = Duration::from_secs(30);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_REQUEST_BODY: usize = 8 * 1024 * 1024;
+#[cfg(feature = "firecracker")]
 const HTTP_BUFFER_SIZE: usize = 32 * 1024;
+#[cfg(feature = "firecracker")]
 const MAX_CONNECTIONS: usize = 128;
 
 pub(crate) struct ResolvedUpstream {
@@ -82,8 +104,9 @@ impl UpstreamResolver for PublicUpstreamResolver {
     }
 }
 
+pub type EgressResponseBody = BoxBody<Bytes, Box<dyn std::error::Error + Send + Sync>>;
 type ProxyError = Box<dyn std::error::Error + Send + Sync>;
-type ProxyBody = BoxBody<Bytes, ProxyError>;
+type ProxyBody = EgressResponseBody;
 
 #[derive(Debug, Clone)]
 pub struct EgressIdentity {
@@ -93,10 +116,42 @@ pub struct EgressIdentity {
 
 #[derive(Debug)]
 pub struct EgressDestination {
+    pub scheme: String,
     pub host: String,
     pub port: u16,
     pub method: Method,
     pub path: String,
+}
+
+/// A URL prefix and method mapping. A matching suffix and query are carried
+/// from the inbound URL to the upstream URL. An empty method list permits every
+/// method except CONNECT, which the engine always rejects.
+#[derive(Debug, Clone)]
+pub struct EgressRule {
+    pub inbound_prefix: String,
+    pub upstream_prefix: String,
+    pub methods: Vec<Method>,
+}
+
+/// A credential placeholder supplied with a request policy. The binding's
+/// destination allowlist is checked after URL rewriting.
+#[derive(Debug, Clone)]
+pub struct EgressRequestCredential {
+    pub binding: EgressCredentialBinding,
+    pub placeholder: String,
+}
+
+/// Per-request rules and placeholders. The caller supplies this alongside the
+/// sandbox identity; Exo does not retain an HTTP caller's sandbox session.
+#[derive(Debug, Clone)]
+pub struct EgressRequestPolicy {
+    pub rules: Vec<EgressRule>,
+    pub credentials: Vec<EgressRequestCredential>,
+}
+
+#[derive(Debug, Default)]
+pub struct EgressRequestContext {
+    pub credential_bindings: Vec<String>,
 }
 
 /// Looks up a binding for this sandbox's agent/thread on every use. The local
@@ -104,6 +159,15 @@ pub struct EgressDestination {
 /// its own vault and authorization. Only the proxy receives the returned value.
 #[async_trait]
 pub trait EgressCredentialResolver: Send + Sync {
+    /// Authorize the normalized upstream destination on every request, even
+    /// when no credential placeholder is present.
+    async fn authorize(
+        &self,
+        identity: &EgressIdentity,
+        destination: &EgressDestination,
+        context: &EgressRequestContext,
+    ) -> Result<()>;
+
     async fn resolve(
         &self,
         identity: &EgressIdentity,
@@ -114,6 +178,7 @@ pub trait EgressCredentialResolver: Send + Sync {
 
 // Owns one sandbox's TLS server, placeholders, and active proxy connections.
 // It does not create VMs or decide where credentials are stored.
+#[cfg(feature = "firecracker")]
 struct EgressProxy {
     endpoints: SandboxEgressProxy,
     transport: Arc<dyn EgressTransport>,
@@ -140,17 +205,80 @@ struct PooledClient {
     client: reqwest::Client,
 }
 
-// Request handling shared by all connections to one sandbox's proxy. Clients
-// are pooled by destination and replaced whenever its resolved addresses change.
+struct CompiledRule {
+    inbound: reqwest::Url,
+    upstream: reqwest::Url,
+    methods: Vec<Method>,
+}
+
+impl CompiledRule {
+    fn new(rule: EgressRule) -> Result<Self> {
+        let inbound = parse_egress_url(&rule.inbound_prefix)?;
+        let upstream = parse_egress_url(&rule.upstream_prefix)?;
+        ensure!(
+            inbound.query().is_none() && upstream.query().is_none(),
+            "egress rule prefixes cannot contain a query"
+        );
+        Ok(Self {
+            inbound,
+            upstream,
+            methods: rule.methods,
+        })
+    }
+
+    fn matches(&self, url: &reqwest::Url, method: &Method) -> bool {
+        if url.scheme() != self.inbound.scheme()
+            || url.host_str() != self.inbound.host_str()
+            || url.port_or_known_default() != self.inbound.port_or_known_default()
+            || (!self.methods.is_empty() && !self.methods.contains(method))
+        {
+            return false;
+        }
+        let Some(suffix) = url.path().strip_prefix(self.inbound.path()) else {
+            return false;
+        };
+        suffix.is_empty() || suffix.starts_with('/') || self.inbound.path().ends_with('/')
+    }
+}
+
+fn parse_egress_url(value: &str) -> Result<reqwest::Url> {
+    let url = reqwest::Url::parse(value)?;
+    ensure!(
+        matches!(url.scheme(), "http" | "https"),
+        "only HTTP and HTTPS are supported"
+    );
+    ensure!(
+        url.username().is_empty() && url.password().is_none() && url.fragment().is_none(),
+        "egress URLs cannot contain credentials or fragments"
+    );
+    let host = url.host_str().context("egress URL requires a host")?;
+    ensure!(
+        canonical_egress_host(host)? == host,
+        "invalid egress URL host"
+    );
+    let port = if url.scheme() == "https" { 443 } else { 80 };
+    ensure!(
+        url.port_or_known_default() == Some(port),
+        "only standard HTTP ports are supported"
+    );
+    ensure!(!url.path().starts_with("//"), "invalid egress URL path");
+    Ok(url)
+}
+
+// Both the Firecracker listener and the public request API use this engine.
+// Clients are pinned to resolved addresses and replaced when those change.
 struct State {
     clients: Mutex<HashMap<(String, u16), PooledClient>>,
+    #[cfg(feature = "firecracker")]
     hosts: HashSet<String>,
+    rules: Vec<CompiledRule>,
     bindings: Vec<Binding>,
     identity: EgressIdentity,
-    resolver: Option<Arc<dyn EgressCredentialResolver>>,
+    resolver: Arc<dyn EgressCredentialResolver>,
     upstream: Arc<dyn UpstreamResolver>,
 }
 
+#[cfg(feature = "firecracker")]
 impl EgressProxy {
     async fn start_with_transport(
         transport: Arc<dyn EgressTransport>,
@@ -199,6 +327,7 @@ impl EgressProxy {
     }
 }
 
+#[cfg(feature = "firecracker")]
 impl Drop for EgressProxy {
     fn drop(&mut self) {
         self.close();
@@ -206,17 +335,130 @@ impl Drop for EgressProxy {
     }
 }
 
+/// Reusable request engine with no sandbox session or listener state.
+pub struct EgressEngine {
+    upstream: Arc<dyn UpstreamResolver>,
+}
+
+impl Default for EgressEngine {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl EgressEngine {
+    pub fn new() -> Self {
+        Self {
+            upstream: Arc::new(PublicUpstreamResolver),
+        }
+    }
+
+    /// Forward one authenticated sandbox request. `inbound_url` is the URL
+    /// selected by the caller's route; rules map it to the upstream. Identity
+    /// and policy are supplied for every request. The named capability header
+    /// is removed before the upstream request is built.
+    pub async fn forward_http_request<B>(
+        &self,
+        identity: EgressIdentity,
+        policy: EgressRequestPolicy,
+        resolver: Arc<dyn EgressCredentialResolver>,
+        inbound_url: &str,
+        capability_header: HeaderName,
+        request: Request<B>,
+    ) -> Result<Response<EgressResponseBody>>
+    where
+        B: Body<Data = Bytes> + Send + 'static,
+        B::Error: Into<ProxyError> + Send + Sync + 'static,
+    {
+        ensure!(
+            !hop_header(&capability_header)
+                && capability_header != HOST
+                && capability_header != "content-length",
+            "invalid capability header name"
+        );
+        let state = State::new_request(identity, policy, resolver, self.upstream.clone())?;
+        Self::forward(&state, request, inbound_url, Some(&capability_header)).await
+    }
+
+    async fn forward<B>(
+        state: &State,
+        request: Request<B>,
+        inbound_url: &str,
+        capability_header: Option<&HeaderName>,
+    ) -> Result<Response<ProxyBody>>
+    where
+        B: Body<Data = Bytes> + Send + 'static,
+        B::Error: Into<ProxyError> + Send + Sync + 'static,
+    {
+        ensure!(
+            request.method() != Method::CONNECT,
+            "CONNECT is not supported"
+        );
+        ensure!(
+            !request.headers().contains_key("upgrade"),
+            "protocol upgrades are not supported"
+        );
+        let (destination, url) = state.destination(inbound_url, request.method())?;
+        let mut headers = request.headers().clone();
+        if let Some(capability_header) = capability_header {
+            headers.remove(capability_header);
+        }
+        let context = state.validate_credentials(
+            &headers,
+            &destination.host,
+            destination.scheme == "https",
+        )?;
+        let authorized = tokio::time::timeout(
+            IO_TIMEOUT,
+            state
+                .resolver
+                .authorize(&state.identity, &destination, &context),
+        )
+        .await
+        .map_err(|_| anyhow!("request authorization timed out"))?;
+        authorized.map_err(|_| anyhow!("request is not authorized"))?;
+        strip_hop_headers(&mut headers)?;
+        let client = state.client(&destination.host, destination.port).await?;
+        state
+            .substitute_credentials(&mut headers, &destination)
+            .await?;
+        relay(request, headers, url, client).await
+    }
+}
+
+#[cfg(feature = "firecracker")]
+struct PolicyOnlyResolver;
+
+#[cfg(feature = "firecracker")]
+#[async_trait]
+impl EgressCredentialResolver for PolicyOnlyResolver {
+    async fn authorize(
+        &self,
+        _identity: &EgressIdentity,
+        _destination: &EgressDestination,
+        _context: &EgressRequestContext,
+    ) -> Result<()> {
+        Ok(())
+    }
+
+    async fn resolve(
+        &self,
+        _identity: &EgressIdentity,
+        _binding_name: &str,
+        _destination: &EgressDestination,
+    ) -> Result<String> {
+        Err(anyhow!("credential resolver is unavailable"))
+    }
+}
+
 impl State {
+    #[cfg(feature = "firecracker")]
     fn new(
         identity: EgressIdentity,
         policy: EgressPolicy,
         resolver: Option<Arc<dyn EgressCredentialResolver>>,
         upstream: Arc<dyn UpstreamResolver>,
     ) -> Result<Self> {
-        ensure!(
-            !identity.sandbox_id.is_empty(),
-            "egress identity is required"
-        );
         let SandboxNetworkPolicy::Limited { allowed_hosts } = policy.networking else {
             return Err(anyhow!(
                 "egress proxy currently requires limited networking; unrestricted passthrough is not implemented"
@@ -227,9 +469,59 @@ impl State {
             policy.credentials.is_empty() || resolver.is_some(),
             "credential substitution requires an egress credential resolver"
         );
+        let mut rules = Vec::new();
+        for host in &hosts {
+            for scheme in ["http", "https"] {
+                let prefix = format!("{scheme}://{host}/");
+                rules.push(EgressRule {
+                    inbound_prefix: prefix.clone(),
+                    upstream_prefix: prefix,
+                    methods: Vec::new(),
+                });
+            }
+        }
+        let credentials = policy
+            .credentials
+            .into_iter()
+            .map(|binding| EgressRequestCredential {
+                binding,
+                placeholder: format!("{PLACEHOLDER_PREFIX}{}", uuid::Uuid::new_v4().simple()),
+            })
+            .collect();
+        let mut state = Self::new_request(
+            identity,
+            EgressRequestPolicy { rules, credentials },
+            resolver.unwrap_or_else(|| Arc::new(PolicyOnlyResolver)),
+            upstream,
+        )?;
+        state.hosts = hosts;
+        Ok(state)
+    }
+
+    fn new_request(
+        identity: EgressIdentity,
+        policy: EgressRequestPolicy,
+        resolver: Arc<dyn EgressCredentialResolver>,
+        upstream: Arc<dyn UpstreamResolver>,
+    ) -> Result<Self> {
+        ensure!(
+            !identity.sandbox_id.is_empty(),
+            "egress identity is required"
+        );
+        ensure!(!policy.rules.is_empty(), "egress rules are required");
+        let rules = policy
+            .rules
+            .into_iter()
+            .map(CompiledRule::new)
+            .collect::<Result<Vec<_>>>()?;
         let mut variables = HashSet::new();
+        let mut placeholders = HashSet::new();
         let mut bindings = Vec::new();
-        for config in policy.credentials {
+        for EgressRequestCredential {
+            binding: config,
+            placeholder,
+        } in policy.credentials
+        {
             let CredentialNetworkPolicy::Limited { allowed_hosts } = &config.networking;
             let hosts = canonical_egress_hosts(allowed_hosts)?;
             ensure!(
@@ -251,15 +543,36 @@ impl State {
                 variables.insert(config.environment_variable.clone()),
                 "duplicate credential environment variable"
             );
+            ensure!(
+                placeholder.starts_with(PLACEHOLDER_PREFIX)
+                    && placeholder.len() > PLACEHOLDER_PREFIX.len()
+                    && placeholder
+                        .bytes()
+                        .all(|c| c == b'_' || c.is_ascii_alphanumeric()),
+                "invalid credential placeholder"
+            );
+            ensure!(
+                placeholders.insert(placeholder.clone()),
+                "duplicate credential placeholder"
+            );
+            ensure!(
+                bindings.iter().all(|binding: &Binding| !binding
+                    .placeholder
+                    .starts_with(&placeholder)
+                    && !placeholder.starts_with(&binding.placeholder)),
+                "overlapping credential placeholders"
+            );
             bindings.push(Binding {
                 config,
                 hosts,
-                placeholder: format!("{PLACEHOLDER_PREFIX}{}", uuid::Uuid::new_v4().simple()),
+                placeholder,
             });
         }
         Ok(Self {
             clients: Mutex::new(HashMap::new()),
-            hosts,
+            #[cfg(feature = "firecracker")]
+            hosts: HashSet::new(),
+            rules,
             bindings,
             identity,
             resolver,
@@ -267,34 +580,50 @@ impl State {
         })
     }
 
-    async fn forward(
-        &self,
-        request: Request<Incoming>,
-        sni: Option<&str>,
-    ) -> Result<Response<ProxyBody>> {
-        let (destination, url) = self.destination(&request, sni)?;
-        let mut headers = request.headers().clone();
-        self.validate_credentials(&headers, &destination.host, sni.is_some())?;
-        strip_hop_headers(&mut headers)?;
-        let client = self.client(&destination.host, destination.port).await?;
-        self.substitute_credentials(&mut headers, &destination)
-            .await?;
-        relay(request, headers, url, client).await
-    }
-
     fn destination(
         &self,
-        request: &Request<Incoming>,
-        sni: Option<&str>,
+        inbound_url: &str,
+        method: &Method,
     ) -> Result<(EgressDestination, reqwest::Url)> {
+        let inbound = parse_egress_url(inbound_url)?;
+        let rule = self
+            .rules
+            .iter()
+            .find(|rule| rule.matches(&inbound, method))
+            .context("URL or method is not allowed")?;
+        let suffix = inbound
+            .path()
+            .strip_prefix(rule.inbound.path())
+            .expect("matched prefix");
+        let query = inbound
+            .query()
+            .map(|query| format!("?{query}"))
+            .unwrap_or_default();
+        let url = parse_egress_url(&format!("{}{}{}", rule.upstream, suffix, query))?;
         ensure!(
-            request.method() != Method::CONNECT,
-            "CONNECT is not supported on the transparent listener"
+            url.scheme() == rule.upstream.scheme()
+                && url.host_str() == rule.upstream.host_str()
+                && url.port_or_known_default() == rule.upstream.port_or_known_default(),
+            "rule changed the upstream authority"
         );
-        ensure!(
-            !request.headers().contains_key("upgrade"),
-            "protocol upgrades are not supported"
-        );
+        let path = match url.query() {
+            Some(query) => format!("{}?{query}", url.path()),
+            None => url.path().to_owned(),
+        };
+        let destination = EgressDestination {
+            scheme: url.scheme().to_owned(),
+            host: url.host_str().context("missing upstream host")?.to_owned(),
+            port: url
+                .port_or_known_default()
+                .context("missing upstream port")?,
+            method: method.clone(),
+            path,
+        };
+        Ok((destination, url))
+    }
+
+    #[cfg(feature = "firecracker")]
+    fn transparent_url(&self, request: &Request<Incoming>, sni: Option<&str>) -> Result<String> {
         ensure!(
             request.uri().scheme().is_none() && request.uri().authority().is_none(),
             "expected origin-form request"
@@ -338,20 +667,16 @@ impl State {
             url.host_str() == Some(host.as_str()) && url.port_or_known_default() == Some(port),
             "request changed the upstream authority"
         );
-        let path = match url.query() {
-            Some(query) => format!("{}?{query}", url.path()),
-            None => url.path().to_owned(),
-        };
-        let destination = EgressDestination {
-            host,
-            port,
-            method: request.method().clone(),
-            path,
-        };
-        Ok((destination, url))
+        Ok(url.to_string())
     }
 
-    fn validate_credentials(&self, headers: &HeaderMap, host: &str, tls: bool) -> Result<()> {
+    fn validate_credentials(
+        &self,
+        headers: &HeaderMap,
+        host: &str,
+        tls: bool,
+    ) -> Result<EgressRequestContext> {
+        let mut credential_bindings = HashSet::new();
         for (header, value) in headers {
             if !contains_placeholder(value.as_bytes()) {
                 continue;
@@ -365,18 +690,20 @@ impl State {
                 headers.get_all(header).iter().count() == 1,
                 "duplicate credential header"
             );
-            let mut unresolved = value.to_str()?.to_owned();
-            for binding in &self.bindings {
-                if binding.permits_header(host) {
-                    unresolved = unresolved.replace(&binding.placeholder, "");
-                }
+            for token in placeholder_tokens(value.to_str()?) {
+                let binding = self
+                    .bindings
+                    .iter()
+                    .find(|binding| binding.placeholder == token && binding.permits_header(host))
+                    .context("credential placeholder does not match this request")?;
+                credential_bindings.insert(binding.config.name.clone());
             }
-            ensure!(
-                !unresolved.contains(PLACEHOLDER_PREFIX),
-                "credential placeholder does not match this request"
-            );
         }
-        Ok(())
+        let mut credential_bindings = credential_bindings.into_iter().collect::<Vec<_>>();
+        credential_bindings.sort_unstable();
+        Ok(EgressRequestContext {
+            credential_bindings,
+        })
     }
 
     async fn substitute_credentials(
@@ -398,8 +725,6 @@ impl State {
                 let value = tokio::time::timeout(
                     IO_TIMEOUT,
                     self.resolver
-                        .as_ref()
-                        .context("credential resolver is unavailable")?
                         .resolve(&self.identity, &binding.config.name, destination),
                 )
                 .await?
@@ -455,24 +780,39 @@ fn contains_placeholder(value: &[u8]) -> bool {
         .any(|s| s == PLACEHOLDER_PREFIX.as_bytes())
 }
 
-async fn relay(
-    mut request: Request<Incoming>,
+fn placeholder_tokens(mut value: &str) -> Vec<&str> {
+    let mut tokens = Vec::new();
+    while let Some(start) = value.find(PLACEHOLDER_PREFIX) {
+        let after_prefix = &value[start + PLACEHOLDER_PREFIX.len()..];
+        let suffix_len = after_prefix
+            .find(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+            .unwrap_or(after_prefix.len());
+        let end = start + PLACEHOLDER_PREFIX.len() + suffix_len;
+        tokens.push(&value[start..end]);
+        value = &value[end..];
+    }
+    tokens
+}
+
+async fn relay<B>(
+    request: Request<B>,
     mut headers: HeaderMap,
     url: reqwest::Url,
     client: reqwest::Client,
-) -> Result<Response<ProxyBody>> {
+) -> Result<Response<ProxyBody>>
+where
+    B: Body<Data = Bytes> + Send + 'static,
+    B::Error: Into<ProxyError> + Send + Sync + 'static,
+{
     headers.remove(HOST);
     headers.remove("content-length");
-    let method = request.method().clone();
-    let body = tokio::time::timeout(
-        IO_TIMEOUT,
-        Limited::new(request.body_mut(), MAX_REQUEST_BODY).collect(),
-    )
-    .await?
-    .map_err(|_| anyhow!("invalid or oversized request body"))?
-    .to_bytes();
+    let (parts, body) = request.into_parts();
+    let body = tokio::time::timeout(IO_TIMEOUT, Limited::new(body, MAX_REQUEST_BODY).collect())
+        .await?
+        .map_err(|_| anyhow!("invalid or oversized request body"))?
+        .to_bytes();
     let response = client
-        .request(method, url)
+        .request(parts.method, url)
         .headers(headers)
         .body(body)
         .send()
@@ -554,6 +894,7 @@ fn strip_hop_headers(headers: &mut HeaderMap) -> Result<()> {
     Ok(())
 }
 
+#[cfg(feature = "firecracker")]
 fn tls_configuration(hosts: Vec<String>) -> Result<(String, TlsAcceptor)> {
     let mut ca = CertificateParams::new(Vec::<String>::new())?;
     ca.distinguished_name
@@ -585,6 +926,7 @@ fn tls_configuration(hosts: Vec<String>) -> Result<(String, TlsAcceptor)> {
     Ok((certificate.pem(), TlsAcceptor::from(Arc::new(tls))))
 }
 
+#[cfg(feature = "firecracker")]
 async fn http_connection<T>(stream: T, state: Arc<State>, sni: Option<String>) -> Result<()>
 where
     T: AsyncRead + AsyncWrite + Send + Unpin + 'static,
@@ -593,7 +935,11 @@ where
         let state = state.clone();
         let sni = sni.clone();
         async move {
-            let response = match state.forward(request, sni.as_deref()).await {
+            let response = match state.transparent_url(&request, sni.as_deref()) {
+                Ok(inbound_url) => EgressEngine::forward(&state, request, &inbound_url, None).await,
+                Err(error) => Err(error),
+            };
+            let response = match response {
                 Ok(response) => response,
                 Err(error) => {
                     tracing::debug!(%error, sandbox_id = %state.identity.sandbox_id, "egress request failed");
@@ -619,6 +965,7 @@ where
     Ok(())
 }
 
+#[cfg(feature = "firecracker")]
 async fn serve(
     transport: Arc<dyn EgressTransport>,
     tls: TlsAcceptor,
@@ -663,5 +1010,5 @@ async fn serve(
     tasks.shutdown().await;
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "firecracker"))]
 mod tests;
