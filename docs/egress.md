@@ -101,7 +101,7 @@ The caller selects bindings in `request.spec.policy.credentials`. Each use is
 resolved again, so rotation and revocation take effect without replacing the
 sandbox. Identity includes the sandbox ID and agent/thread scope; destination
 includes the scheme, host, port, method, and normalized path/query. `authorize`
-runs on that rewritten destination before DNS resolution or forwarding, even
+runs on that normalized destination before DNS resolution or forwarding, even
 without a credential placeholder. A vault adapter can
 pin a binding to a vault/secret reference per thread and enforce its stored
 destination restrictions. The local CLI resolver assumes a single user owns the
@@ -178,20 +178,22 @@ proxy can pass endpoints to
 
 ## Request-level forwarding
 
-`EgressEngine::forward_http_request` accepts a sandbox identity, policy,
-resolver, inbound URL, capability header name, and HTTP request on every call.
-The caller validates the capability; Exo removes that header before forwarding.
-The API needs no listener or process-local sandbox session.
+`EgressEngine::new(identity, policy, resolver)` prepares the existing
+`EgressPolicy` and credential placeholders. `environment()` returns the same
+placeholder variables injected into Firecracker. A hosted caller can construct
+an engine per request and use those placeholders in its outgoing headers.
 
-Each `EgressRule` maps an inbound URL prefix and allowed methods to an upstream
-prefix, carrying the remaining path and query. For example, a rule from
-`https://gateway.example/service` to `https://api.example/v1` maps
-`/service/items?id=1` to `/v1/items?id=1`. The engine authorizes the rewritten
-destination before resolving or forwarding. Credentials are substituted from
-the request policy after authorization. Request bodies are binary-safe and
-bounded to 8 MiB; responses stream. Public IPv4 addresses are pinned, upstream
-TLS is verified, and redirects are not followed. The Firecracker listener uses
-the same engine with exact-host identity rules.
+`forward_http_request(request, capability_header)` accepts an absolute upstream
+URI. The caller validates its capability and applies its URL/method routing
+rules first. Exo removes the capability header, enforces the existing host
+allowlists, and calls `authorize` before DNS resolution or credential lookup,
+even without placeholders. Repository grants remain the resolver's responsibility.
+
+The engine works without Firecracker or a listener. Request bodies are bounded
+to 8 MiB; responses stream, public IPv4 addresses are pinned, upstream TLS is
+verified, and redirects are not followed. Firecracker retains limited networking;
+the request API also accepts unrestricted networking while keeping credential
+destinations independently restricted. Disabled networking denies requests.
 
 ## Other backends
 
@@ -213,9 +215,9 @@ not control the attached container's network.
 
 ## Current scope
 
-The proxy supports limited networking with exact hosts and HTTPS header
-substitution. Unrestricted networking with credential bindings is rejected until
-passthrough is implemented. Body substitution is not part of the policy yet.
+The Firecracker proxy supports limited networking with exact hosts and HTTPS
+header substitution. Firecracker rejects unrestricted networking with credential
+bindings until passthrough is implemented. Body substitution is not part of the policy yet.
 Standard ports 80/443 are supported; local gateways on other ports need
 additional transport support. Model credential bindings are not inferred
 automatically.
@@ -254,8 +256,8 @@ selected binding and forwards only requests the resolver authorizes.
 Run the request engine and listener unit tests:
 
 ```bash
-cargo check -p exoharness --features egress --lib
-cargo test -p exoharness --features firecracker --lib egress::tests::
+cargo test -p exoharness --features egress --lib egress::request_tests::
+cargo test -p exoharness --features firecracker --lib egress::
 ```
 
 With the [Firecracker artifacts](../support/firecracker/README.md) installed,
