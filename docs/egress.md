@@ -4,8 +4,8 @@ Sandbox policy is part of `SandboxSpec`. Each backend enforces the policy when
 it acquires, attaches, or restores a sandbox, before returning a usable handle.
 Unsupported policies fail with an error identifying the unsupported field.
 
-The `egress` build feature includes the transparent HTTP/HTTPS proxy without a
-VM backend. The `firecracker` feature includes `egress` and adds VM integration.
+The `egress` build feature includes transparent and explicit HTTP/HTTPS proxies
+without a VM backend. The `firecracker` feature includes `egress` and adds VM integration.
 Programs receive placeholder environment variables; the proxy resolves
 credentials outside the VM and substitutes them on authorized requests.
 
@@ -169,8 +169,40 @@ proxy can pass endpoints to
 `EgressProxy::start(identity, policy, resolver, transport, cancel)` starts the
 proxy using the existing `EgressPolicy` and an `EgressTransport`. It exposes
 listener endpoints, the CA certificate, and placeholder environment variables.
-This is a transparent proxy; an explicit `HTTPS_PROXY`/CONNECT listener is not
-implemented here.
+
+`ExplicitProxy::start(identity, policy, resolver, listener, advertised_host)`
+serves an authenticated HTTP/HTTPS proxy on a caller-bound `TcpListener`. It
+creates the CA and credential placeholders once per proxy. Install `ca_pem` at
+`ca_path` inside the sandbox and apply `environment` (or use `command()`) to set
+`HTTPS_PROXY`, placeholder credentials, and CA trust variables. `close()` or
+Drop closes the listener and active tunnels. The caller owns sandbox setup;
+this API does not change sandbox backend integration.
+
+Limited networking checks every request against the sandbox's allowed hosts,
+including anonymous requests. With unrestricted networking, the explicit proxy
+intercepts credential hosts and tunnels other HTTPS destinations unchanged.
+Proxy configuration alone does not prevent clients from bypassing the proxy;
+network isolation requires separate sandbox routing or firewall enforcement.
+
+For a shared hosted listener, call
+`serve_connect_proxy(listener, authorizer, shutdown)`. Implement `ProxyAuthorizer`
+to validate the Basic proxy username/password and return the authorized
+`ProxySession` for the requested host. Construct sessions with
+`ProxySession::new(identity, policy, resolver, tls, placeholders)` using TLS
+material trusted by that sandbox and its stable credential placeholders. Sessions
+can be cached and cloned; authentication still runs for every CONNECT request.
+Returning `None` rejects authentication with 407; errors or a 10-second timeout
+return 503. Exo validates CONNECT framing, enforces the session's egress policy,
+and owns connection limits, upgrades, and shutdown. The hosted listener accepts
+only CONNECT on port 443. `ExplicitProxy` uses the same server with a fixed
+sandbox session and generated password, and also accepts plain HTTP requests.
+
+Callers that already own an authenticated CONNECT listener can instead pass its
+post-200 stream to `serve_https_connect` with the CONNECT authority, TLS acceptor,
+and stable placeholders. Exo checks CONNECT host, SNI, and HTTP Host before
+forwarding. Session selection and credential resolution are separate: the
+hosted caller must authenticate access to the sandbox even when the request
+uses no credential.
 
 A hosted backend can implement `ManagedSandboxBackend::acquire` itself: choose
 the sandbox node, establish an authenticated relay to the credential service,
@@ -200,9 +232,10 @@ not control the attached container's network.
 
 ## Current scope
 
-The proxy supports limited networking with exact hosts and HTTPS header
-substitution. Unrestricted networking with credential bindings is rejected until
-passthrough is implemented. Body substitution is not part of the policy yet.
+The transparent proxy supports limited networking with exact hosts and HTTPS
+header substitution. The explicit proxy also supports unrestricted networking
+with credential substitution restricted to each binding's allowed hosts.
+Body substitution is not part of the policy yet.
 Standard ports 80/443 are supported; local gateways on other ports need
 additional transport support. Model credential bindings are not inferred
 automatically.
@@ -212,6 +245,10 @@ attachments, or one-shot sandboxes. HTTP/2, WebSockets, arbitrary TCP, and signe
 requests are also outside this initial implementation.
 
 ## Git over HTTPS
+
+Git can use its normal HTTPS URL through `HTTPS_PROXY`. For Basic authentication,
+Exo decodes the username/password, substitutes any credential placeholder with
+the token returned by the resolver, and re-encodes the header before forwarding it.
 
 Git read and write operations use ordinary smart HTTP. A read uses
 `GET /repo.git/info/refs?service=git-upload-pack` followed by
@@ -228,8 +265,8 @@ git -C "$repo" config --local \
   "Authorization: Basic $GIT_AUTH"
 ```
 
-For Basic authentication, the resolver returns the Base64 payload expected after
-`Basic`, and the proxy substitutes it for the placeholder. `Git-Protocol: version=2`
+For this raw-header configuration, the resolver returns the Base64 payload
+expected after `Basic`, and the proxy substitutes it for the placeholder. `Git-Protocol: version=2`
 passes through unchanged, and `GIT_SSL_CAINFO` provides trust for the
 proxy's certificate. Redirects are not followed. Request bodies over 8 MiB are
 rejected, so larger push packfiles need additional support. Repository and
