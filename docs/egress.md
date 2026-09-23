@@ -4,11 +4,10 @@ Sandbox policy is part of `SandboxSpec`. Each backend enforces the policy when
 it acquires, attaches, or restores a sandbox, before returning a usable handle.
 Unsupported policies fail with an error identifying the unsupported field.
 
-The `egress` build feature includes the forwarding engine, TLS proxy, and
-transport without a VM backend. The `firecracker` feature adds VM integration
-and uses the proxy for transparent HTTP/HTTPS credential substitution. Programs receive placeholder
-environment variables; the proxy resolves credentials outside the VM and
-substitutes them on authorized requests.
+The `egress` build feature includes the transparent HTTP/HTTPS proxy without a
+VM backend. The `firecracker` feature includes `egress` and adds VM integration.
+Programs receive placeholder environment variables; the proxy resolves
+credentials outside the VM and substitutes them on authorized requests.
 
 On macOS, TLS and credential resolution run in the native Exo process. The
 existing Lima bridge carries streams and DNS configuration, without receiving
@@ -82,13 +81,6 @@ Binding names are scoped references, not storage IDs. Two threads can both
 request `notion` and resolve different secrets. Implement `EgressCredentialResolver`:
 
 ```rust
-async fn authorize(
-    &self,
-    identity: &EgressIdentity,
-    destination: &EgressDestination,
-    credential_bindings: &[String],
-) -> anyhow::Result<()>;
-
 async fn resolve(
     &self,
     identity: &EgressIdentity,
@@ -100,12 +92,10 @@ async fn resolve(
 The caller selects bindings in `request.spec.policy.credentials`. Each use is
 resolved again, so rotation and revocation take effect without replacing the
 sandbox. Identity includes the sandbox ID and agent/thread scope; destination
-includes the scheme, host, port, method, and normalized path/query. `authorize`
-runs on that normalized destination before DNS resolution or forwarding, even
-without a credential placeholder. A vault adapter can
+includes the host, port, method, and normalized path/query. A vault adapter can
 pin a binding to a vault/secret reference per thread and enforce its stored
 destination restrictions. The local CLI resolver assumes a single user owns the
-secret store; request-level callers supply their own authorization. Resolver
+secret store; hosted resolvers must supply their own authorization. Resolver
 failures are sanitized before returning them to the guest.
 
 ```rust
@@ -176,26 +166,19 @@ the listeners inside the Lima bridge. Low-level callers that already own their
 proxy can pass endpoints to
 `FirecrackerSandboxBackend::acquire_request(FirecrackerRequest)`.
 
-## Request-level forwarding
+`EgressProxy::start(identity, policy, resolver, transport, cancel)` starts the
+proxy using the existing `EgressPolicy` and an `EgressTransport`. It exposes
+listener endpoints, the CA certificate, and placeholder environment variables.
+This is a transparent proxy; an explicit `HTTPS_PROXY`/CONNECT listener is not
+implemented here.
 
-`EgressEngine::new(identity, policy, resolver)` prepares the existing
-`EgressPolicy` and credential placeholders. `environment()` returns the same
-placeholder variables injected into Firecracker. A hosted caller can construct
-an engine per request and use those placeholders in its outgoing headers.
-
-`forward_http_request(request, capability_header)` accepts an absolute upstream
-URI. The caller validates its capability and applies its URL/method routing
-rules first. Exo removes the capability header, enforces the existing host
-allowlists, and calls `authorize` before DNS resolution or credential lookup,
-even without placeholders. Repository grants remain the resolver's responsibility.
-
-`EgressProxy::start_with_transport` serves the same engine over an
-`EgressTransport`; TLS and DNS do not require the Firecracker feature.
-The engine can also forward requests without a listener. Request bodies are
-bounded to 8 MiB; responses stream, public IPv4 addresses are pinned, upstream TLS is
-verified, and redirects are not followed. Firecracker retains limited networking;
-the request API also accepts unrestricted networking while keeping credential
-destinations independently restricted. Disabled networking denies requests.
+A hosted backend can implement `ManagedSandboxBackend::acquire` itself: choose
+the sandbox node, establish an authenticated relay to the credential service,
+install routing, and only then return a handle. No proxy hooks are required on
+the shared sandbox traits. The credential service can run inside Loop while
+the node relays opaque streams. Relay authorization must bind the stream to the
+sandbox allocation and its generation; raw source-IP binding is only suitable
+before NAT on a trusted local host. The production relay is not implemented here.
 
 ## Other backends
 
@@ -217,9 +200,9 @@ not control the attached container's network.
 
 ## Current scope
 
-The Firecracker proxy supports limited networking with exact hosts and HTTPS
-header substitution. Firecracker rejects unrestricted networking with credential
-bindings until passthrough is implemented. Body substitution is not part of the policy yet.
+The proxy supports limited networking with exact hosts and HTTPS header
+substitution. Unrestricted networking with credential bindings is rejected until
+passthrough is implemented. Body substitution is not part of the policy yet.
 Standard ports 80/443 are supported; local gateways on other ports need
 additional transport support. Model credential bindings are not inferred
 automatically.
@@ -255,17 +238,16 @@ selected binding and forwards only requests the resolver authorizes.
 
 ## Tests
 
-Run the request engine and listener unit tests:
+Run the shared proxy tests without a VM backend:
 
 ```bash
 cargo test -p exoharness --features egress --lib egress::
-cargo test -p exoharness --features firecracker --lib egress::
 ```
 
-With the [Firecracker artifacts](../support/firecracker/README.md) installed,
-run the VM smoke tests:
+With the [Firecracker artifacts](../support/firecracker/README.md) installed:
 
 ```bash
+cargo test -p exoharness --features firecracker --lib
 bash support/firecracker/egress-smoke.sh
 bash support/firecracker/managed-egress-smoke.sh
 ```

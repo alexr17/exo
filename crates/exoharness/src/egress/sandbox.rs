@@ -10,8 +10,7 @@ use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard};
 use tokio_util::sync::CancellationToken;
 
 use super::{
-    EgressCredentialResolver, EgressEngine, EgressIdentity, EgressProxy, EgressTransport,
-    UpstreamResolver,
+    EgressCredentialResolver, EgressIdentity, EgressProxy, EgressTransport, State, UpstreamResolver,
 };
 use crate::{ManagedSandboxHandle, SandboxCommand, SandboxRequest};
 
@@ -210,14 +209,7 @@ impl<H: ManagedSandboxHandle + 'static> EgressRuntime<H> {
             request.lifecycle.idle_ttl.is_some(),
             "proxy egress requires a managed sandbox lifecycle"
         );
-        ensure!(
-            matches!(
-                request.spec.policy.networking,
-                crate::SandboxNetworkPolicy::Limited { .. }
-            ),
-            "Firecracker egress proxy requires limited networking"
-        );
-        let state = EgressEngine::with_upstream(
+        let state = State::new(
             EgressIdentity {
                 sandbox_id: request.sandbox_id.clone(),
                 scope: request.scope.clone(),
