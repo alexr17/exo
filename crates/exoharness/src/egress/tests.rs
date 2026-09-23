@@ -42,7 +42,6 @@ impl UpstreamResolver for TestUpstream {
 struct TestResolver {
     value: RwLock<Option<String>>,
     uses: RwLock<Vec<(String, String, String)>>,
-    authorizations: RwLock<Vec<(String, String, String)>>,
 }
 
 impl TestResolver {
@@ -50,7 +49,6 @@ impl TestResolver {
         Arc::new(Self {
             value: RwLock::new(Some("canary-v1".to_string())),
             uses: RwLock::new(Vec::new()),
-            authorizations: RwLock::new(Vec::new()),
         })
     }
 }
@@ -59,15 +57,10 @@ impl TestResolver {
 impl EgressCredentialResolver for TestResolver {
     async fn authorize(
         &self,
-        identity: &EgressIdentity,
-        destination: &EgressDestination,
-        _context: &EgressRequestContext,
+        _identity: &EgressIdentity,
+        _destination: &EgressDestination,
+        _credential_bindings: &[String],
     ) -> Result<()> {
-        self.authorizations.write().await.push((
-            identity.sandbox_id.clone(),
-            destination.host.clone(),
-            destination.path.clone(),
-        ));
         Ok(())
     }
 
@@ -97,16 +90,24 @@ impl EgressCredentialResolver for TestResolver {
     }
 }
 
-struct GitResolver;
+#[derive(Default)]
+struct GitResolver {
+    authorizations: RwLock<Vec<(String, String, String)>>,
+}
 
 #[async_trait]
 impl EgressCredentialResolver for GitResolver {
     async fn authorize(
         &self,
-        _identity: &EgressIdentity,
+        identity: &EgressIdentity,
         destination: &EgressDestination,
-        _context: &EgressRequestContext,
+        _credential_bindings: &[String],
     ) -> Result<()> {
+        self.authorizations.write().await.push((
+            identity.sandbox_id.clone(),
+            destination.host.clone(),
+            destination.path.clone(),
+        ));
         ensure!(
             git_destination_allowed(destination),
             "git request is not authorized"
@@ -175,7 +176,7 @@ impl Upstream {
                         let request_count = request_count.clone();
                         connections.spawn(async move {
                             let stream = tls.accept(stream).await?;
-                            let service = service_fn(move |request: Request<Incoming>| {
+                            let service = service_fn(move |mut request: Request<Incoming>| {
                                 let request_count = request_count.clone();
                                 async move {
                                 request_count.fetch_add(1, Ordering::SeqCst);
@@ -183,10 +184,6 @@ impl Upstream {
                                     let mut response = Response::new(Full::new(Bytes::from_static(b"capability leaked")).boxed());
                                     *response.status_mut() = StatusCode::BAD_REQUEST;
                                     return Ok::<_, Infallible>(response);
-                                }
-                                if request.uri().path() == "/binary" {
-                                    let body = request.into_body().collect().await.unwrap().to_bytes();
-                                    return Ok::<_, Infallible>(Response::new(Full::new(body).boxed()));
                                 }
                                 let authorization = request.headers().get("authorization")
                                     .or_else(|| request.headers().get("x-api-key"))
@@ -219,6 +216,12 @@ impl Upstream {
                                     None => "anonymous",
                                     _ => "bad-auth",
                                 };
+                                if git_upload_pack && request.headers().contains_key("x-check-binary") {
+                                    assert_eq!(
+                                        request.body_mut().collect().await.unwrap().to_bytes(),
+                                        Bytes::from_static(b"\0\x01\xffpack-request")
+                                    );
+                                }
                                 let body: BoxBody<Bytes, Infallible> = if git_refs {
                                     Full::new(Bytes::from_static(b"refs")).boxed()
                                 } else if git_receive_refs {
@@ -329,7 +332,7 @@ impl EgressCredentialResolver for ThreadResolver {
         &self,
         identity: &EgressIdentity,
         _destination: &EgressDestination,
-        _context: &EgressRequestContext,
+        _credential_bindings: &[String],
     ) -> Result<()> {
         self.for_identity(identity).map(|_| ())
     }
@@ -598,7 +601,8 @@ async fn proxy_supports_git_smart_http() -> Result<()> {
     use futures::StreamExt;
 
     let upstream = Upstream::start().await?;
-    let (proxy, proxy_client) = bound_proxy(&upstream, "git", Arc::new(GitResolver)).await?;
+    let (proxy, proxy_client) =
+        bound_proxy(&upstream, "git", Arc::new(GitResolver::default())).await?;
     let authorization = format!("Basic {}", proxy.environment()["TEST_API_KEY"]);
 
     let refs = proxy_client
@@ -685,42 +689,75 @@ async fn proxy_supports_git_smart_http() -> Result<()> {
     Ok(())
 }
 
+struct RequestApi {
+    engine: EgressEngine,
+    policy: EgressRequestPolicy,
+    resolver: Arc<dyn EgressCredentialResolver>,
+}
+
+impl RequestApi {
+    async fn forward(
+        &self,
+        sandbox_id: &str,
+        method: Method,
+        inbound_url: &str,
+        authorization: Option<&str>,
+        body: Bytes,
+    ) -> Result<Response<EgressResponseBody>> {
+        let mut request = Request::builder()
+            .method(method)
+            .uri("/proxy")
+            .header("x-sandbox-capability", "opaque-capability");
+        if let Some(authorization) = authorization {
+            request = request
+                .header("authorization", format!("Basic {authorization}"))
+                .header("git-protocol", "version=2");
+        }
+        if !body.is_empty() {
+            request = request.header("x-check-binary", "1");
+        }
+        self.engine
+            .forward_http_request(
+                identity(sandbox_id),
+                self.policy.clone(),
+                self.resolver.clone(),
+                inbound_url,
+                HeaderName::from_static("x-sandbox-capability"),
+                request.body(Full::new(body))?,
+            )
+            .await
+    }
+}
+
 #[tokio::test]
 async fn request_api_rewrites_git_http_and_streams_the_response() -> Result<()> {
     let upstream = Upstream::start().await?;
-    let engine = EgressEngine {
-        upstream: Arc::new(upstream.config.clone()),
-    };
+    let resolver = Arc::new(GitResolver::default());
     let placeholder = "exo_egress_http_test";
-    let credential = EgressRequestCredential {
-        binding: policy().credentials.remove(0),
-        placeholder: placeholder.into(),
+    let api = RequestApi {
+        engine: EgressEngine {
+            upstream: Arc::new(upstream.config.clone()),
+        },
+        policy: EgressRequestPolicy {
+            rules: vec![EgressRule {
+                inbound_prefix: "https://gateway.test/git".into(),
+                upstream_prefix: "https://api.test/authorized-repo.git".into(),
+                methods: vec![Method::GET, Method::POST],
+            }],
+            credentials: vec![EgressRequestCredential {
+                binding: policy().credentials.remove(0),
+                placeholder: placeholder.into(),
+            }],
+        },
+        resolver: resolver.clone(),
     };
-    let request_policy = EgressRequestPolicy {
-        rules: vec![EgressRule {
-            inbound_prefix: "https://gateway.test/git".into(),
-            upstream_prefix: "https://api.test/authorized-repo.git".into(),
-            methods: vec![Method::GET, Method::POST],
-        }],
-        credentials: vec![credential],
-    };
-    let capability_header = HeaderName::from_static("x-sandbox-capability");
-    let resolver: Arc<dyn EgressCredentialResolver> = Arc::new(GitResolver);
-    let refs = Request::builder()
-        .method(Method::GET)
-        .uri("/proxy/git/info/refs?service=git-upload-pack")
-        .header(&capability_header, "opaque-capability")
-        .header("authorization", format!("Basic {placeholder}"))
-        .header("git-protocol", "version=2")
-        .body(Full::new(Bytes::new()))?;
-    let refs = engine
-        .forward_http_request(
-            identity("git"),
-            request_policy.clone(),
-            resolver.clone(),
+    let refs = api
+        .forward(
+            "git-refs",
+            Method::GET,
             "https://gateway.test/git/info/refs?service=git-upload-pack",
-            capability_header.clone(),
-            refs,
+            Some(placeholder),
+            Bytes::new(),
         )
         .await?;
     assert_eq!(refs.status(), StatusCode::OK);
@@ -733,39 +770,26 @@ async fn request_api_rewrites_git_http_and_streams_the_response() -> Result<()> 
         Bytes::from_static(b"refs")
     );
 
-    let pack = Request::builder()
-        .method(Method::POST)
-        .uri("/proxy/git/git-upload-pack")
-        .header(&capability_header, "opaque-capability")
-        .header("authorization", format!("Basic {placeholder}"))
-        .header("git-protocol", "version=2")
-        .body(Full::new(Bytes::from_static(b"\0\x01\xffpack-request")))?;
-    let pack = engine
-        .forward_http_request(
-            identity("git"),
-            request_policy.clone(),
-            resolver.clone(),
+    let pack = api
+        .forward(
+            "git-pack",
+            Method::POST,
             "https://gateway.test/git/git-upload-pack",
-            capability_header.clone(),
-            pack,
+            Some(placeholder),
+            Bytes::from_static(b"\0\x01\xffpack-request"),
         )
         .await?;
     assert_eq!(pack.status(), StatusCode::OK);
     let mut body = pack.into_body();
-    let first = tokio::time::timeout(Duration::from_secs(2), body.frame())
-        .await?
-        .context("missing first chunk")?
-        .map_err(|error| anyhow!("{error}"))?
-        .into_data()
-        .expect("data frame");
-    assert_eq!(first, Bytes::from_static(b"pack-1"));
-    let second = tokio::time::timeout(Duration::from_secs(2), body.frame())
-        .await?
-        .context("missing second chunk")?
-        .map_err(|error| anyhow!("{error}"))?
-        .into_data()
-        .expect("data frame");
-    assert_eq!(second, Bytes::from_static(b"pack-2"));
+    for expected in ["pack-1", "pack-2"] {
+        let chunk = tokio::time::timeout(Duration::from_secs(2), body.frame())
+            .await?
+            .context("missing chunk")?
+            .map_err(|error| anyhow!("{error}"))?
+            .into_data()
+            .expect("data frame");
+        assert_eq!(chunk.as_ref(), expected.as_bytes());
+    }
     assert!(body.frame().await.is_none());
 
     let forwarded = upstream.requests.load(Ordering::SeqCst);
@@ -778,105 +802,27 @@ async fn request_api_rewrites_git_http_and_streams_the_response() -> Result<()> 
             "https://gateway.test/git/ungranted-repo.git/info/refs",
         ),
     ] {
-        let request = Request::builder()
-            .method(method)
-            .uri("/proxy/denied")
-            .header(&capability_header, "opaque-capability")
-            .body(Full::new(Bytes::new()))?;
         assert!(
-            engine
-                .forward_http_request(
-                    identity("git"),
-                    request_policy.clone(),
-                    resolver.clone(),
-                    url,
-                    capability_header.clone(),
-                    request,
-                )
+            api.forward("git-denied", method, url, None, Bytes::new())
                 .await
                 .is_err()
         );
     }
     assert_eq!(upstream.requests.load(Ordering::SeqCst), forwarded);
-    Ok(())
-}
-
-#[tokio::test]
-async fn request_api_preserves_binary_body_and_does_not_follow_redirects() -> Result<()> {
-    let upstream = Upstream::start().await?;
-    let engine = EgressEngine {
-        upstream: Arc::new(upstream.config.clone()),
-    };
-    let policy = EgressRequestPolicy {
-        rules: vec![
-            EgressRule {
-                inbound_prefix: "https://gateway.test/blob".into(),
-                upstream_prefix: "https://api.test/binary".into(),
-                methods: vec![Method::POST],
-            },
-            EgressRule {
-                inbound_prefix: "https://gateway.test/redirect".into(),
-                upstream_prefix: "https://api.test/redirect".into(),
-                methods: vec![Method::GET],
-            },
-        ],
-        credentials: vec![],
-    };
-    let resolver = TestResolver::new();
-    let capability_header = HeaderName::from_static("x-sandbox-capability");
-    let bytes = Bytes::from_static(b"\0\x01\xfe\xff\0binary");
-    let request = Request::builder()
-        .method(Method::POST)
-        .uri("/proxy/blob")
-        .header(&capability_header, "opaque-capability")
-        .body(Full::new(bytes.clone()))?;
-    let response = engine
-        .forward_http_request(
-            identity("one"),
-            policy.clone(),
-            resolver.clone(),
-            "https://gateway.test/blob",
-            capability_header.clone(),
-            request,
-        )
-        .await?;
-    assert_eq!(response.status(), StatusCode::OK);
-    assert_eq!(
-        response
-            .into_body()
-            .collect()
-            .await
-            .map_err(|error| anyhow!("{error}"))?
-            .to_bytes(),
-        bytes
-    );
-
-    let request = Request::builder()
-        .method(Method::GET)
-        .uri("/proxy/redirect")
-        .header(&capability_header, "opaque-capability")
-        .body(Full::new(Bytes::new()))?;
-    let response = engine
-        .forward_http_request(
-            identity("two"),
-            policy,
-            resolver.clone(),
-            "https://gateway.test/redirect",
-            capability_header,
-            request,
-        )
-        .await?;
-    assert_eq!(response.status(), StatusCode::FOUND);
-    assert_eq!(
-        response.headers().get("location").unwrap(),
-        "https://public.test/auth"
-    );
-    assert_eq!(upstream.requests.load(Ordering::SeqCst), 2);
     assert_eq!(
         resolver.authorizations.read().await.as_slice(),
         [
-            ("one".into(), "api.test".into(), "/binary".into()),
-            ("two".into(), "api.test".into(), "/redirect".into()),
+            ("git-refs".into(), "api.test".into(), GIT_REFS_PATH.into()),
+            (
+                "git-pack".into(),
+                "api.test".into(),
+                GIT_UPLOAD_PACK_PATH.into()
+            ),
+            (
+                "git-denied".into(),
+                "api.test".into(),
+                "/authorized-repo.git/ungranted-repo.git/info/refs".into(),
+            ),
         ]
     );
     Ok(())

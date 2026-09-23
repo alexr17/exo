@@ -86,7 +86,7 @@ async fn authorize(
     &self,
     identity: &EgressIdentity,
     destination: &EgressDestination,
-    context: &EgressRequestContext,
+    credential_bindings: &[String],
 ) -> anyhow::Result<()>;
 
 async fn resolve(
@@ -178,28 +178,20 @@ proxy can pass endpoints to
 
 ## Request-level forwarding
 
-`EgressEngine::forward_http_request` accepts a sandbox identity, an
-`EgressRequestPolicy`, a resolver, an inbound URL, the name of the capability
-header, and an HTTP request on every call. The caller validates its capability
-before calling Exo. Exo removes that header before forwarding. No listener,
-network interception, or process-local sandbox session is required.
+`EgressEngine::forward_http_request` accepts a sandbox identity, policy,
+resolver, inbound URL, capability header name, and HTTP request on every call.
+The caller validates the capability; Exo removes that header before forwarding.
+The API needs no listener or process-local sandbox session.
 
-`EgressRequestPolicy.rules` contains `EgressRule` values with an inbound URL
-prefix, an upstream URL prefix, and allowed HTTP methods. The engine matches a
-path segment boundary, appends the remaining path and query to the upstream
-prefix, and authorizes the resulting destination. An empty method list permits
-all methods except CONNECT. For example, a rule from
+Each `EgressRule` maps an inbound URL prefix and allowed methods to an upstream
+prefix, carrying the remaining path and query. For example, a rule from
 `https://gateway.example/service` to `https://api.example/v1` maps
-`/service/items?id=1` to `/v1/items?id=1`. Adding another service is another
-rule, without a forwarding handler. Both sides require exact DNS hostnames and
-standard HTTP or HTTPS ports.
-
-`EgressRequestPolicy.credentials` supplies placeholders and their destination
-allowlists for that request. The resolver supplies the actual credential only
-after authorization. Request bodies are binary-safe and bounded to 8 MiB;
-responses stream. The engine pins public IPv4 DNS answers, verifies upstream
-TLS, and does not follow redirects. The Firecracker listener applies its
-existing exact-host policy as identity rules and calls the same engine.
+`/service/items?id=1` to `/v1/items?id=1`. The engine authorizes the rewritten
+destination before resolving or forwarding. Credentials are substituted from
+the request policy after authorization. Request bodies are binary-safe and
+bounded to 8 MiB; responses stream. Public IPv4 addresses are pinned, upstream
+TLS is verified, and redirects are not followed. The Firecracker listener uses
+the same engine with exact-host identity rules.
 
 ## Other backends
 

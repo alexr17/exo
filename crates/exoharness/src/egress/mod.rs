@@ -5,10 +5,6 @@
 //! the listener passes their requests through the same engine.
 
 use std::collections::{HashMap, HashSet};
-#[cfg(feature = "firecracker")]
-use std::convert::Infallible;
-#[cfg(feature = "firecracker")]
-use std::net::Ipv4Addr;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -17,34 +13,28 @@ use anyhow::{Context, Result, anyhow, ensure};
 use async_trait::async_trait;
 use bytes::Bytes;
 use futures::TryStreamExt;
-#[cfg(feature = "firecracker")]
-use http_body_util::Full;
 use http_body_util::{BodyExt, Limited, StreamBody, combinators::BoxBody};
-#[cfg(feature = "firecracker")]
-use hyper::StatusCode;
-#[cfg(feature = "firecracker")]
-use hyper::body::Incoming;
 use hyper::body::{Body, Frame};
 use hyper::header::{CONNECTION, HOST, HeaderMap, HeaderName, HeaderValue};
-#[cfg(feature = "firecracker")]
-use hyper::service::service_fn;
 use hyper::{Method, Request, Response};
 #[cfg(feature = "firecracker")]
-use hyper_util::rt::{TokioIo, TokioTimer};
-#[cfg(feature = "firecracker")]
-use rcgen::{BasicConstraints, CertificateParams, DnType, IsCa, Issuer, KeyPair, KeyUsagePurpose};
-#[cfg(feature = "firecracker")]
-use tokio::io::{AsyncRead, AsyncWrite};
-#[cfg(feature = "firecracker")]
-use tokio::sync::Semaphore;
-#[cfg(feature = "firecracker")]
-use tokio::task::JoinSet;
-#[cfg(feature = "firecracker")]
-use tokio_rustls::TlsAcceptor;
-#[cfg(feature = "firecracker")]
-use tokio_rustls::rustls::{self, ServerConfig, pki_types::PrivatePkcs8KeyDer};
-#[cfg(feature = "firecracker")]
-use tokio_util::sync::CancellationToken;
+use {
+    http_body_util::Full,
+    hyper::{StatusCode, body::Incoming, service::service_fn},
+    hyper_util::rt::{TokioIo, TokioTimer},
+    rcgen::{BasicConstraints, CertificateParams, DnType, IsCa, Issuer, KeyPair, KeyUsagePurpose},
+    std::{convert::Infallible, net::Ipv4Addr},
+    tokio::{
+        io::{AsyncRead, AsyncWrite},
+        sync::Semaphore,
+        task::JoinSet,
+    },
+    tokio_rustls::{
+        TlsAcceptor,
+        rustls::{self, ServerConfig, pki_types::PrivatePkcs8KeyDer},
+    },
+    tokio_util::sync::CancellationToken,
+};
 
 use crate::types::{canonical_egress_host, canonical_egress_hosts};
 
@@ -106,7 +96,6 @@ impl UpstreamResolver for PublicUpstreamResolver {
 
 pub type EgressResponseBody = BoxBody<Bytes, Box<dyn std::error::Error + Send + Sync>>;
 type ProxyError = Box<dyn std::error::Error + Send + Sync>;
-type ProxyBody = EgressResponseBody;
 
 #[derive(Debug, Clone)]
 pub struct EgressIdentity {
@@ -149,11 +138,6 @@ pub struct EgressRequestPolicy {
     pub credentials: Vec<EgressRequestCredential>,
 }
 
-#[derive(Debug, Default)]
-pub struct EgressRequestContext {
-    pub credential_bindings: Vec<String>,
-}
-
 /// Looks up a binding for this sandbox's agent/thread on every use. The local
 /// implementation reads Exo's encrypted store; a hosted implementation can use
 /// its own vault and authorization. Only the proxy receives the returned value.
@@ -165,7 +149,7 @@ pub trait EgressCredentialResolver: Send + Sync {
         &self,
         identity: &EgressIdentity,
         destination: &EgressDestination,
-        context: &EgressRequestContext,
+        credential_bindings: &[String],
     ) -> Result<()>;
 
     async fn resolve(
@@ -340,12 +324,6 @@ pub struct EgressEngine {
     upstream: Arc<dyn UpstreamResolver>,
 }
 
-impl Default for EgressEngine {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 impl EgressEngine {
     pub fn new() -> Self {
         Self {
@@ -385,7 +363,7 @@ impl EgressEngine {
         request: Request<B>,
         inbound_url: &str,
         capability_header: Option<&HeaderName>,
-    ) -> Result<Response<ProxyBody>>
+    ) -> Result<Response<EgressResponseBody>>
     where
         B: Body<Data = Bytes> + Send + 'static,
         B::Error: Into<ProxyError> + Send + Sync + 'static,
@@ -403,7 +381,7 @@ impl EgressEngine {
         if let Some(capability_header) = capability_header {
             headers.remove(capability_header);
         }
-        let context = state.validate_credentials(
+        let credential_bindings = state.validate_credentials(
             &headers,
             &destination.host,
             destination.scheme == "https",
@@ -412,7 +390,7 @@ impl EgressEngine {
             IO_TIMEOUT,
             state
                 .resolver
-                .authorize(&state.identity, &destination, &context),
+                .authorize(&state.identity, &destination, &credential_bindings),
         )
         .await
         .map_err(|_| anyhow!("request authorization timed out"))?;
@@ -436,7 +414,7 @@ impl EgressCredentialResolver for PolicyOnlyResolver {
         &self,
         _identity: &EgressIdentity,
         _destination: &EgressDestination,
-        _context: &EgressRequestContext,
+        _credential_bindings: &[String],
     ) -> Result<()> {
         Ok(())
     }
@@ -675,7 +653,7 @@ impl State {
         headers: &HeaderMap,
         host: &str,
         tls: bool,
-    ) -> Result<EgressRequestContext> {
+    ) -> Result<Vec<String>> {
         let mut credential_bindings = HashSet::new();
         for (header, value) in headers {
             if !contains_placeholder(value.as_bytes()) {
@@ -701,9 +679,7 @@ impl State {
         }
         let mut credential_bindings = credential_bindings.into_iter().collect::<Vec<_>>();
         credential_bindings.sort_unstable();
-        Ok(EgressRequestContext {
-            credential_bindings,
-        })
+        Ok(credential_bindings)
     }
 
     async fn substitute_credentials(
@@ -799,7 +775,7 @@ async fn relay<B>(
     mut headers: HeaderMap,
     url: reqwest::Url,
     client: reqwest::Client,
-) -> Result<Response<ProxyBody>>
+) -> Result<Response<EgressResponseBody>>
 where
     B: Body<Data = Bytes> + Send + 'static,
     B::Error: Into<ProxyError> + Send + Sync + 'static,

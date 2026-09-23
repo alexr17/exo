@@ -4914,7 +4914,7 @@ impl crate::egress::EgressCredentialResolver for LocalEgressResolver {
         &self,
         _identity: &crate::egress::EgressIdentity,
         _destination: &crate::egress::EgressDestination,
-        _context: &crate::egress::EgressRequestContext,
+        _credential_bindings: &[String],
     ) -> Result<()> {
         Ok(())
     }
