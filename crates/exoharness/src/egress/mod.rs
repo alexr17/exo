@@ -493,7 +493,6 @@ impl State {
             .map(CompiledRule::new)
             .collect::<Result<Vec<_>>>()?;
         let mut variables = HashSet::new();
-        let mut placeholders = HashSet::new();
         let mut bindings = Vec::new();
         for EgressRequestCredential {
             binding: config,
@@ -528,10 +527,6 @@ impl State {
                         .bytes()
                         .all(|c| c == b'_' || c.is_ascii_alphanumeric()),
                 "invalid credential placeholder"
-            );
-            ensure!(
-                placeholders.insert(placeholder.clone()),
-                "duplicate credential placeholder"
             );
             ensure!(
                 bindings.iter().all(|binding: &Binding| !binding
