@@ -719,6 +719,81 @@ async fn proxy_rejects_cleartext_wrong_destinations_and_other_sandboxes() -> Res
     Ok(())
 }
 
+#[tokio::test]
+async fn connect_stream_uses_supplied_placeholder_and_checks_both_hosts() -> Result<()> {
+    let upstream = Upstream::start().await?;
+    let resolver = TestResolver::new();
+    let placeholder = "exo_egress_0123456789abcdef0123456789abcdef";
+    let placeholders = HashMap::from([("TEST_API_KEY".into(), placeholder.into())]);
+    let listener = Arc::new(TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?);
+    let (ca_pem, tls) = tls_configuration(vec!["api.test".into(), "public.test".into()])?;
+
+    for (connect_host, request_host, expected_status) in [
+        ("api.test", "api.test", Some(StatusCode::OK)),
+        ("api.test", "public.test", Some(StatusCode::BAD_GATEWAY)),
+        ("public.test", "api.test", None),
+    ] {
+        let state = Arc::new(State::new_with_placeholders(
+            identity("connect"),
+            policy(),
+            Some(resolver.clone()),
+            Arc::new(upstream.config.clone()),
+            Some(&placeholders),
+        )?);
+        let accept = listener.clone();
+        let tls = tls.clone();
+        let server = tokio::spawn(async move {
+            let (stream, _) = accept.accept().await?;
+            https_connection(stream, tls, state, Some(connect_host)).await
+        });
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .add_root_certificate(reqwest::Certificate::from_pem(ca_pem.as_bytes())?)
+            .resolve("api.test", listener.local_addr()?)
+            .build()?;
+        let response = client
+            .get("https://api.test/auth")
+            .header(HOST, request_host)
+            .header("connection", "close")
+            .header("authorization", format!("Bearer {placeholder}"))
+            .send()
+            .await;
+        if let Some(status) = expected_status {
+            let response = response?;
+            assert_eq!(response.status(), status);
+            if status == StatusCode::OK {
+                assert_eq!(response.text().await?, "authenticated-v1");
+            }
+            drop(client);
+            server.await??;
+        } else {
+            assert!(response.is_err());
+            assert!(server.await?.is_err());
+        }
+    }
+    assert_eq!(upstream.connections.load(Ordering::SeqCst), 1);
+    assert_eq!(resolver.uses.read().await.len(), 1);
+    let mut no_credentials = policy();
+    no_credentials.credentials.clear();
+    for authority in ["blocked.test:443", "api.test:80"] {
+        let (stream, _) = tokio::io::duplex(1);
+        assert!(
+            serve_https_connect(
+                stream,
+                authority,
+                tls.clone(),
+                identity("connect"),
+                no_credentials.clone(),
+                None,
+                &HashMap::new(),
+            )
+            .await
+            .is_err()
+        );
+    }
+    Ok(())
+}
+
 #[test]
 fn rejects_unsafe_policy_and_addresses() {
     for host in [

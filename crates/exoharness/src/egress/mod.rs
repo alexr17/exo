@@ -212,6 +212,39 @@ impl EgressProxy {
     }
 }
 
+/// Serve a CONNECT tunnel after the caller has authenticated it and sent 200.
+/// The caller supplies TLS configuration trusted by the sandbox and the same
+/// placeholders it installed there. TLS must negotiate HTTP/1.1. No listener
+/// or sandbox session is retained.
+pub async fn serve_https_connect<T>(
+    stream: T,
+    connect_authority: &str,
+    tls: TlsAcceptor,
+    identity: EgressIdentity,
+    policy: EgressPolicy,
+    resolver: Option<Arc<dyn EgressCredentialResolver>>,
+    placeholders: &HashMap<String, String>,
+) -> Result<()>
+where
+    T: AsyncRead + AsyncWrite + Send + Unpin + 'static,
+{
+    let authority: hyper::http::uri::Authority = connect_authority.parse()?;
+    ensure!(
+        authority.port_u16() == Some(443),
+        "CONNECT requires port 443"
+    );
+    let host = canonical_egress_host(authority.host())?;
+    let state = State::new_with_placeholders(
+        identity,
+        policy,
+        resolver,
+        Arc::new(PublicUpstreamResolver),
+        Some(placeholders),
+    )?;
+    ensure!(state.hosts.contains(&host), "host is not allowed");
+    https_connection(stream, tls, Arc::new(state), Some(&host)).await
+}
+
 impl Drop for EgressProxy {
     fn drop(&mut self) {
         self.close();
@@ -225,6 +258,16 @@ impl State {
         policy: EgressPolicy,
         resolver: Option<Arc<dyn EgressCredentialResolver>>,
         upstream: Arc<dyn UpstreamResolver>,
+    ) -> Result<Self> {
+        Self::new_with_placeholders(identity, policy, resolver, upstream, None)
+    }
+
+    fn new_with_placeholders(
+        identity: EgressIdentity,
+        policy: EgressPolicy,
+        resolver: Option<Arc<dyn EgressCredentialResolver>>,
+        upstream: Arc<dyn UpstreamResolver>,
+        placeholders: Option<&HashMap<String, String>>,
     ) -> Result<Self> {
         ensure!(
             !identity.sandbox_id.is_empty(),
@@ -241,6 +284,13 @@ impl State {
             "credential substitution requires an egress credential resolver"
         );
         let mut variables = HashSet::new();
+        let mut values = HashSet::new();
+        if let Some(placeholders) = placeholders {
+            ensure!(
+                placeholders.len() == policy.credentials.len(),
+                "placeholder map must match credential bindings"
+            );
+        }
         let mut bindings = Vec::new();
         for config in policy.credentials {
             let CredentialNetworkPolicy::Limited { allowed_hosts } = &config.networking;
@@ -264,10 +314,27 @@ impl State {
                 variables.insert(config.environment_variable.clone()),
                 "duplicate credential environment variable"
             );
+            let placeholder = if let Some(placeholders) = placeholders {
+                let value = placeholders
+                    .get(&config.environment_variable)
+                    .context("missing credential placeholder")?;
+                ensure!(
+                    value.len() == PLACEHOLDER_PREFIX.len() + 32
+                        && value.starts_with(PLACEHOLDER_PREFIX)
+                        && value[PLACEHOLDER_PREFIX.len()..]
+                            .bytes()
+                            .all(|byte| byte.is_ascii_hexdigit())
+                        && values.insert(value.clone()),
+                    "invalid or duplicate credential placeholder"
+                );
+                value.clone()
+            } else {
+                format!("{PLACEHOLDER_PREFIX}{}", uuid::Uuid::new_v4().simple())
+            };
             bindings.push(Binding {
                 config,
                 hosts,
-                placeholder: format!("{PLACEHOLDER_PREFIX}{}", uuid::Uuid::new_v4().simple()),
+                placeholder,
             });
         }
         Ok(Self {
@@ -632,6 +699,31 @@ where
     Ok(())
 }
 
+async fn https_connection<T>(
+    stream: T,
+    tls: TlsAcceptor,
+    state: Arc<State>,
+    connect_host: Option<&str>,
+) -> Result<()>
+where
+    T: AsyncRead + AsyncWrite + Send + Unpin + 'static,
+{
+    let stream = tokio::time::timeout(IO_TIMEOUT, tls.accept(stream)).await??;
+    let sni = stream
+        .get_ref()
+        .1
+        .server_name()
+        .context("TLS SNI is required")?
+        .to_owned();
+    if let Some(host) = connect_host {
+        ensure!(
+            canonical_egress_host(&sni)? == host,
+            "CONNECT host and TLS SNI must match"
+        );
+    }
+    http_connection(stream, state, Some(sni)).await
+}
+
 async fn serve(
     transport: Arc<dyn EgressTransport>,
     tls: TlsAcceptor,
@@ -664,9 +756,7 @@ async fn serve(
                 let tls = tls.clone();
                 tasks.spawn(async move {
                     let _permit = permit;
-                    let stream = tokio::time::timeout(IO_TIMEOUT, tls.accept(stream)).await??;
-                    let sni = stream.get_ref().1.server_name().context("TLS SNI is required")?.to_owned();
-                    http_connection(stream, state, Some(sni)).await
+                    https_connection(stream, tls, state, None).await
                 });
             }
         }

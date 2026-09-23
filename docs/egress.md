@@ -169,8 +169,11 @@ proxy can pass endpoints to
 `EgressProxy::start(identity, policy, resolver, transport, cancel)` starts the
 proxy using the existing `EgressPolicy` and an `EgressTransport`. It exposes
 listener endpoints, the CA certificate, and placeholder environment variables.
-This is a transparent proxy; an explicit `HTTPS_PROXY`/CONNECT listener is not
-implemented here.
+For an explicit HTTPS proxy, the caller authenticates CONNECT and passes its
+post-200 stream to `serve_https_connect` with the CONNECT authority, a TLS
+acceptor trusted by the sandbox, and the sandbox's stable placeholders. Exo
+checks CONNECT host, SNI, and HTTP Host before forwarding. The caller owns the
+listener and TLS material.
 
 A hosted backend can implement `ManagedSandboxBackend::acquire` itself: choose
 the sandbox node, establish an authenticated relay to the credential service,
