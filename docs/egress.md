@@ -4,9 +4,9 @@ Sandbox policy is part of `SandboxSpec`. Each backend enforces the policy when
 it acquires, attaches, or restores a sandbox, before returning a usable handle.
 Unsupported policies fail with an error identifying the unsupported field.
 
-The `egress` build feature exposes request-level forwarding without a VM or
-listener. The `firecracker` feature includes it. Firecracker implements credential
-substitution with a transparent HTTP/HTTPS proxy. Programs receive placeholder
+The `egress` build feature includes the forwarding engine, TLS proxy, and
+transport without a VM backend. The `firecracker` feature adds VM integration
+and uses the proxy for transparent HTTP/HTTPS credential substitution. Programs receive placeholder
 environment variables; the proxy resolves credentials outside the VM and
 substitutes them on authorized requests.
 
@@ -189,8 +189,10 @@ rules first. Exo removes the capability header, enforces the existing host
 allowlists, and calls `authorize` before DNS resolution or credential lookup,
 even without placeholders. Repository grants remain the resolver's responsibility.
 
-The engine works without Firecracker or a listener. Request bodies are bounded
-to 8 MiB; responses stream, public IPv4 addresses are pinned, upstream TLS is
+`EgressProxy::start_with_transport` serves the same engine over an
+`EgressTransport`; TLS and DNS do not require the Firecracker feature.
+The engine can also forward requests without a listener. Request bodies are
+bounded to 8 MiB; responses stream, public IPv4 addresses are pinned, upstream TLS is
 verified, and redirects are not followed. Firecracker retains limited networking;
 the request API also accepts unrestricted networking while keeping credential
 destinations independently restricted. Disabled networking denies requests.
@@ -256,7 +258,7 @@ selected binding and forwards only requests the resolver authorizes.
 Run the request engine and listener unit tests:
 
 ```bash
-cargo test -p exoharness --features egress --lib egress::request_tests::
+cargo test -p exoharness --features egress --lib egress::
 cargo test -p exoharness --features firecracker --lib egress::
 ```
 

@@ -1,11 +1,11 @@
 //! Shared egress policy enforcement, credential substitution, and forwarding.
 //!
-//! The public engine accepts an identity and policy on every request. With the
-//! `firecracker` feature, `EgressTransport` supplies sandbox connections and
-//! the listener passes their requests through the same engine.
+//! The engine, TLS listener, and transport work independently of a sandbox
+//! backend. Firecracker adds sandbox acquisition and lifecycle management.
 
 use std::collections::{HashMap, HashSet};
-use std::net::{IpAddr, SocketAddr};
+use std::convert::Infallible;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -13,38 +13,28 @@ use anyhow::{Context, Result, anyhow, ensure};
 use async_trait::async_trait;
 use bytes::Bytes;
 use futures::TryStreamExt;
-use http_body_util::{BodyExt, Limited, StreamBody, combinators::BoxBody};
+use http_body_util::{BodyExt, Full, Limited, StreamBody, combinators::BoxBody};
 use hyper::body::{Body, Frame};
 use hyper::header::{CONNECTION, HOST, HeaderMap, HeaderName, HeaderValue};
-use hyper::{Method, Request, Response};
-#[cfg(feature = "firecracker")]
-use {
-    http_body_util::Full,
-    hyper::{StatusCode, service::service_fn},
-    hyper_util::rt::{TokioIo, TokioTimer},
-    rcgen::{BasicConstraints, CertificateParams, DnType, IsCa, Issuer, KeyPair, KeyUsagePurpose},
-    std::{convert::Infallible, net::Ipv4Addr},
-    tokio::{
-        io::{AsyncRead, AsyncWrite},
-        sync::Semaphore,
-        task::JoinSet,
-    },
-    tokio_rustls::{
-        TlsAcceptor,
-        rustls::{self, ServerConfig, pki_types::PrivatePkcs8KeyDer},
-    },
-    tokio_util::sync::CancellationToken,
-};
+use hyper::service::service_fn;
+use hyper::{Method, Request, Response, StatusCode};
+use hyper_util::rt::{TokioIo, TokioTimer};
+use rcgen::{BasicConstraints, CertificateParams, DnType, IsCa, Issuer, KeyPair, KeyUsagePurpose};
+use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::sync::Semaphore;
+use tokio::task::JoinSet;
+use tokio_rustls::TlsAcceptor;
+use tokio_rustls::rustls::{self, ServerConfig, pki_types::PrivatePkcs8KeyDer};
+use tokio_util::sync::CancellationToken;
 
 use crate::types::{canonical_egress_host, canonical_egress_hosts};
 
-#[cfg(feature = "firecracker")]
-use crate::SandboxEgressProxy;
-use crate::{CredentialNetworkPolicy, EgressCredentialBinding, EgressPolicy, SandboxNetworkPolicy};
+use crate::{
+    CredentialNetworkPolicy, EgressCredentialBinding, EgressPolicy, SandboxEgressProxy,
+    SandboxNetworkPolicy,
+};
 
-#[cfg(feature = "firecracker")]
 mod transport;
-#[cfg(feature = "firecracker")]
 pub use transport::{EgressTransport, LocalEgressTransport};
 #[cfg(feature = "firecracker")]
 mod sandbox;
@@ -55,9 +45,7 @@ const PLACEHOLDER_PREFIX: &str = "exo_egress_";
 const IO_TIMEOUT: Duration = Duration::from_secs(30);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_REQUEST_BODY: usize = 8 * 1024 * 1024;
-#[cfg(feature = "firecracker")]
 const HTTP_BUFFER_SIZE: usize = 32 * 1024;
-#[cfg(feature = "firecracker")]
 const MAX_CONNECTIONS: usize = 128;
 
 pub(crate) struct ResolvedUpstream {
@@ -135,8 +123,7 @@ pub trait EgressCredentialResolver: Send + Sync {
 
 // Owns one sandbox's TLS server, placeholders, and active proxy connections.
 // It does not create VMs or decide where credentials are stored.
-#[cfg(feature = "firecracker")]
-struct EgressProxy {
+pub struct EgressProxy {
     endpoints: SandboxEgressProxy,
     transport: Arc<dyn EgressTransport>,
     ca_pem: String,
@@ -174,16 +161,15 @@ pub struct EgressEngine {
     upstream: Arc<dyn UpstreamResolver>,
 }
 
-#[cfg(feature = "firecracker")]
 impl EgressProxy {
-    async fn start_with_transport(
+    pub async fn start_with_transport(
         transport: Arc<dyn EgressTransport>,
         state: EgressEngine,
         cancel: CancellationToken,
     ) -> Result<Self> {
         ensure!(
             !state.unrestricted,
-            "Firecracker egress proxy requires limited networking"
+            "transparent egress proxy requires limited networking"
         );
         let endpoints = transport.endpoints();
         endpoints.validate()?;
@@ -201,29 +187,28 @@ impl EgressProxy {
         })
     }
 
-    async fn bind_source(&self, source_ip: Ipv4Addr) -> Result<()> {
+    pub async fn bind_source(&self, source_ip: Ipv4Addr) -> Result<()> {
         self.transport.bind_source(source_ip).await
     }
 
-    fn endpoints(&self) -> SandboxEgressProxy {
+    pub fn endpoints(&self) -> SandboxEgressProxy {
         self.endpoints
     }
 
-    fn ca_pem(&self) -> &str {
+    pub fn ca_pem(&self) -> &str {
         &self.ca_pem
     }
 
-    fn environment(&self) -> &HashMap<String, String> {
+    pub fn environment(&self) -> &HashMap<String, String> {
         &self.environment
     }
 
-    fn close(&self) {
+    pub fn close(&self) {
         self.cancel.cancel();
         self.transport.close();
     }
 }
 
-#[cfg(feature = "firecracker")]
 impl Drop for EgressProxy {
     fn drop(&mut self) {
         self.close();
@@ -671,7 +656,6 @@ fn strip_hop_headers(headers: &mut HeaderMap) -> Result<()> {
     Ok(())
 }
 
-#[cfg(feature = "firecracker")]
 fn tls_configuration(hosts: Vec<String>) -> Result<(String, TlsAcceptor)> {
     let mut ca = CertificateParams::new(Vec::<String>::new())?;
     ca.distinguished_name
@@ -703,7 +687,6 @@ fn tls_configuration(hosts: Vec<String>) -> Result<(String, TlsAcceptor)> {
     Ok((certificate.pem(), TlsAcceptor::from(Arc::new(tls))))
 }
 
-#[cfg(feature = "firecracker")]
 async fn http_connection<T>(stream: T, state: Arc<EgressEngine>, sni: Option<String>) -> Result<()>
 where
     T: AsyncRead + AsyncWrite + Send + Unpin + 'static,
@@ -738,7 +721,6 @@ where
     Ok(())
 }
 
-#[cfg(feature = "firecracker")]
 async fn serve(
     transport: Arc<dyn EgressTransport>,
     tls: TlsAcceptor,
@@ -784,6 +766,4 @@ async fn serve(
 }
 
 #[cfg(test)]
-mod request_tests;
-#[cfg(all(test, feature = "firecracker"))]
 mod tests;

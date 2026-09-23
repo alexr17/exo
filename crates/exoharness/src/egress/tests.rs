@@ -1002,6 +1002,7 @@ fn dns_only_answers_exact_allowed_names() -> Result<()> {
     Ok(())
 }
 
+#[cfg(feature = "firecracker")]
 async fn guest(
     handle: &Arc<dyn crate::ManagedSandboxHandle>,
     proxy: &EgressProxy,
@@ -1027,6 +1028,7 @@ async fn guest(
     Ok(output.stdout)
 }
 
+#[cfg(feature = "firecracker")]
 #[tokio::test]
 #[ignore = "requires root, Linux/KVM, and the Exo Firecracker artifact bundle"]
 async fn firecracker_transparent_egress_live() -> Result<()> {
@@ -1518,4 +1520,43 @@ async fn quiet_response_stream_survives_past_the_request_io_timeout() -> Result<
     assert_eq!(response.chunk().await?.unwrap(), "last\n");
     assert!(response.chunk().await?.is_none());
     proxy.shutdown().await
+}
+
+#[test]
+fn shared_network_policy_works_without_firecracker() -> Result<()> {
+    for (networking, permitted) in [
+        (SandboxNetworkPolicy::Unrestricted, true),
+        (
+            SandboxNetworkPolicy::Limited {
+                allowed_hosts: vec!["api.test".into()],
+            },
+            true,
+        ),
+        (
+            SandboxNetworkPolicy::Limited {
+                allowed_hosts: vec![],
+            },
+            false,
+        ),
+        (SandboxNetworkPolicy::Disabled, false),
+    ] {
+        let state = EgressEngine::new(
+            EgressIdentity {
+                sandbox_id: "request-test".into(),
+                scope: None,
+            },
+            networking.into(),
+            None,
+        );
+        let request = Request::builder()
+            .uri("/a/../v1?query=1")
+            .header(HOST, "api.test")
+            .body(())?;
+        let destination = state.and_then(|state| state.destination(&request, Some("api.test")));
+        assert_eq!(destination.is_ok(), permitted);
+        if let Ok((destination, _)) = destination {
+            assert_eq!(destination.path, "/v1?query=1");
+        }
+    }
+    Ok(())
 }
