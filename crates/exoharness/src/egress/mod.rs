@@ -1,8 +1,9 @@
-//! Request-level egress authorization, rewriting, and forwarding.
+//! HTTP/TLS handling and credential substitution outside the sandbox.
 //!
-//! The public engine accepts an identity and policy on every request. With the
-//! `firecracker` feature, `EgressTransport` supplies sandbox connections and
-//! the listener passes their requests through the same engine.
+//! `EgressTransport` supplies connections from the sandbox network. This module
+//! checks destinations, resolves credentials, and forwards requests. `sandbox`
+//! coordinates proxy setup with Firecracker/Lima acquisition; `transport`
+//! implements the listeners and DNS service on the VM host.
 
 use std::collections::{HashMap, HashSet};
 use std::convert::Infallible;
@@ -279,14 +280,13 @@ fn egress_destination(url: &reqwest::Url, method: &Method) -> Result<EgressDesti
     })
 }
 
-// Both the Firecracker listener and the public request API use this engine.
-// Clients are pinned to resolved addresses and replaced when those change.
+// Firecracker reuses this state per sandbox; the HTTP API creates it per request.
 struct State {
     clients: Mutex<HashMap<(String, u16), PooledClient>>,
     hosts: HashSet<String>,
     bindings: Vec<Binding>,
     identity: EgressIdentity,
-    resolver: Arc<dyn EgressCredentialResolver>,
+    resolver: Option<Arc<dyn EgressCredentialResolver>>,
     upstream: Arc<dyn UpstreamResolver>,
 }
 
@@ -389,7 +389,7 @@ impl EgressEngine {
         let state = State::new_request(
             identity,
             policy.credentials,
-            resolver,
+            Some(resolver),
             self.upstream.clone(),
         )?;
         Self::forward(&state, request, destination, url, Some(&capability_header)).await
@@ -423,44 +423,22 @@ impl EgressEngine {
             &destination.host,
             destination.scheme == "https",
         )?;
-        let authorized = tokio::time::timeout(
-            IO_TIMEOUT,
-            state
-                .resolver
-                .authorize(&state.identity, &destination, &credential_bindings),
-        )
-        .await
-        .map_err(|_| anyhow!("request authorization timed out"))?;
-        authorized.map_err(|_| anyhow!("request is not authorized"))?;
+        // The HTTP API always supplies a resolver; Firecracker can rely on its host policy.
+        if let Some(resolver) = &state.resolver {
+            let authorized = tokio::time::timeout(
+                IO_TIMEOUT,
+                resolver.authorize(&state.identity, &destination, &credential_bindings),
+            )
+            .await
+            .map_err(|_| anyhow!("request authorization timed out"))?;
+            authorized.map_err(|_| anyhow!("request is not authorized"))?;
+        }
         strip_hop_headers(&mut headers)?;
         let client = state.client(&destination.host, destination.port).await?;
         state
             .substitute_credentials(&mut headers, &destination)
             .await?;
         relay(request, headers, url, client).await
-    }
-}
-
-struct PolicyOnlyResolver;
-
-#[async_trait]
-impl EgressCredentialResolver for PolicyOnlyResolver {
-    async fn authorize(
-        &self,
-        _identity: &EgressIdentity,
-        _destination: &EgressDestination,
-        _credential_bindings: &[String],
-    ) -> Result<()> {
-        Ok(())
-    }
-
-    async fn resolve(
-        &self,
-        _identity: &EgressIdentity,
-        _binding_name: &str,
-        _destination: &EgressDestination,
-    ) -> Result<String> {
-        Err(anyhow!("credential resolver is unavailable"))
     }
 }
 
@@ -489,12 +467,7 @@ impl State {
                 placeholder: format!("{PLACEHOLDER_PREFIX}{}", uuid::Uuid::new_v4().simple()),
             })
             .collect();
-        let mut state = Self::new_request(
-            identity,
-            credentials,
-            resolver.unwrap_or_else(|| Arc::new(PolicyOnlyResolver)),
-            upstream,
-        )?;
+        let mut state = Self::new_request(identity, credentials, resolver, upstream)?;
         state.hosts = hosts;
         Ok(state)
     }
@@ -502,7 +475,7 @@ impl State {
     fn new_request(
         identity: EgressIdentity,
         credentials: Vec<EgressRequestCredential>,
-        resolver: Arc<dyn EgressCredentialResolver>,
+        resolver: Option<Arc<dyn EgressCredentialResolver>>,
         upstream: Arc<dyn UpstreamResolver>,
     ) -> Result<Self> {
         ensure!(
@@ -672,6 +645,8 @@ impl State {
                 let value = tokio::time::timeout(
                     IO_TIMEOUT,
                     self.resolver
+                        .as_ref()
+                        .context("credential resolver is unavailable")?
                         .resolve(&self.identity, &binding.config.name, destination),
                 )
                 .await?

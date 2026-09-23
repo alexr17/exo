@@ -178,22 +178,17 @@ proxy can pass endpoints to
 
 ## Request-level forwarding
 
-Under the `firecracker` feature, `EgressEngine::forward_http_request` accepts a
-sandbox identity, policy, resolver, capability header name, and HTTP request on
-every call. Rules match the request URI. The caller validates the capability;
-Exo removes that header before forwarding. The API needs no listener or
-process-local sandbox session.
+With the `firecracker` feature, `EgressEngine::forward_http_request` takes an
+HTTP request plus sandbox identity, URL and method rules, and a resolver. It
+starts no listener and keeps no sandbox session. The caller validates its
+capability; Exo strips the named capability header before forwarding.
 
-Each `EgressRule` maps an inbound URL prefix and allowed methods to an upstream
-prefix, carrying the remaining path and query. For example, a rule from
-`https://gateway.example/service` to `https://api.example/v1` maps
-`/service/items?id=1` to `/v1/items?id=1`. The engine authorizes the rewritten
-destination before resolving or forwarding. Credentials are substituted from
-the request policy after authorization. Request bodies are binary-safe and
-bounded to 8 MiB; responses stream. Public IPv4 addresses are pinned, upstream
-TLS is verified, and redirects are not followed. The Firecracker listener
-derives its destination from Host and SNI before using the same authorization
-and forwarding path.
+Rules map an inbound URL prefix to an upstream prefix, keeping the suffix and
+query. Firecracker selects its destination from Host, SNI, and its host policy.
+Both use the same forwarding code. The HTTP resolver authorizes the rewritten
+destination before credential substitution and public-address resolution.
+Requests are limited to 8 MiB, responses stream, upstream TLS is verified, and
+redirects are not followed.
 
 ## Other backends
 
