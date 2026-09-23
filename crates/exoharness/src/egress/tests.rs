@@ -706,7 +706,7 @@ impl RequestApi {
     ) -> Result<Response<EgressResponseBody>> {
         let mut request = Request::builder()
             .method(method)
-            .uri("/proxy")
+            .uri(inbound_url)
             .header("x-sandbox-capability", "opaque-capability");
         if let Some(authorization) = authorization {
             request = request
@@ -721,7 +721,6 @@ impl RequestApi {
                 identity(sandbox_id),
                 self.policy.clone(),
                 self.resolver.clone(),
-                inbound_url,
                 HeaderName::from_static("x-sandbox-capability"),
                 request.body(Full::new(body))?,
             )

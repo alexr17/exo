@@ -4,8 +4,8 @@ Sandbox policy is part of `SandboxSpec`. Each backend enforces the policy when
 it acquires, attaches, or restores a sandbox, before returning a usable handle.
 Unsupported policies fail with an error identifying the unsupported field.
 
-The `egress` build feature exposes request-level forwarding without a VM or
-listener. The `firecracker` feature includes it. Firecracker implements credential
+The existing `firecracker` build feature includes the proxy; there is no
+separate egress feature to enable. Firecracker implements credential
 substitution with a transparent HTTP/HTTPS proxy. Programs receive placeholder
 environment variables; the proxy resolves credentials outside the VM and
 substitutes them on authorized requests.
@@ -178,10 +178,11 @@ proxy can pass endpoints to
 
 ## Request-level forwarding
 
-`EgressEngine::forward_http_request` accepts a sandbox identity, policy,
-resolver, inbound URL, capability header name, and HTTP request on every call.
-The caller validates the capability; Exo removes that header before forwarding.
-The API needs no listener or process-local sandbox session.
+Under the `firecracker` feature, `EgressEngine::forward_http_request` accepts a
+sandbox identity, policy, resolver, capability header name, and HTTP request on
+every call. Rules match the request URI. The caller validates the capability;
+Exo removes that header before forwarding. The API needs no listener or
+process-local sandbox session.
 
 Each `EgressRule` maps an inbound URL prefix and allowed methods to an upstream
 prefix, carrying the remaining path and query. For example, a rule from
@@ -190,8 +191,9 @@ prefix, carrying the remaining path and query. For example, a rule from
 destination before resolving or forwarding. Credentials are substituted from
 the request policy after authorization. Request bodies are binary-safe and
 bounded to 8 MiB; responses stream. Public IPv4 addresses are pinned, upstream
-TLS is verified, and redirects are not followed. The Firecracker listener uses
-the same engine with exact-host identity rules.
+TLS is verified, and redirects are not followed. The Firecracker listener
+derives its destination from Host and SNI before using the same authorization
+and forwarding path.
 
 ## Other backends
 
@@ -254,7 +256,6 @@ selected binding and forwards only requests the resolver authorizes.
 Run the request engine and listener unit tests:
 
 ```bash
-cargo check -p exoharness --features egress --lib
 cargo test -p exoharness --features firecracker --lib egress::tests::
 ```
 

@@ -20,10 +20,11 @@ basic-backend = [
   "dep:tracing",
   "dep:url",
 ]
-egress = ["basic-backend", "dep:http-body-util", "dep:hyper"]
 firecracker = [
-  "egress",
+  "basic-backend",
   "dep:hickory-proto",
+  "dep:http-body-util",
+  "dep:hyper",
   "dep:hyper-util",
   "dep:rcgen",
   "dep:tokio-rustls",
