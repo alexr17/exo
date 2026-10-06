@@ -1705,6 +1705,7 @@ mod egress_cleanup_tests {
                 scope: crate::ResourceScope::Global,
                 provider_state: None,
                 spec: crate::SandboxSpec {
+                    root_disk_gib: None,
                     tcp_ports: vec![],
                     image: "test".into(),
                     resources,
@@ -1886,6 +1887,7 @@ mod egress_cleanup_tests {
             scope: crate::ResourceScope::Global,
             provider_state: None,
             spec: crate::SandboxSpec {
+                root_disk_gib: None,
                 tcp_ports: vec![],
                 image: "test".into(),
                 resources: Default::default(),

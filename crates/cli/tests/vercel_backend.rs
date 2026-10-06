@@ -21,6 +21,7 @@ fn make_request(thread_id: exoharness::Uuid7, sandbox_id: &str) -> SandboxReques
             thread_id,
         },
         spec: SandboxSpec {
+            root_disk_gib: None,
             tcp_ports: vec![],
             image: "node24".into(),
             resources: Default::default(),

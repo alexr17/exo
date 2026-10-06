@@ -4977,6 +4977,7 @@ fn sandbox_request(
         sandbox_id: sandbox_id.to_string(),
         scope: owner,
         spec: SandboxSpec {
+            root_disk_gib: None,
             image: sandbox.image.clone(),
             resources: sandbox.resources,
             mounts: sandbox

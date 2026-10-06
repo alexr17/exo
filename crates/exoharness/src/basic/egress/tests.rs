@@ -514,6 +514,7 @@ async fn container_registrations_reject_credentials_before_launch() -> Result<()
         scope: ResourceScope::Global,
         provider_state: None,
         spec: crate::SandboxSpec {
+            root_disk_gib: None,
             tcp_ports: vec![],
             image: "must-not-be-launched".into(),
             resources: crate::SandboxResourceShape::new(1, 512),

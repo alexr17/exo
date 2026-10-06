@@ -699,6 +699,7 @@ async fn local_process_contract_handle(
                 thread_id: Uuid7::now(),
             },
             spec: SandboxSpec {
+                root_disk_gib: None,
                 tcp_ports: vec![],
                 image: "local-process".to_string(),
                 resources: Default::default(),
@@ -902,6 +903,7 @@ fn provider_contract_request(
             thread_id: Uuid7::now(),
         },
         spec: SandboxSpec {
+            root_disk_gib: None,
             tcp_ports: vec![],
             image,
             resources: Default::default(),
@@ -2850,6 +2852,7 @@ async fn local_process_sandbox_rejects_disabled_networking() {
             scope: crate::ResourceScope::Global,
             provider_state: None,
             spec: crate::SandboxSpec {
+                root_disk_gib: None,
                 tcp_ports: vec![],
                 image: String::new(),
                 resources: Default::default(),

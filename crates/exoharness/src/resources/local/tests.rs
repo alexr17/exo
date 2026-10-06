@@ -71,6 +71,7 @@ async fn isolated_git_resources_live(
         scope: ResourceScope::Global,
         provider_state: None,
         spec: SandboxSpec {
+            root_disk_gib: None,
             image: backend.resolve_image(&image).await?.image,
             resources: SandboxResourceShape::new(1, 1024),
             mounts: vec![],

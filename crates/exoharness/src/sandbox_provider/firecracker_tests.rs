@@ -29,6 +29,35 @@ fn runtime_fingerprint_uses_requested_resources() {
 }
 
 #[test]
+fn root_disk_sizes_separate_snapshot_templates() -> Result<()> {
+    let mut spec: SandboxSpec = serde_json::from_str(
+        r#"{
+        "image": "runtime", "mounts": [], "durable_file_systems": [],
+        "policy": {"networking": {"type": "disabled"}, "credentials": []},
+        "default_workdir": "/workspace"
+    }"#,
+    )?;
+    let config = FirecrackerConfig::default();
+    let original = template_spec_hash(&spec);
+    let serialized = serde_json::to_string(&spec)?;
+    assert!(!serialized.contains("root_disk_gib"));
+    assert_eq!(
+        root_disk_bytes(&config, &spec)?,
+        config.image_size_gib * 1024 * 1024 * 1024
+    );
+    spec.root_disk_gib = std::num::NonZeroU64::new(64);
+    assert_eq!(root_disk_bytes(&config, &spec)?, 64 * 1024 * 1024 * 1024);
+    assert_ne!(template_spec_hash(&spec), original);
+    let decoded: SandboxSpec = serde_json::from_str(&serde_json::to_string(&spec)?)?;
+    assert_eq!(decoded, spec);
+    spec.root_disk_gib = std::num::NonZeroU64::new(128);
+    assert_ne!(template_spec_hash(&spec), template_spec_hash(&decoded));
+    spec.root_disk_gib = std::num::NonZeroU64::new(u64::MAX);
+    assert!(root_disk_bytes(&config, &spec).is_err());
+    Ok(())
+}
+
+#[test]
 fn firecracker_validates_provider_specific_resource_limits() {
     validate_resource_shape(SandboxResourceShape::new(1, 128).unwrap()).unwrap();
     assert!(validate_resource_shape(SandboxResourceShape::new(33, 4096).unwrap()).is_err());
@@ -123,6 +152,7 @@ fn proxy_transport_enforces_egress_independently_of_network_policy() {
             scope: crate::ResourceScope::Global,
             provider_state: None,
             spec: SandboxSpec {
+                root_disk_gib: None,
                 tcp_ports: vec![],
                 image: String::new(),
                 resources: Default::default(),
@@ -919,6 +949,7 @@ impl DurableStopFixture {
             sandbox_id: "durable".into(),
             scope: crate::ResourceScope::Global,
             spec: SandboxSpec {
+                root_disk_gib: None,
                 tcp_ports: vec![],
                 image: "/images/test.ext4".into(),
                 resources: Default::default(),
@@ -1226,6 +1257,7 @@ fn resource_disks_have_independent_guest_mounts_and_read_only_drives() -> Result
             provider_state: None,
             lifecycle: Default::default(),
             spec: SandboxSpec {
+                root_disk_gib: None,
                 tcp_ports: vec![],
                 image: "/base.ext4".into(),
                 resources: None,
@@ -1338,6 +1370,7 @@ async fn resource_disks_live_isolate_resume_and_enforce_read_only() -> Result<()
             thread_id: thread,
         },
         spec: SandboxSpec {
+            root_disk_gib: None,
             tcp_ports: vec![],
             image: image.clone(),
             resources: None,

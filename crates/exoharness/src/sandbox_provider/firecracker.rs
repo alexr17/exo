@@ -1194,8 +1194,9 @@ impl FirecrackerSandboxBackend {
             let config = self.shared.config.clone();
             let key = template_key.clone();
             let memory_mib = manifest.runtime.memory_mib;
+            let disk_bytes = root_disk_bytes(&config, &request.spec)?;
             let template_ready = tokio::task::spawn_blocking(move || {
-                snapshot_template_ready(&config, &key, memory_mib)
+                snapshot_template_ready(&config, &key, memory_mib, disk_bytes)
             })
             .await
             .context("joining Firecracker snapshot template validation")??;
@@ -3908,7 +3909,7 @@ fn prepare_and_launch_blocking(
             .create_new(true)
             .write(true)
             .open(&overlay)?;
-        file.set_len(gib_bytes(config.image_size_gib, "image")?)?;
+        file.set_len(root_disk_bytes(config, &request.spec)?)?;
         run_checked(
             "mkfs.ext4",
             &[
@@ -4590,11 +4591,7 @@ fn firecracker_api_request<T: Serialize>(
     )
 }
 
-fn validate_snapshot_template(
-    config: &FirecrackerConfig,
-    directory: &Path,
-    memory_mib: u32,
-) -> Result<bool> {
+fn validate_snapshot_template(directory: &Path, memory_mib: u32, disk_bytes: u64) -> Result<bool> {
     let complete = directory.join("complete");
     if !complete.try_exists()? {
         return Ok(false);
@@ -4605,10 +4602,7 @@ fn validate_snapshot_template(
             directory.join("memory"),
             Some(u64::from(memory_mib) * 1024 * 1024),
         ),
-        (
-            directory.join("overlay.ext4"),
-            Some(gib_bytes(config.image_size_gib, "image")?),
-        ),
+        (directory.join("overlay.ext4"), Some(disk_bytes)),
     ];
     for (path, expected_length) in expected {
         let metadata = fs::metadata(&path)
@@ -4634,12 +4628,25 @@ fn gib_bytes(size_gib: u64, label: &str) -> Result<u64> {
         .with_context(|| format!("Firecracker {label} size overflows bytes"))
 }
 
-fn snapshot_template_ready(config: &FirecrackerConfig, key: &str, memory_mib: u32) -> Result<bool> {
+fn root_disk_bytes(config: &FirecrackerConfig, spec: &SandboxSpec) -> Result<u64> {
+    gib_bytes(
+        spec.root_disk_gib
+            .map_or(config.image_size_gib, std::num::NonZeroU64::get),
+        "root disk",
+    )
+}
+
+fn snapshot_template_ready(
+    config: &FirecrackerConfig,
+    key: &str,
+    memory_mib: u32,
+    disk_bytes: u64,
+) -> Result<bool> {
     let directory = snapshot_template_dir(config, key)?;
     if !directory.try_exists()? {
         return Ok(false);
     }
-    validate_snapshot_template(config, &directory, memory_mib)
+    validate_snapshot_template(&directory, memory_mib, disk_bytes)
 }
 
 fn fork_snapshot_template_key(source: &MachineRecord, target_machine_id: &str) -> String {
@@ -4930,7 +4937,7 @@ fn capture_snapshot_template(
     }
     fs::rename(&temporary, &destination)
         .with_context(|| format!("publishing Firecracker snapshot {}", destination.display()))?;
-    validate_snapshot_template(config, &destination, source.runtime.memory_mib)?;
+    validate_snapshot_template(&destination, source.runtime.memory_mib, disk_bytes)?;
     replace_hard_link(&destination.join("memory"), &memory_base)?;
     fs::remove_file(&capture_pending)?;
     open_snapshot_template_lease(config, template_key)

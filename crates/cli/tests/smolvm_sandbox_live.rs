@@ -91,6 +91,7 @@ fn request(
             agent_id: exoharness::Uuid7::now(),
         },
         spec: SandboxSpec {
+            root_disk_gib: None,
             tcp_ports: vec![],
             image,
             resources: Default::default(),

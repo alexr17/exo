@@ -1103,6 +1103,7 @@ async fn firecracker_transparent_egress_live() -> Result<()> {
         scope: crate::ResourceScope::Global,
         provider_state: None,
         spec: SandboxSpec {
+            root_disk_gib: None,
             tcp_ports: vec![],
             image: crate::default_firecracker_image(),
             resources: SandboxResourceShape::new(1, 512),
@@ -1267,6 +1268,7 @@ async fn managed_firecracker_egress(unrestricted: bool) -> Result<()> {
         },
         provider_state: None,
         spec: SandboxSpec {
+            root_disk_gib: None,
             tcp_ports: vec![],
             image: crate::default_firecracker_image(),
             resources: SandboxResourceShape::new(1, 512),
@@ -2295,6 +2297,7 @@ async fn smolvm_proxy_live(with_gh: bool) -> Result<()> {
         scope: identity("smolvm-proxy").scope,
         provider_state: None,
         spec: SandboxSpec {
+            root_disk_gib: None,
             tcp_ports: vec![],
             image,
             resources: SandboxResourceShape::new(2, 1024),
@@ -2508,6 +2511,7 @@ async fn firecracker_template_egress_resources(codex_image: Option<String>) -> R
         scope: ResourceScope::Global,
         provider_state: None,
         spec: SandboxSpec {
+            root_disk_gib: None,
             image: codex_image.unwrap_or_else(|| "docker.io/library/python:3.12-slim".into()),
             resources: SandboxResourceShape::new(1, if codex { 1024 } else { 512 }),
             mounts: vec![],

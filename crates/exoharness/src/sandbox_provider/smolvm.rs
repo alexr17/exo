@@ -2036,6 +2036,7 @@ esac"#,
                 agent_id: crate::Uuid7::now(),
             },
             spec: SandboxSpec {
+                root_disk_gib: None,
                 tcp_ports: vec![],
                 image: "alpine".into(),
                 resources: Default::default(),
@@ -2179,6 +2180,7 @@ esac"#,
     #[test]
     fn resource_shape_and_mounts_are_forwarded() {
         let spec = SandboxSpec {
+            root_disk_gib: None,
             tcp_ports: vec![],
             image: "alpine".into(),
             resources: crate::SandboxResourceShape::new(3, 2048),
