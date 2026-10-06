@@ -25,7 +25,7 @@ pub(crate) fn write_test_executable(path: &std::path::Path, script: &str) -> cra
     Ok(())
 }
 
-pub(crate) fn local_test_config(root: impl Into<PathBuf>) -> BasicExoHarnessConfig {
+pub fn local_test_config(root: impl Into<PathBuf>) -> BasicExoHarnessConfig {
     BasicExoHarnessConfig {
         root: root.into(),
         secret_backend: SecretBackendChoice::Static([7u8; 32]),
@@ -35,10 +35,28 @@ pub(crate) fn local_test_config(root: impl Into<PathBuf>) -> BasicExoHarnessConf
     }
 }
 
+pub async fn new_test_agent(
+    harness: &dyn crate::ExoHarness,
+    slug: &str,
+) -> crate::Result<std::sync::Arc<dyn crate::AgentHandle>> {
+    harness
+        .new_agent(crate::NewAgentRequest {
+            slug: slug.into(),
+            name: slug.into(),
+            vaults: vec![],
+        })
+        .await
+}
+
+pub fn sandbox_request() -> crate::CreateSandboxRequest {
+    serde_json::from_str(r#"{"provider":"local_process","image":"unused","enable_networking":true,"idle_seconds":300}"#)
+        .expect("test sandbox request")
+}
+
 /// Like [`local_test_config`] but also advertises Daytona, so tests can exercise
 /// lazy secret resolution. Daytona credentials are still read from the secret
 /// store on first use.
-pub(crate) fn local_test_config_with_daytona(root: impl Into<PathBuf>) -> BasicExoHarnessConfig {
+pub fn local_test_config_with_daytona(root: impl Into<PathBuf>) -> BasicExoHarnessConfig {
     BasicExoHarnessConfig {
         root: root.into(),
         secret_backend: SecretBackendChoice::Static([7u8; 32]),
@@ -49,4 +67,24 @@ pub(crate) fn local_test_config_with_daytona(root: impl Into<PathBuf>) -> BasicE
             SandboxBackendRegistration::daytona(DaytonaBackendSpec::default()),
         ],
     }
+}
+
+pub fn corrupt_thread_history(
+    root: &std::path::Path,
+    agent: crate::AgentId,
+    thread: crate::ThreadId,
+) -> crate::Result<(PathBuf, Vec<u8>)> {
+    let directory = root
+        .join("agents")
+        .join(agent.to_string())
+        .join("conversations")
+        .join(thread.to_string())
+        .join("events");
+    let path = std::fs::read_dir(directory)?
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("thread has no event files"))??
+        .path();
+    let original = std::fs::read(&path)?;
+    std::fs::write(&path, b"invalid event JSON")?;
+    Ok((path, original))
 }

@@ -1,4 +1,5 @@
 use std::collections::HashSet;
+use std::future::Future;
 use std::num::NonZeroUsize;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -11,6 +12,7 @@ use exoharness::{
     TurnHandle, TurnRecord,
 };
 use futures::StreamExt;
+use futures::future::BoxFuture;
 use tokio::sync::{Notify, OnceCell, mpsc};
 use tokio_stream::wrappers::UnboundedReceiverStream;
 
@@ -285,6 +287,8 @@ pub trait HarnessExecutor: Send + Sync + 'static {
     }
 }
 
+type ShutdownHook = Arc<dyn Fn() -> BoxFuture<'static, Result<()>> + Send + Sync>;
+
 #[derive(Clone)]
 pub struct Runtime {
     provider: Arc<dyn Provider>,
@@ -296,6 +300,7 @@ pub struct Runtime {
     recovery_gate: Arc<RecoveryGate>,
     recovery_agent_concurrency: Arc<AtomicUsize>,
     recovery_thread_concurrency: Arc<AtomicUsize>,
+    shutdown_hook: Option<ShutdownHook>,
 }
 
 impl Runtime {
@@ -307,6 +312,8 @@ impl Runtime {
             scoped.provider.runtime_host(),
         )));
         scoped.recovery = Arc::default();
+        // The root runtime owns cleanup shared with caller-scoped runtimes.
+        scoped.shutdown_hook = None;
         Ok(scoped)
     }
 
@@ -325,7 +332,19 @@ impl Runtime {
             recovery_gate: Arc::default(),
             recovery_agent_concurrency: Arc::new(AtomicUsize::new(4)),
             recovery_thread_concurrency: Arc::new(AtomicUsize::new(4)),
+            shutdown_hook: None,
         }
+    }
+
+    /// Run cleanup after execution and finalizers have drained. Caller-scoped
+    /// runtimes leave this hook with their root runtime.
+    pub fn with_shutdown_hook<F, Fut>(mut self, hook: F) -> Self
+    where
+        F: Fn() -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<()>> + Send + 'static,
+    {
+        self.shutdown_hook = Some(Arc::new(move || Box::pin(hook())));
+        self
     }
 
     pub fn set_recovery_concurrency(&self, agents: NonZeroUsize, threads: NonZeroUsize) {
@@ -1137,12 +1156,25 @@ impl Runtime {
     pub async fn shutdown(&self) -> Result<()> {
         let shutdown = self.provider.harness().shutdown().await;
         let mut finalizers = self.finalizers.lock().await;
+        let mut finalizer_error = None;
         while let Some(result) = finalizers.join_next().await {
-            result?;
+            if let Err(error) = result {
+                tracing::error!(?error, "runtime finalizer failed");
+                finalizer_error = Some(error);
+            }
         }
+        drop(finalizers);
         let flush = self.tracer.flush().await;
+        let cleanup = match &self.shutdown_hook {
+            Some(hook) => hook().await,
+            None => Ok(()),
+        };
         shutdown?;
-        flush
+        if let Some(error) = finalizer_error {
+            return Err(error);
+        }
+        flush?;
+        cleanup
     }
 }
 
