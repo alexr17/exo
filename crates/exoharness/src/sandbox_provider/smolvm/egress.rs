@@ -152,7 +152,6 @@ mod tests {
     ) -> Result<SmolvmProxy> {
         SmolvmProxy::start(
             State::new(
-                Default::default(),
                 EgressIdentity {
                     sandbox_id: "test".into(),
                     scope: Default::default(),

@@ -219,7 +219,6 @@ async fn resource_git_push_uses_proxy_credentials_and_honors_revocation() -> Res
     policy.credentials.push(github);
     let proxy = super::super::explicit::ExplicitProxy::with_listener(
         State::new(
-            Default::default(),
             identity("git"),
             policy,
             Some(resolver.clone()),
