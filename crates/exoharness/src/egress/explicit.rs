@@ -27,6 +27,7 @@ pub struct ProxySession {
 
 impl ProxySession {
     pub fn new(
+        config: EgressProxyConfig,
         identity: EgressIdentity,
         policy: EgressPolicy,
         resolver: Option<Arc<dyn EgressCredentialResolver>>,
@@ -35,6 +36,7 @@ impl ProxySession {
     ) -> Result<Self> {
         Ok(Self {
             state: Arc::new(State::new_with_placeholders(
+                config,
                 identity,
                 policy,
                 resolver,
@@ -84,13 +86,20 @@ pub struct ExplicitProxy {
 
 impl ExplicitProxy {
     pub async fn start(
+        config: EgressProxyConfig,
         identity: EgressIdentity,
         policy: EgressPolicy,
         resolver: Option<Arc<dyn EgressCredentialResolver>>,
         listener: TcpListener,
         advertised_host: &str,
     ) -> Result<Self> {
-        let state = State::new(identity, policy, resolver, Arc::new(PublicUpstreamResolver))?;
+        let state = State::new(
+            config,
+            identity,
+            policy,
+            resolver,
+            Arc::new(PublicUpstreamResolver),
+        )?;
         Self::with_listener(state, listener, advertised_host).await
     }
 

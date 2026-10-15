@@ -49,7 +49,7 @@ impl SandboxBackendRegistration {
             "e2b" => Ok(Self::e2b(E2bBackendSpec::default())),
             "firecracker" => Ok(Self::firecracker(FirecrackerBackendSpec::default())),
             "local_process" => Ok(Self::local_process()),
-            "smolvm" => Ok(Self::smolvm()),
+            "smolvm" => Ok(Self::smolvm(Default::default())),
             "sprites" => Ok(Self::sprites(SpritesBackendSpec::default())),
             "vercel" => Ok(Self::vercel(VercelBackendSpec::with_conventional_secrets())),
             _ => bail!("sandbox provider {provider} is not built into exoharness"),
@@ -120,16 +120,17 @@ impl SandboxBackendRegistration {
     /// Local microVM sandboxes via the `smolvm` CLI. Unlike `docker` this puts a
     /// hypervisor boundary around the workload, and unlike `apple_container` it
     /// is not macOS-only.
-    pub fn smolvm() -> Self {
+    pub fn smolvm(egress_proxy: crate::egress::EgressProxyConfig) -> Self {
         // A factory, not a fixed backend: the binary paths are configured per
         // binding (`exo environment provider create --backend smolvm --smolvm-binary`),
         // so they have to be read when a request arrives rather than at startup —
         // the same shape daytona/e2b use for their credentials. The result is
         // cached per provider by `sandbox_backend_for_provider`, so this runs
         // once per harness and not once per sandbox.
-        Self::from_factory(SandboxProvider::Smolvm, true, true, |inner| {
+        Self::from_factory(SandboxProvider::Smolvm, true, true, move |inner| {
             Box::pin(async move {
-                let config = inner.smolvm_config_from_binding().await?;
+                let mut config = inner.smolvm_config_from_binding().await?;
+                config.egress_proxy = egress_proxy;
                 let resolver = Arc::new(LocalEgressResolver {
                     harness: Arc::downgrade(inner),
                 });

@@ -170,6 +170,8 @@ pub enum FirecrackerNetworkDevicePolicy {
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct FirecrackerConfig {
     #[serde(default)]
+    pub egress_proxy: crate::egress::EgressProxyConfig,
+    #[serde(default)]
     pub egress_listen: Option<crate::EgressListenConfig>,
     pub firecracker_bin: PathBuf,
     pub jailer_bin: PathBuf,
@@ -207,6 +209,7 @@ pub struct FirecrackerConfig {
 impl Default for FirecrackerConfig {
     fn default() -> Self {
         Self {
+            egress_proxy: Default::default(),
             egress_listen: None,
             firecracker_bin: PathBuf::from(DEFAULT_FIRECRACKER_BINARY),
             jailer_bin: PathBuf::from(DEFAULT_FIRECRACKER_JAILER),
@@ -733,7 +736,11 @@ impl FirecrackerSandboxBackend {
         resolver: Option<Arc<dyn EgressCredentialResolver>>,
         upstream: Arc<dyn UpstreamResolver>,
     ) -> Self {
-        self.egress = Arc::new(EgressRuntime::new(resolver, upstream));
+        self.egress = Arc::new(EgressRuntime::new(
+            self.shared.config.egress_proxy,
+            resolver,
+            upstream,
+        ));
         self
     }
 
@@ -839,7 +846,7 @@ impl FirecrackerSandboxBackend {
         resolver: Option<Arc<dyn EgressCredentialResolver>>,
         upstream: Arc<dyn UpstreamResolver>,
     ) -> Result<Self> {
-        let egress = Arc::new(EgressRuntime::new(resolver, upstream));
+        let egress = Arc::new(EgressRuntime::new(config.egress_proxy, resolver, upstream));
         tokio::task::spawn_blocking(move || Self::new_blocking(config, egress))
             .await
             .context("joining Firecracker backend construction")?

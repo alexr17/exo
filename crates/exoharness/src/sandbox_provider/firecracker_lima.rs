@@ -88,7 +88,11 @@ impl LimaFirecrackerSandboxBackend {
         resolver: Option<Arc<dyn EgressCredentialResolver>>,
         upstream: Arc<dyn UpstreamResolver>,
     ) -> Self {
-        self.egress = Arc::new(EgressRuntime::new(resolver, upstream));
+        self.egress = Arc::new(EgressRuntime::new(
+            self.config.egress_proxy,
+            resolver,
+            upstream,
+        ));
         self
     }
 
@@ -178,11 +182,12 @@ impl LimaFirecrackerSandboxBackend {
         ));
         bridge.prepare_bridge(&lima.target_dir).await?;
         bridge.connection().await?;
+        let egress = Arc::new(EgressRuntime::new(config.egress_proxy, resolver, upstream));
         Ok(Self {
             external_proxy: None,
             config,
             bridge,
-            egress: Arc::new(EgressRuntime::new(resolver, upstream)),
+            egress,
         })
     }
 
@@ -1688,7 +1693,11 @@ mod egress_cleanup_tests {
             });
             let backend = LimaFirecrackerSandboxBackend {
                 external_proxy: None,
-                egress: Arc::new(EgressRuntime::new(None, Arc::new(PublicUpstreamResolver))),
+                egress: Arc::new(EgressRuntime::new(
+                    Default::default(),
+                    None,
+                    Arc::new(PublicUpstreamResolver),
+                )),
                 config: FirecrackerConfig::default(),
                 bridge: Arc::new(LimaBridgeManager {
                     limactl: "unused-limactl".into(),
@@ -1903,7 +1912,8 @@ mod egress_cleanup_tests {
         };
         let transport =
             Arc::new(crate::egress::LocalEgressTransport::for_hosts(&["api.test".into()]).await?);
-        let runtime = EgressRuntime::new(None, Arc::new(PublicUpstreamResolver));
+        let runtime =
+            EgressRuntime::new(Default::default(), None, Arc::new(PublicUpstreamResolver));
         let handle = runtime
             .acquire(
                 request.clone(),

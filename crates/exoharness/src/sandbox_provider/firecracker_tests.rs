@@ -890,7 +890,11 @@ async fn idle_reap_closes_egress_before_machine_cleanup_can_fail() -> Result<()>
     let backend = FirecrackerSandboxBackend {
         external_proxy: None,
         shared: shared.clone(),
-        egress: Arc::new(EgressRuntime::new(None, Arc::new(PublicUpstreamResolver))),
+        egress: Arc::new(EgressRuntime::new(
+            Default::default(),
+            None,
+            Arc::new(PublicUpstreamResolver),
+        )),
     };
     assert_eq!(shared.is_running(&record.machine_id).await?, Some(false));
     assert!(backend.reap_expired_machines().await.is_err());
@@ -991,7 +995,11 @@ impl DurableStopFixture {
         let backend = FirecrackerSandboxBackend {
             external_proxy: None,
             shared,
-            egress: Arc::new(EgressRuntime::new(None, Arc::new(PublicUpstreamResolver))),
+            egress: Arc::new(EgressRuntime::new(
+                Default::default(),
+                None,
+                Arc::new(PublicUpstreamResolver),
+            )),
         };
         let egress_transport =
             Arc::new(LocalEgressTransport::for_hosts(&["api.test".into()]).await?);

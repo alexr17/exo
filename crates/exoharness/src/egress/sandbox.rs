@@ -155,6 +155,7 @@ struct CachedSandbox<H, P> {
 // This owns cached handles/proxies, not VM execution or the secret store.
 // A hosted backend can own its own allocation lifecycle instead of using this.
 pub(crate) struct EgressRuntime<H, P = EgressProxy> {
+    pub(crate) config: super::EgressProxyConfig,
     resolver: Option<Arc<dyn EgressCredentialResolver>>,
     upstream: Arc<dyn UpstreamResolver>,
     locks: Mutex<HashMap<String, Weak<AsyncMutex<()>>>>,
@@ -164,10 +165,12 @@ pub(crate) struct EgressRuntime<H, P = EgressProxy> {
 
 impl<H: ManagedSandboxHandle + 'static, P: SandboxProxy> EgressRuntime<H, P> {
     pub(crate) fn new(
+        config: super::EgressProxyConfig,
         resolver: Option<Arc<dyn EgressCredentialResolver>>,
         upstream: Arc<dyn UpstreamResolver>,
     ) -> Self {
         Self {
+            config,
             resolver,
             upstream,
             locks: Mutex::new(HashMap::new()),
@@ -261,11 +264,16 @@ impl<H: ManagedSandboxHandle + 'static, P: SandboxProxy> EgressRuntime<H, P> {
             sandbox_id: request.sandbox_id.clone(),
             scope: request.scope,
         };
+        let config = self.config;
         let state = match external_proxy {
-            Some(proxy) => {
-                State::with_external_proxy(identity, request.spec.policy.clone(), proxy.clone())?
-            }
+            Some(proxy) => State::with_external_proxy(
+                config,
+                identity,
+                request.spec.policy.clone(),
+                proxy.clone(),
+            )?,
             None => State::new(
+                config,
                 identity,
                 request.spec.policy.clone(),
                 self.resolver.clone(),
@@ -480,7 +488,11 @@ mod tests {
     #[tokio::test]
     async fn failed_acquisition_terminates_the_vm_and_preserves_the_original_error() -> Result<()> {
         for fail_termination in [false, true] {
-            let runtime = EgressRuntime::<Handle>::new(None, Arc::new(PublicUpstreamResolver));
+            let runtime = EgressRuntime::<Handle>::new(
+                Default::default(),
+                None,
+                Arc::new(PublicUpstreamResolver),
+            );
             let transport = Arc::new(Transport::default());
             let running = AtomicBool::new(false);
             let result = runtime
@@ -527,7 +539,11 @@ mod tests {
 
     #[tokio::test]
     async fn shutdown_closes_proxies_while_acquisition_is_pending() -> Result<()> {
-        let runtime = EgressRuntime::<Handle>::new(None, Arc::new(PublicUpstreamResolver));
+        let runtime = EgressRuntime::<Handle>::new(
+            Default::default(),
+            None,
+            Arc::new(PublicUpstreamResolver),
+        );
         let transport = Arc::new(Transport::default());
         let terminated = AtomicBool::new(false);
         let (started, ready) = tokio::sync::oneshot::channel();
@@ -562,7 +578,11 @@ mod tests {
 
     #[tokio::test]
     async fn shutdown_during_transport_creation_prevents_late_registration() -> Result<()> {
-        let runtime = EgressRuntime::<Handle>::new(None, Arc::new(PublicUpstreamResolver));
+        let runtime = EgressRuntime::<Handle>::new(
+            Default::default(),
+            None,
+            Arc::new(PublicUpstreamResolver),
+        );
         let transport = Arc::new(Transport::default());
         let (started, ready) = tokio::sync::oneshot::channel();
         let (release, released) = tokio::sync::oneshot::channel();
@@ -591,7 +611,11 @@ mod tests {
 
     #[tokio::test]
     async fn termination_waits_for_acquisition_and_removes_cached_state() -> Result<()> {
-        let runtime = EgressRuntime::<Handle>::new(None, Arc::new(PublicUpstreamResolver));
+        let runtime = EgressRuntime::<Handle>::new(
+            Default::default(),
+            None,
+            Arc::new(PublicUpstreamResolver),
+        );
         let transport = Arc::new(Transport::default());
         let (started, ready) = tokio::sync::oneshot::channel();
         let (release, released) = tokio::sync::oneshot::channel();
@@ -629,7 +653,11 @@ mod tests {
     #[tokio::test]
     async fn dead_or_unknown_handle_does_not_prevent_configuration_changes() -> Result<()> {
         for running in [Some(false), None] {
-            let runtime = EgressRuntime::<Handle>::new(None, Arc::new(PublicUpstreamResolver));
+            let runtime = EgressRuntime::<Handle>::new(
+                Default::default(),
+                None,
+                Arc::new(PublicUpstreamResolver),
+            );
             let old = Arc::new(Transport::default());
             let retained = runtime
                 .acquire(

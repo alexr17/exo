@@ -80,6 +80,14 @@ struct Cli {
 
 #[derive(Debug, Args)]
 struct RuntimeArgs {
+    /// Maximum buffered request body size for the sandbox egress proxy, in bytes.
+    #[arg(
+        long,
+        global = true,
+        env = "EXO_EGRESS_MAX_REQUEST_BODY_BYTES",
+        default_value_t = exoharness::egress::EgressProxyConfig::default().max_request_body_bytes
+    )]
+    egress_max_request_body_bytes: usize,
     /// Store used to protect vault credentials.
     #[arg(long, global = true, value_enum, env = "EXO_SECRET_BACKEND")]
     secret_backend: Option<SecretBackendArg>,
@@ -258,7 +266,10 @@ struct FirecrackerArgs {
 
 #[cfg(feature = "firecracker")]
 impl FirecrackerArgs {
-    fn backend_spec(&self) -> Result<FirecrackerBackendSpec> {
+    fn backend_spec(
+        &self,
+        egress_proxy: exoharness::egress::EgressProxyConfig,
+    ) -> Result<FirecrackerBackendSpec> {
         let allowed_egress_cidrs = self
             .allowed_egress_cidrs
             .iter()
@@ -272,6 +283,7 @@ impl FirecrackerArgs {
                 .chain(self.allowed_local_images.iter().cloned())
                 .collect();
         let config = FirecrackerConfig {
+            egress_proxy,
             egress_listen: None,
             firecracker_bin: self.firecracker_bin.clone(),
             jailer_bin: self.jailer_bin.clone(),
@@ -403,6 +415,9 @@ fn read_config_file<T: serde::de::DeserializeOwned>(path: &std::path::Path) -> R
 }
 
 fn build_exo_config(cli: &Cli, state_root: &Path) -> Result<BasicExoHarnessConfig> {
+    let egress_proxy = exoharness::egress::EgressProxyConfig {
+        max_request_body_bytes: cli.runtime().egress_max_request_body_bytes,
+    };
     let secret_backend = match cli
         .runtime()
         .secret_backend
@@ -415,16 +430,17 @@ fn build_exo_config(cli: &Cli, state_root: &Path) -> Result<BasicExoHarnessConfi
     };
     #[cfg(feature = "firecracker")]
     let firecracker_spec = match command_firecracker_args(&cli.command) {
-        Some(args) => args.backend_spec()?,
+        Some(args) => args.backend_spec(egress_proxy)?,
         None => {
             let matches = FirecrackerArgs::augment_args(clap::Command::new("exo"))
                 .try_get_matches_from(["exo"])?;
-            <FirecrackerArgs as clap::FromArgMatches>::from_arg_matches(&matches)?.backend_spec()?
+            <FirecrackerArgs as clap::FromArgMatches>::from_arg_matches(&matches)?
+                .backend_spec(egress_proxy)?
         }
     };
     #[cfg(not(feature = "firecracker"))]
     let firecracker_spec = FirecrackerBackendSpec::default();
-    let sandbox_backends = default_sandbox_backends(firecracker_spec);
+    let sandbox_backends = default_sandbox_backends(firecracker_spec, egress_proxy);
     let sandbox_policy = cli
         .execution()
         .and_then(|args| args.egress_policy.as_ref())
@@ -451,11 +467,12 @@ fn command_firecracker_args(command: &Commands) -> Option<&FirecrackerArgs> {
 /// Daytona (offered even with no key set — credentials resolve lazily).
 fn default_sandbox_backends(
     firecracker: FirecrackerBackendSpec,
+    egress_proxy: exoharness::egress::EgressProxyConfig,
 ) -> Vec<SandboxBackendRegistration> {
     vec![
         SandboxBackendRegistration::apple_container(),
         SandboxBackendRegistration::docker(),
-        SandboxBackendRegistration::smolvm(),
+        SandboxBackendRegistration::smolvm(egress_proxy),
         SandboxBackendRegistration::firecracker(firecracker),
         SandboxBackendRegistration::local_process(),
         SandboxBackendRegistration::daytona(DaytonaBackendSpec::default()),
@@ -2387,6 +2404,7 @@ mod command_tests {
             vec!["run", "--serve", "support"],
             vec!["run", "--serve"],
             vec!["run", "agent.md", "--serve"],
+            vec!["run", "agent.md", "--egress-max-request-body-bytes", "4096"],
             vec!["environment", "provider", "list"],
             vec!["sandbox", "run", "support", "thread", "pwd"],
         ] {

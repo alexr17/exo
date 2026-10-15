@@ -104,6 +104,7 @@ pub enum SmolvmExecutionMode {
 /// working while still listing them in `--help`.
 #[derive(Debug, Clone, Default)]
 pub struct SmolvmBackendConfig {
+    pub egress_proxy: crate::egress::EgressProxyConfig,
     pub mode: SmolvmExecutionMode,
     /// `smolvm` itself. `None` falls back to `SMOLVM_BIN`, then bare `smolvm`
     /// resolved through `PATH`. With the `smolvm` feature, a missing default
@@ -183,12 +184,17 @@ impl SmolvmSandboxBackend {
             image_cache: config.image_cache,
             capabilities: Arc::new(OnceCell::new()),
             tcp_forwards: Arc::new(Mutex::new(HashMap::new())),
-            egress: Arc::new(EgressRuntime::new(None, Arc::new(PublicUpstreamResolver))),
+            egress: Arc::new(EgressRuntime::new(
+                config.egress_proxy,
+                None,
+                Arc::new(PublicUpstreamResolver),
+            )),
         }
     }
 
     pub fn with_credentials(mut self, resolver: Arc<dyn EgressCredentialResolver>) -> Self {
         self.egress = Arc::new(EgressRuntime::new(
+            self.egress.config,
             Some(resolver),
             Arc::new(PublicUpstreamResolver),
         ));
@@ -201,7 +207,11 @@ impl SmolvmSandboxBackend {
         resolver: Arc<dyn EgressCredentialResolver>,
         upstream: Arc<dyn UpstreamResolver>,
     ) -> Self {
-        self.egress = Arc::new(EgressRuntime::new(Some(resolver), upstream));
+        self.egress = Arc::new(EgressRuntime::new(
+            self.egress.config,
+            Some(resolver),
+            upstream,
+        ));
         self
     }
 

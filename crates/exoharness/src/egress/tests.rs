@@ -262,12 +262,13 @@ impl Upstream {
         sandbox_id: &str,
         resolver: Arc<dyn EgressCredentialResolver>,
     ) -> Result<EgressProxy> {
-        self.proxy_with_policy(host_ip, sandbox_id, resolver, policy())
+        self.proxy_with_policy(Default::default(), host_ip, sandbox_id, resolver, policy())
             .await
     }
 
     async fn proxy_with_policy(
         &self,
+        config: EgressProxyConfig,
         host_ip: Ipv4Addr,
         sandbox_id: &str,
         resolver: Arc<dyn EgressCredentialResolver>,
@@ -287,6 +288,7 @@ impl Upstream {
             .await?,
         );
         let state = State::new(
+            config,
             identity(sandbox_id),
             policy,
             Some(resolver),
@@ -361,7 +363,7 @@ async fn threads_select_different_bindings_and_resolve_the_same_name_independent
             .map(|(binding, _)| binding.clone())
             .collect();
         let proxy = upstream
-            .proxy_with_policy(host_ip()?, id, resolver.clone(), policy)
+            .proxy_with_policy(Default::default(), host_ip()?, id, resolver.clone(), policy)
             .await?;
         proxy.bind_source(host_ip()?).await?;
         assert_eq!(
@@ -399,7 +401,13 @@ async fn threads_select_different_bindings_and_resolve_the_same_name_independent
     let mut empty_policy = policy();
     empty_policy.credentials.clear();
     let empty = upstream
-        .proxy_with_policy(host_ip()?, "empty", resolver.clone(), empty_policy)
+        .proxy_with_policy(
+            Default::default(),
+            host_ip()?,
+            "empty",
+            resolver.clone(),
+            empty_policy,
+        )
         .await?;
     assert!(empty.environment().is_empty());
     empty.shutdown().await?;
@@ -487,34 +495,54 @@ fn client(proxy: &EgressProxy) -> Result<reqwest::Client> {
 
 #[tokio::test]
 async fn proxy_enforces_request_body_limit() -> Result<()> {
-    let limit = std::env::var("EXO_EGRESS_MAX_REQUEST_BODY_BYTES")
-        .map_or(Ok(128_usize * 1024 * 1024), |value| value.parse())?;
     let upstream = Upstream::start().await?;
     let resolver = TestResolver::new();
     *resolver.value.write().await = Some("canary-v2".into());
-    let (proxy, client) = bound_proxy(&upstream, "large-upload", resolver).await?;
-    for (size, expected) in [
-        (limit, StatusCode::OK),
-        (limit + 1, StatusCode::BAD_GATEWAY),
+    for (config, limit) in [
+        (EgressProxyConfig::default(), 128_usize * 1024 * 1024),
+        (
+            EgressProxyConfig {
+                max_request_body_bytes: 4096,
+            },
+            4096,
+        ),
     ] {
-        let chunk = Bytes::from(vec![b'x'; 1024 * 1024]);
-        let chunks = futures::stream::iter((0..size.div_ceil(chunk.len())).map(move |index| {
-            Ok::<_, std::io::Error>(chunk.slice(..(size - index * chunk.len()).min(chunk.len())))
-        }));
-        let response = client
-            .post("https://api.test/refresh")
-            .bearer_auth(&proxy.environment()["TEST_API_KEY"])
-            .body(reqwest::Body::wrap_stream(chunks))
-            .send()
+        let proxy = upstream
+            .proxy_with_policy(
+                config,
+                host_ip()?,
+                "large-upload",
+                resolver.clone(),
+                policy(),
+            )
             .await?;
-        assert_eq!(response.status(), expected);
-        let body = response.bytes().await?;
-        if expected == StatusCode::OK {
-            assert_eq!(body.len(), size);
-            assert!(body.iter().all(|byte| *byte == b'x'));
+        proxy.bind_source(host_ip()?).await?;
+        let client = client(&proxy)?;
+        for (size, expected) in [
+            (limit, StatusCode::OK),
+            (limit + 1, StatusCode::BAD_GATEWAY),
+        ] {
+            let chunk = Bytes::from(vec![b'x'; 1024 * 1024]);
+            let chunks = futures::stream::iter((0..size.div_ceil(chunk.len())).map(move |index| {
+                Ok::<_, std::io::Error>(
+                    chunk.slice(..(size - index * chunk.len()).min(chunk.len())),
+                )
+            }));
+            let response = client
+                .post("https://api.test/refresh")
+                .bearer_auth(&proxy.environment()["TEST_API_KEY"])
+                .body(reqwest::Body::wrap_stream(chunks))
+                .send()
+                .await?;
+            assert_eq!(response.status(), expected);
+            let body = response.bytes().await?;
+            if expected == StatusCode::OK {
+                assert_eq!(body.len(), size);
+                assert!(body.iter().all(|byte| *byte == b'x'));
+            }
         }
+        proxy.shutdown().await?;
     }
-    proxy.shutdown().await?;
     Ok(())
 }
 
@@ -831,6 +859,7 @@ async fn connect_stream_uses_supplied_placeholder_and_checks_both_hosts() -> Res
         ("public.test", "api.test", None),
     ] {
         let state = Arc::new(State::new_with_placeholders(
+            Default::default(),
             identity("connect"),
             policy(),
             Some(resolver.clone()),
@@ -877,6 +906,7 @@ async fn connect_stream_uses_supplied_placeholder_and_checks_both_hosts() -> Res
         let (stream, _) = tokio::io::duplex(1);
         assert!(
             serve_https_connect(
+                Default::default(),
                 stream,
                 authority,
                 tls.clone(),
@@ -928,6 +958,7 @@ fn rejects_unsafe_policy_and_addresses() {
         allowed_hosts: vec!["blocked.test".into()],
     };
     let state = State::new(
+        Default::default(),
         identity("one"),
         config,
         Some(TestResolver::new()),
@@ -947,6 +978,7 @@ fn rejects_unsafe_policy_and_addresses() {
 fn credential_networking_is_independent_of_environment_networking() -> Result<()> {
     let mut config = policy();
     let state = State::new(
+        Default::default(),
         identity("one"),
         config.clone(),
         Some(TestResolver::new()),
@@ -974,6 +1006,7 @@ fn credential_networking_is_independent_of_environment_networking() -> Result<()
     }));
     config.credentials[0].injection_location.header = false;
     let state = State::new(
+        Default::default(),
         identity("one"),
         config.clone(),
         Some(TestResolver::new()),
@@ -992,6 +1025,7 @@ fn credential_networking_is_independent_of_environment_networking() -> Result<()
     let mut config = policy();
     config.networking = SandboxNetworkPolicy::Unrestricted;
     let state = State::new(
+        Default::default(),
         identity("one"),
         config,
         Some(TestResolver::new()),
@@ -1016,6 +1050,7 @@ fn empty_credential_allowlist_does_not_inherit_sandbox_hosts() -> Result<()> {
         allowed_hosts: vec![],
     };
     let state = State::new(
+        Default::default(),
         identity("one"),
         config,
         Some(TestResolver::new()),
@@ -1043,6 +1078,7 @@ fn dns_only_answers_exact_allowed_names() -> Result<()> {
     use hickory_proto::op::Query;
     use hickory_proto::rr::Name;
     let state = State::new(
+        Default::default(),
         identity("one"),
         policy(),
         Some(TestResolver::new()),
@@ -1569,6 +1605,7 @@ async fn pooled_clients_reuse_connections_but_follow_changed_dns() -> Result<()>
     let second = Upstream::start().await?;
     let upstream = Arc::new(ChangingUpstream(RwLock::new(first.config.clone())));
     let state = State::new(
+        Default::default(),
         identity("one"),
         policy(),
         Some(TestResolver::new()),
@@ -1692,6 +1729,7 @@ async fn proxy_starts_without_a_sandbox_backend() -> Result<()> {
         LocalEgressTransport::bind(host_ip()?, &HashSet::from(["api.test".into()])).await?,
     );
     let proxy = EgressProxy::start(
+        Default::default(),
         identity("hosted"),
         policy(),
         Some(TestResolver::new()),
@@ -1716,10 +1754,22 @@ async fn transparent_unrestricted_egress_intercepts_credentials_and_preserves_pu
     let mut config = policy();
     config.networking = SandboxNetworkPolicy::Unrestricted;
     let proxy = upstream
-        .proxy_with_policy(host_ip()?, "one", resolver.clone(), config.clone())
+        .proxy_with_policy(
+            Default::default(),
+            host_ip()?,
+            "one",
+            resolver.clone(),
+            config.clone(),
+        )
         .await?;
     let other = upstream
-        .proxy_with_policy(host_ip()?, "two", resolver.clone(), config)
+        .proxy_with_policy(
+            Default::default(),
+            host_ip()?,
+            "two",
+            resolver.clone(),
+            config,
+        )
         .await?;
     proxy.bind_source(host_ip()?).await?;
     other.bind_source(host_ip()?).await?;
@@ -1822,6 +1872,7 @@ async fn explicit_proxy_reuses_credential_substitution_and_isolates_sandboxes() 
     config.networking = SandboxNetworkPolicy::Unrestricted;
     let start = |id| {
         State::new(
+            Default::default(),
             identity(id),
             config.clone(),
             Some(resolver.clone()),
@@ -1981,6 +2032,7 @@ async fn explicit_proxy_enforces_host_policy_without_credentials() -> Result<()>
     let upstream = Upstream::start().await?;
     let resolver = TestResolver::new();
     let state = State::new(
+        Default::default(),
         identity("limited"),
         policy(),
         Some(resolver.clone()),
@@ -2041,6 +2093,7 @@ impl TestProxyAuthorizer {
                 uses: RwLock::new(Vec::new()),
             });
             let state = State::new(
+                Default::default(),
                 identity(name),
                 policy(),
                 Some(resolver),
@@ -2473,7 +2526,13 @@ async fn proxy_enforces_resource_urls_before_resolving_credentials() -> Result<(
         }],
     };
     let proxy = upstream
-        .proxy_with_policy(host_ip()?, "one", resolver.clone(), policy)
+        .proxy_with_policy(
+            Default::default(),
+            host_ip()?,
+            "one",
+            resolver.clone(),
+            policy,
+        )
         .await?;
     proxy.bind_source(host_ip()?).await?;
     let client = client(&proxy)?;
@@ -2748,7 +2807,8 @@ async fn native_tls_uses_the_external_proxys_identity_and_credential_resolver() 
         if !credentials {
             policy.credentials.clear();
         }
-        let state = State::with_external_proxy(identity("worker"), policy, config)?;
+        let state =
+            State::with_external_proxy(Default::default(), identity("worker"), policy, config)?;
         assert!(state.resolver.is_none());
         let transport = Arc::new(
             LocalEgressTransport::with_config(
