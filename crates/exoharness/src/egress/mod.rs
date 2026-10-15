@@ -50,7 +50,7 @@ use crate::egress_credentials::{Binding, strip_hop_headers};
 pub use crate::egress_credentials::{EgressCredentialResolver, EgressDestination, EgressIdentity};
 pub(crate) const IO_TIMEOUT: Duration = Duration::from_secs(30);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
-const MAX_REQUEST_BODY: usize = 8 * 1024 * 1024;
+const DEFAULT_MAX_REQUEST_BODY_BYTES: usize = 128 * 1024 * 1024;
 const HTTP_BUFFER_SIZE: usize = 32 * 1024;
 const MAX_CONNECTIONS: usize = 128;
 
@@ -115,6 +115,7 @@ struct PooledClient {
 // are pooled by destination and replaced whenever its resolved addresses change.
 pub(crate) struct State {
     external: Option<ExternalProxyConfig>,
+    max_request_body_bytes: usize,
     clients: Mutex<HashMap<(String, u16), PooledClient>>,
     hosts: HashSet<String>,
     network: crate::egress_credentials::NetworkPolicy,
@@ -274,6 +275,15 @@ impl State {
             crate::egress_credentials::prepare_bindings(policy.credentials, placeholders)?;
         Ok(Self {
             external,
+            max_request_body_bytes: match std::env::var("EXO_EGRESS_MAX_REQUEST_BODY_BYTES") {
+                Ok(value) => value.parse().context(
+                    "EXO_EGRESS_MAX_REQUEST_BODY_BYTES must be a non-negative integer in bytes",
+                )?,
+                Err(std::env::VarError::NotPresent) => DEFAULT_MAX_REQUEST_BODY_BYTES,
+                Err(error) => {
+                    return Err(error).context("reading EXO_EGRESS_MAX_REQUEST_BODY_BYTES");
+                }
+            },
             clients: Mutex::new(HashMap::new()),
             hosts,
             network,
@@ -346,7 +356,7 @@ impl State {
         .await?;
         let body = tokio::time::timeout(
             IO_TIMEOUT,
-            Limited::new(request.body_mut(), MAX_REQUEST_BODY).collect(),
+            Limited::new(request.body_mut(), self.max_request_body_bytes).collect(),
         )
         .await?
         .map_err(|_| anyhow!("invalid or oversized request body"))?
