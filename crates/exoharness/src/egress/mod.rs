@@ -34,6 +34,8 @@ use crate::types::canonical_egress_host;
 
 use crate::{EgressPolicy, SandboxEgressProxy};
 
+mod config;
+pub use config::EgressProxyConfig;
 mod external;
 pub use external::ExternalProxyConfig;
 mod explicit;
@@ -50,7 +52,6 @@ use crate::egress_credentials::{Binding, strip_hop_headers};
 pub use crate::egress_credentials::{EgressCredentialResolver, EgressDestination, EgressIdentity};
 pub(crate) const IO_TIMEOUT: Duration = Duration::from_secs(30);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
-const DEFAULT_MAX_REQUEST_BODY_BYTES: usize = 128 * 1024 * 1024;
 const HTTP_BUFFER_SIZE: usize = 32 * 1024;
 const MAX_CONNECTIONS: usize = 128;
 
@@ -115,7 +116,7 @@ struct PooledClient {
 // are pooled by destination and replaced whenever its resolved addresses change.
 pub(crate) struct State {
     external: Option<ExternalProxyConfig>,
-    max_request_body_bytes: usize,
+    config: EgressProxyConfig,
     clients: Mutex<HashMap<(String, u16), PooledClient>>,
     hosts: HashSet<String>,
     network: crate::egress_credentials::NetworkPolicy,
@@ -127,13 +128,20 @@ pub(crate) struct State {
 
 impl EgressProxy {
     pub async fn start(
+        config: EgressProxyConfig,
         identity: EgressIdentity,
         policy: EgressPolicy,
         resolver: Option<Arc<dyn EgressCredentialResolver>>,
         transport: Arc<dyn EgressTransport>,
         cancel: CancellationToken,
     ) -> Result<Self> {
-        let state = State::new(identity, policy, resolver, Arc::new(PublicUpstreamResolver))?;
+        let state = State::new(
+            config,
+            identity,
+            policy,
+            resolver,
+            Arc::new(PublicUpstreamResolver),
+        )?;
         Self::start_with_transport(transport, state, cancel).await
     }
 
@@ -194,7 +202,9 @@ impl EgressProxy {
 /// The caller supplies TLS configuration trusted by the sandbox and the same
 /// placeholders it installed there. TLS must negotiate HTTP/1.1. No listener
 /// or sandbox session is retained.
+#[allow(clippy::too_many_arguments)]
 pub async fn serve_https_connect<T>(
+    config: EgressProxyConfig,
     stream: T,
     connect_authority: &str,
     tls: TlsAcceptor,
@@ -206,7 +216,7 @@ pub async fn serve_https_connect<T>(
 where
     T: AsyncRead + AsyncWrite + Send + Unpin + 'static,
 {
-    let session = ProxySession::new(identity, policy, resolver, tls, placeholders)?;
+    let session = ProxySession::new(config, identity, policy, resolver, tls, placeholders)?;
     let host = session.state.connect_host(connect_authority)?;
     https_connection(stream, session.tls, session.state, Some(&host)).await
 }
@@ -219,15 +229,17 @@ impl Drop for EgressProxy {
 
 impl State {
     pub(crate) fn new(
+        config: EgressProxyConfig,
         identity: EgressIdentity,
         policy: EgressPolicy,
         resolver: Option<Arc<dyn EgressCredentialResolver>>,
         upstream: Arc<dyn UpstreamResolver>,
     ) -> Result<Self> {
-        Self::new_with_placeholders(identity, policy, resolver, upstream, None, None)
+        Self::new_with_placeholders(config, identity, policy, resolver, upstream, None, None)
     }
 
     fn new_with_placeholders(
+        config: EgressProxyConfig,
         identity: EgressIdentity,
         policy: EgressPolicy,
         resolver: Option<Arc<dyn EgressCredentialResolver>>,
@@ -275,15 +287,7 @@ impl State {
             crate::egress_credentials::prepare_bindings(policy.credentials, placeholders)?;
         Ok(Self {
             external,
-            max_request_body_bytes: match std::env::var("EXO_EGRESS_MAX_REQUEST_BODY_BYTES") {
-                Ok(value) => value.parse().context(
-                    "EXO_EGRESS_MAX_REQUEST_BODY_BYTES must be a non-negative integer in bytes",
-                )?,
-                Err(std::env::VarError::NotPresent) => DEFAULT_MAX_REQUEST_BODY_BYTES,
-                Err(error) => {
-                    return Err(error).context("reading EXO_EGRESS_MAX_REQUEST_BODY_BYTES");
-                }
-            },
+            config,
             clients: Mutex::new(HashMap::new()),
             hosts,
             network,
@@ -356,7 +360,7 @@ impl State {
         .await?;
         let body = tokio::time::timeout(
             IO_TIMEOUT,
-            Limited::new(request.body_mut(), self.max_request_body_bytes).collect(),
+            Limited::new(request.body_mut(), self.config.max_request_body_bytes).collect(),
         )
         .await?
         .map_err(|_| anyhow!("invalid or oversized request body"))?

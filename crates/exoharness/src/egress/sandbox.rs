@@ -261,11 +261,16 @@ impl<H: ManagedSandboxHandle + 'static, P: SandboxProxy> EgressRuntime<H, P> {
             sandbox_id: request.sandbox_id.clone(),
             scope: request.scope,
         };
+        let config = super::EgressProxyConfig::from_env()?;
         let state = match external_proxy {
-            Some(proxy) => {
-                State::with_external_proxy(identity, request.spec.policy.clone(), proxy.clone())?
-            }
+            Some(proxy) => State::with_external_proxy(
+                config,
+                identity,
+                request.spec.policy.clone(),
+                proxy.clone(),
+            )?,
             None => State::new(
+                config,
                 identity,
                 request.spec.policy.clone(),
                 self.resolver.clone(),

@@ -89,11 +89,13 @@ impl ExternalProxyConfig {
 
 impl State {
     pub(super) fn with_external_proxy(
+        config: EgressProxyConfig,
         identity: EgressIdentity,
         policy: EgressPolicy,
         proxy: ExternalProxyConfig,
     ) -> Result<Self> {
         Self::new_with_placeholders(
+            config,
             identity,
             policy,
             None,

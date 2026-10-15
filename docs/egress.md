@@ -215,11 +215,13 @@ other traffic, including IPv6 and QUIC. CIDR exceptions cannot bypass the proxy.
 DNS answers exact allowed names with a synthetic IPv4 address. The proxy resolves
 and pins public upstream IPv4 addresses, validates TLS, requires matching SNI
 and HTTP Host, and does not follow redirects. Request bodies are bounded to
-128 MiB by default; responses stream, including SSE. Set
-`EXO_EGRESS_MAX_REQUEST_BODY_BYTES` in the host process environment to override
-the limit in bytes. The proxy reads it when creating each sandbox session;
-invalid values fail session creation. Allowed upstreams can still return
-sensitive values in their responses.
+128 MiB by default; responses stream, including SSE.
+`EgressProxyConfig.max_request_body_bytes` controls this limit. Call
+`EgressProxyConfig::from_env()` to load `EXO_EGRESS_MAX_REQUEST_BODY_BYTES` from
+the host environment, or construct the config directly. Native sandbox backends
+load it from the environment when creating proxy sessions; invalid values fail
+session creation. Allowed upstreams can still return sensitive values in their
+responses.
 
 `CreateSandboxRequest.policy` supplies the policy through the Exoharness API.
 `BasicExoHarnessConfig.sandbox_policy` supplies a default, including for the
@@ -266,11 +268,11 @@ the listeners inside the Lima bridge. Low-level callers that already own their
 proxy can pass endpoints to
 `FirecrackerSandboxBackend::acquire_request(FirecrackerRequest)`.
 
-`EgressProxy::start(identity, policy, resolver, transport, cancel)` starts the
+`EgressProxy::start(config, identity, policy, resolver, transport, cancel)` starts the
 proxy using the existing `EgressPolicy` and an `EgressTransport`. It exposes
 listener endpoints, the CA certificate, and placeholder environment variables.
 
-`ExplicitProxy::start(identity, policy, resolver, listener, advertised_host)`
+`ExplicitProxy::start(config, identity, policy, resolver, listener, advertised_host)`
 serves an authenticated HTTP/HTTPS proxy on a caller-bound `TcpListener`. It
 creates the CA and credential placeholders once per proxy. Install `ca_pem` at
 `ca_path` inside the sandbox and apply `environment` (or use `command()`) to set
@@ -288,7 +290,7 @@ For a shared hosted listener, call
 `serve_connect_proxy(listener, authorizer, shutdown)`. Implement `ProxyAuthorizer`
 to validate the Basic proxy username/password and return the authorized
 `ProxySession` for the requested host. Construct sessions with
-`ProxySession::new(identity, policy, resolver, tls, placeholders)` using TLS
+`ProxySession::new(config, identity, policy, resolver, tls, placeholders)` using TLS
 material trusted by that sandbox and its stable credential placeholders. Sessions
 can be cached and cloned; authentication still runs for every CONNECT request.
 Returning `None` rejects authentication with 407; errors or a 10-second timeout
@@ -298,8 +300,8 @@ only CONNECT on port 443. `ExplicitProxy` uses the same server with a fixed
 sandbox session and generated password, and also accepts plain HTTP requests.
 
 Callers that already own an authenticated CONNECT listener can instead pass its
-post-200 stream to `serve_https_connect` with the CONNECT authority, TLS acceptor,
-and stable placeholders. Exo checks CONNECT host, SNI, and HTTP Host before
+post-200 stream to `serve_https_connect` with the proxy config, CONNECT authority,
+TLS acceptor, and stable placeholders. Exo checks CONNECT host, SNI, and HTTP Host before
 forwarding. Session selection and credential resolution are separate: the
 hosted caller must authenticate access to the sandbox even when the request
 uses no credential.
