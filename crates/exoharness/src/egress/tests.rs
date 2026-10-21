@@ -2614,6 +2614,7 @@ if os.environ['EXO_TEST_CODEX'] == 'true':
             allocation.sandbox_id = format!("template-clone-{index}");
             allocation.scope = ResourceScope::Thread { agent_id: agent, thread_id: thread };
             allocation.spec.policy = policy();
+            allocation.spec.policy.allowed_tcp_ports = Some(vec![443]);
             allocation.spec.policy.networking = SandboxNetworkPolicy::Limited { allowed_hosts: vec!["api.github.com".into()] };
             allocation.spec.policy.credentials[0].networking = CredentialNetworkPolicy::Limited { allowed_hosts: vec!["api.github.com".into()] };
             allocation.spec.mounts = mounts.into_iter().map(|mount| SandboxMount {
