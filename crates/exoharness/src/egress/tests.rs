@@ -49,6 +49,7 @@ impl UpstreamResolver for TestUpstream {
 struct TestResolver {
     value: RwLock<Option<String>>,
     uses: RwLock<Vec<(String, String, String)>>,
+    rejection: Mutex<Option<String>>,
 }
 
 impl TestResolver {
@@ -56,6 +57,7 @@ impl TestResolver {
         Arc::new(Self {
             value: RwLock::new(Some("canary-v1".to_string())),
             uses: RwLock::new(Vec::new()),
+            rejection: Mutex::new(None),
         })
     }
 }
@@ -80,6 +82,9 @@ impl EgressCredentialResolver for TestResolver {
             },
             destination.host.clone(),
         ));
+        if let Some(message) = self.rejection.lock().unwrap().clone() {
+            return Err(anyhow::Error::new(EgressRejection(message)).context("resolver context"));
+        }
         self.value
             .read()
             .await
@@ -730,6 +735,16 @@ async fn proxy_resolves_current_credentials_for_each_request() -> Result<()> {
             .status()
             .is_server_error()
     );
+    *resolver.rejection.lock().unwrap() = Some("Request rejected.".into());
+    let connections = upstream.connections.load(Ordering::SeqCst);
+    let rejected = proxy_client
+        .get("https://api.test/auth")
+        .header("authorization", &bearer)
+        .send()
+        .await?;
+    assert_eq!(rejected.status(), StatusCode::FORBIDDEN);
+    assert_eq!(rejected.text().await?, "Request rejected.\n");
+    assert_eq!(upstream.connections.load(Ordering::SeqCst), connections);
     assert!(
         resolver
             .uses
@@ -2039,6 +2054,7 @@ impl TestProxyAuthorizer {
             let resolver = Arc::new(TestResolver {
                 value: RwLock::new(Some(value.into())),
                 uses: RwLock::new(Vec::new()),
+                rejection: Mutex::new(None),
             });
             let state = State::new(
                 identity(name),

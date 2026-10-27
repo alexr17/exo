@@ -29,6 +29,7 @@ pub struct EgressDestination {
 /// Looks up a binding for this sandbox's agent/thread on every use. The local
 /// implementation reads Exo's encrypted store; a hosted implementation can use
 /// its own vault and authorization. Only the proxy receives the returned value.
+/// Return [`EgressRejection`] to explain a denial safely to the sandbox.
 #[async_trait]
 pub trait EgressCredentialResolver: Send + Sync {
     async fn resolve(
@@ -325,6 +326,12 @@ pub struct EgressDenied;
 pub fn denied(error: impl Into<anyhow::Error>) -> anyhow::Error {
     error.into().context(EgressDenied)
 }
+
+/// A denial with a sandbox-safe message, returned as plain-text HTTP 403.
+/// Only this message is exposed, without surrounding error context.
+#[derive(Debug, thiserror::Error)]
+#[error("{0}")]
+pub struct EgressRejection(pub String);
 
 pub fn credential_fingerprint(value: &str) -> String {
     use sha2::{Digest, Sha256};
