@@ -329,9 +329,16 @@ pub fn denied(error: impl Into<anyhow::Error>) -> anyhow::Error {
 
 /// A denial with a sandbox-safe message, returned as plain-text HTTP 403.
 /// Only this message is exposed, without surrounding error context.
-#[derive(Debug, thiserror::Error)]
-#[error("{0}")]
+#[derive(Debug)]
 pub struct EgressRejection(pub String);
+
+impl std::fmt::Display for EgressRejection {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for EgressRejection {}
 
 pub fn credential_fingerprint(value: &str) -> String {
     use sha2::{Digest, Sha256};
