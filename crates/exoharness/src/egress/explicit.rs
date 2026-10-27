@@ -438,7 +438,7 @@ async fn forward_http(
         .context("missing path")?
         .as_str()
         .parse()?;
-    state.forward(request, None).await
+    Ok(state.forward(request, None).await?)
 }
 
 async fn connect(

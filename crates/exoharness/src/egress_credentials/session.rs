@@ -1,7 +1,7 @@
 //! Persistent interception session over Exo's ordinary store and vaults.
 use super::{
-    CredentialBindings, EgressCredentialResolver, EgressDestination, EgressIdentity, NetworkPolicy,
-    credential_fingerprint, denied,
+    CredentialBindings, EgressCredentialResolver, EgressDestination, EgressError, EgressIdentity,
+    NetworkPolicy, credential_fingerprint, denied,
 };
 use crate::{ConversationHandle, EgressPolicy, ExoHarness, ResourceScope, SandboxRequest, Storage};
 use anyhow::{Context, Result, ensure};
@@ -75,7 +75,7 @@ impl EgressSession {
         destination: &EgressDestination,
         tls: bool,
         rejected: Vec<(String, String)>,
-    ) -> Result<(Vec<(String, String)>, bool)> {
+    ) -> Result<(Vec<(String, String)>, bool), EgressError> {
         NetworkPolicy::new(&self.policy)?
             .authorize(destination)
             .map_err(denied)?;
@@ -131,11 +131,11 @@ impl EgressCredentialResolver for Resolver {
         _identity: &EgressIdentity,
         name: &str,
         destination: &EgressDestination,
-    ) -> Result<String> {
+    ) -> Result<String, EgressError> {
         let reference = crate::vault::find_secret(self.conversation.as_ref(), name)
             .await?
             .ok_or_else(|| denied(anyhow::anyhow!("credential not found")))?;
-        super::vault::resolve_with_rejection(
+        Ok(super::vault::resolve_with_rejection(
             self.conversation.as_ref(),
             &reference,
             destination,
@@ -144,7 +144,7 @@ impl EgressCredentialResolver for Resolver {
                 .find(|(binding, _)| binding == name)
                 .map(|(_, hash)| super::vault::RejectedCredential::Fingerprint(hash)),
         )
-        .await
+        .await?)
     }
 }
 
@@ -157,7 +157,7 @@ mod tests {
     };
 
     #[tokio::test]
-    async fn missing_credentials_and_protocol_upgrades_are_policy_denials() -> Result<()> {
+    async fn rewrite_distinguishes_policy_denials_from_corrupt_state() -> Result<()> {
         let state = BasicExoHarness::in_memory(crate::test_support::local_test_config(
             "unused-egress-session",
         ))
@@ -182,7 +182,7 @@ mod tests {
                 injection_location: CredentialInjectionLocation { header: true },
             }],
         };
-        let session = EgressSession {
+        let mut session = EgressSession {
             identity: EgressIdentity {
                 sandbox_id: "sandbox".into(),
                 scope: ResourceScope::Thread {
@@ -213,8 +213,14 @@ mod tests {
                 .rewrite(&state, &mut headers, &destination, true, vec![])
                 .await
                 .expect_err("policy denial");
-            assert!(error.is::<super::super::EgressDenied>(), "{error:#}");
+            assert!(matches!(error, EgressError::Denied(_)), "{error:#}");
         }
+        session.policy.allowed_tcp_ports = Some(vec![0]);
+        let error = session
+            .rewrite(&state, &mut HeaderMap::new(), &destination, true, vec![])
+            .await
+            .expect_err("invalid stored policy");
+        assert!(matches!(error, EgressError::Internal(_)), "{error:#}");
         Ok(())
     }
 }
