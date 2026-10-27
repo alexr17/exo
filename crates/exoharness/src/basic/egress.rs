@@ -1,5 +1,5 @@
 use super::*;
-use crate::egress::{EgressCredentialResolver, EgressDestination, EgressIdentity};
+use crate::egress::{EgressCredentialResolver, EgressDestination, EgressError, EgressIdentity};
 
 pub(super) struct LocalEgressResolver {
     pub harness: std::sync::Weak<BasicExoHarnessInner>,
@@ -53,8 +53,10 @@ impl EgressCredentialResolver for LocalEgressResolver {
         identity: &EgressIdentity,
         name: &str,
         destination: &EgressDestination,
-    ) -> Result<String> {
-        self.resolve_value(identity, name, destination, None).await
+    ) -> Result<String, EgressError> {
+        Ok(self
+            .resolve_value(identity, name, destination, None)
+            .await?)
     }
 
     async fn refresh(
@@ -63,7 +65,7 @@ impl EgressCredentialResolver for LocalEgressResolver {
         name: &str,
         destination: &EgressDestination,
         rejected: &str,
-    ) -> Result<Option<String>> {
+    ) -> Result<Option<String>, EgressError> {
         let value = self
             .resolve_value(identity, name, destination, Some(rejected))
             .await?;

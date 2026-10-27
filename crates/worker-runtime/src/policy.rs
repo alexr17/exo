@@ -3,7 +3,7 @@ use crate::host::{Host, HostStorage};
 use anyhow::{Result, ensure};
 use executor::Runtime;
 use exoharness::egress_credentials::{
-    EgressIdentity, denied, http_destination, session::EgressSession,
+    EgressError, EgressIdentity, denied, http_destination, session::EgressSession,
 };
 use exoharness::{AgentId, ResourceScope, ThreadId};
 use http::{
@@ -47,7 +47,7 @@ pub(crate) async fn proxy_headers(
     method: &str,
     headers: Vec<(String, String)>,
     rejected: Option<Vec<(String, String)>>,
-) -> Result<ProxyHeaders> {
+) -> Result<ProxyHeaders, EgressError> {
     let url = url::Url::parse(url).map_err(denied)?;
     let destination = http_destination(&url, method.parse().map_err(denied)?).map_err(denied)?;
     // Cloudflare intercepts public DNS HTTP destinations. DNS/IP resolution

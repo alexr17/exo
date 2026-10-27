@@ -2,6 +2,7 @@ use std::sync::Arc;
 
 use anyhow::Result;
 use executor::Runtime;
+use exoharness::egress_credentials::EgressError;
 use exoharness::{AgentId, ThreadId};
 use serde::{Deserialize, Serialize};
 
@@ -147,10 +148,9 @@ pub(crate) async fn run(
             Ok(Output::Headers(match result {
                 Ok(headers) => crate::policy::ProxyReply::Allowed(headers),
                 Err(error) => crate::policy::ProxyReply::Error {
-                    status: if error.is::<exoharness::egress_credentials::EgressDenied>() {
-                        403
-                    } else {
-                        500
+                    status: match &error {
+                        EgressError::Rejected(_) | EgressError::Denied(_) => 403,
+                        EgressError::Internal(_) => 500,
                     },
                     error: format!("{error:#}"),
                 },

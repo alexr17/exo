@@ -48,7 +48,7 @@ pub(crate) use sandbox::{AcquisitionMode, EgressRuntime, SandboxEgress, SandboxP
 
 use crate::egress_credentials::{Binding, strip_hop_headers};
 pub use crate::egress_credentials::{
-    EgressCredentialResolver, EgressDestination, EgressIdentity, EgressRejection,
+    EgressCredentialResolver, EgressDestination, EgressError, EgressIdentity,
 };
 pub(crate) const IO_TIMEOUT: Duration = Duration::from_secs(30);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
@@ -341,7 +341,7 @@ impl State {
         &self,
         mut request: Request<Incoming>,
         sni: Option<&str>,
-    ) -> Result<Response<ProxyBody>> {
+    ) -> Result<Response<ProxyBody>, EgressError> {
         let (destination, url) = self.destination(&request, sni)?;
         let mut headers = request.headers().clone();
 
@@ -360,7 +360,8 @@ impl State {
             IO_TIMEOUT,
             Limited::new(request.body_mut(), self.max_request_body_bytes).collect(),
         )
-        .await?
+        .await
+        .context("reading egress request body timed out")?
         .map_err(|_| anyhow!("invalid or oversized request body"))?
         .to_bytes();
         let method = request.method().clone();
@@ -377,8 +378,8 @@ impl State {
                     IO_TIMEOUT,
                     resolver.refresh(&self.identity, &name, &destination, &rejected),
                 )
-                .await?
-                .context("credential refresh failed")?
+                .await
+                .context("credential refresh timed out")??
                 .is_some();
             }
             if refreshed {
@@ -395,7 +396,7 @@ impl State {
                 response = relay(method, headers, url, body, &client).await?;
             }
         }
-        proxy_response(response)
+        Ok(proxy_response(response)?)
     }
 
     fn destination(
@@ -594,9 +595,11 @@ where
                 Ok(response) => response,
                 Err(error) => {
                     tracing::debug!(%error, sandbox_id = %state.identity.sandbox_id, "egress request failed");
-                    let (status, message) = match error.downcast_ref::<EgressRejection>() {
-                        Some(rejection) => (StatusCode::FORBIDDEN, format!("{rejection}\n")),
-                        None => (
+                    let (status, message) = match error {
+                        EgressError::Rejected(message) => {
+                            (StatusCode::FORBIDDEN, format!("{message}\n"))
+                        }
+                        EgressError::Denied(_) | EgressError::Internal(_) => (
                             StatusCode::BAD_GATEWAY,
                             "egress request denied or upstream unavailable\n".into(),
                         ),
@@ -834,8 +837,10 @@ impl EgressCredentialResolver for TimedResolver<'_> {
         identity: &EgressIdentity,
         name: &str,
         destination: &EgressDestination,
-    ) -> Result<String> {
-        tokio::time::timeout(IO_TIMEOUT, self.0.resolve(identity, name, destination)).await?
+    ) -> Result<String, EgressError> {
+        tokio::time::timeout(IO_TIMEOUT, self.0.resolve(identity, name, destination))
+            .await
+            .context("credential resolution timed out")?
     }
 }
 
@@ -847,7 +852,7 @@ impl EgressCredentialResolver for NoCredentials {
         _identity: &EgressIdentity,
         _name: &str,
         _destination: &EgressDestination,
-    ) -> Result<String> {
-        anyhow::bail!("credential resolver is unavailable")
+    ) -> Result<String, EgressError> {
+        Err(anyhow!("credential resolver is unavailable").into())
     }
 }

@@ -69,27 +69,25 @@ impl EgressCredentialResolver for TestResolver {
         identity: &EgressIdentity,
         binding_name: &str,
         destination: &EgressDestination,
-    ) -> Result<String> {
-        ensure!(
-            binding_name == "test-credential" && destination.port == 443,
-            "wrong credential use"
-        );
+    ) -> Result<String, EgressError> {
+        assert!(binding_name == "test-credential" && destination.port == 443);
         self.uses.write().await.push((
             identity.sandbox_id.clone(),
             match &identity.scope {
                 crate::ResourceScope::Thread { thread_id, .. } => thread_id.to_string(),
-                _ => bail!("expected thread identity"),
+                _ => panic!("expected thread identity"),
             },
             destination.host.clone(),
         ));
         if let Some(message) = self.rejection.lock().unwrap().clone() {
-            return Err(anyhow::Error::new(EgressRejection(message)).context("resolver context"));
+            return Err(EgressError::Rejected(message));
         }
-        self.value
+        Ok(self
+            .value
             .read()
             .await
             .clone()
-            .context("credential removed")
+            .context("credential removed")?)
     }
 }
 
@@ -102,19 +100,19 @@ impl EgressCredentialResolver for GitResolver {
         _identity: &EgressIdentity,
         binding_name: &str,
         destination: &EgressDestination,
-    ) -> Result<String> {
+    ) -> Result<String, EgressError> {
         let authorized_path = (destination.method == Method::GET
             && (destination.path == GIT_REFS_PATH || destination.path == GIT_RECEIVE_REFS_PATH))
             || (destination.method == Method::POST
                 && (destination.path == GIT_UPLOAD_PACK_PATH
                     || destination.path == GIT_RECEIVE_PACK_PATH));
-        ensure!(
-            binding_name == "test-credential"
-                && destination.host == "api.test"
-                && destination.port == 443
-                && authorized_path,
-            "git request is not authorized"
-        );
+        if !(binding_name == "test-credential"
+            && destination.host == "api.test"
+            && destination.port == 443
+            && authorized_path)
+        {
+            return Err(anyhow!("git request is not authorized").into());
+        }
         Ok("canary-v1".into())
     }
 }
@@ -327,12 +325,13 @@ impl EgressCredentialResolver for ThreadResolver {
         identity: &EgressIdentity,
         binding_name: &str,
         _destination: &EgressDestination,
-    ) -> Result<String> {
-        self.for_identity(identity)?
+    ) -> Result<String, EgressError> {
+        Ok(self
+            .for_identity(identity)?
             .iter()
             .find(|(binding, _)| binding.name == binding_name)
             .map(|(_, value)| value.clone())
-            .context("binding is not selected for this thread")
+            .context("binding is not selected for this thread")?)
     }
 }
 
@@ -726,14 +725,15 @@ async fn proxy_resolves_current_credentials_for_each_request() -> Result<()> {
         "authenticated-v2"
     );
     *resolver.value.write().await = None;
-    assert!(
-        proxy_client
-            .get("https://api.test/auth")
-            .header("authorization", &bearer)
-            .send()
-            .await?
-            .status()
-            .is_server_error()
+    let unavailable = proxy_client
+        .get("https://api.test/auth")
+        .header("authorization", &bearer)
+        .send()
+        .await?;
+    assert_eq!(unavailable.status(), StatusCode::BAD_GATEWAY);
+    assert_eq!(
+        unavailable.text().await?,
+        "egress request denied or upstream unavailable\n"
     );
     *resolver.rejection.lock().unwrap() = Some("Request rejected.".into());
     let connections = upstream.connections.load(Ordering::SeqCst);
@@ -743,6 +743,10 @@ async fn proxy_resolves_current_credentials_for_each_request() -> Result<()> {
         .send()
         .await?;
     assert_eq!(rejected.status(), StatusCode::FORBIDDEN);
+    assert_eq!(
+        rejected.headers()["content-type"],
+        "text/plain; charset=utf-8"
+    );
     assert_eq!(rejected.text().await?, "Request rejected.\n");
     assert_eq!(upstream.connections.load(Ordering::SeqCst), connections);
     assert!(
@@ -1644,11 +1648,17 @@ async fn quiet_response_stream_survives_past_the_request_io_timeout() -> Result<
 struct RefreshResolver {
     value: std::sync::Mutex<String>,
     calls: AtomicUsize,
+    error: Mutex<Option<EgressError>>,
 }
 
 #[async_trait]
 impl EgressCredentialResolver for RefreshResolver {
-    async fn resolve(&self, _: &EgressIdentity, _: &str, _: &EgressDestination) -> Result<String> {
+    async fn resolve(
+        &self,
+        _: &EgressIdentity,
+        _: &str,
+        _: &EgressDestination,
+    ) -> Result<String, EgressError> {
         Ok(self.value.lock().unwrap().clone())
     }
     async fn refresh(
@@ -1657,8 +1667,11 @@ impl EgressCredentialResolver for RefreshResolver {
         _: &str,
         _: &EgressDestination,
         rejected: &str,
-    ) -> Result<Option<String>> {
+    ) -> Result<Option<String>, EgressError> {
         self.calls.fetch_add(1, Ordering::SeqCst);
+        if let Some(error) = self.error.lock().unwrap().take() {
+            return Err(error);
+        }
         let mut value = self.value.lock().unwrap();
         if *value == rejected {
             *value = "canary-v2".into();
@@ -1678,6 +1691,7 @@ async fn oauth_retries_once_with_the_original_mcp_body_and_session() -> Result<(
         let resolver = Arc::new(RefreshResolver {
             value: std::sync::Mutex::new("canary-v1".into()),
             calls: AtomicUsize::new(0),
+            error: Mutex::new(None),
         });
         let proxy = upstream.proxy(host_ip()?, path, resolver.clone()).await?;
         proxy.bind_source(host_ip()?).await?;
@@ -1696,6 +1710,47 @@ async fn oauth_retries_once_with_the_original_mcp_body_and_session() -> Result<(
         assert_eq!(response.headers()["mcp-session-id"], "native-session");
         assert_eq!(response.text().await?, body);
         assert_eq!(resolver.calls.load(Ordering::SeqCst), refreshes);
+        proxy.shutdown().await?;
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn credential_refresh_preserves_rejections_and_hides_internal_errors() -> Result<()> {
+    let upstream = Upstream::start().await?;
+    for (error, status, message) in [
+        (
+            EgressError::Rejected("Refresh rejected.".into()),
+            StatusCode::FORBIDDEN,
+            "Refresh rejected.\n",
+        ),
+        (
+            EgressError::Denied(anyhow!("private policy details")),
+            StatusCode::BAD_GATEWAY,
+            "egress request denied or upstream unavailable\n",
+        ),
+        (
+            EgressError::Internal(anyhow!("private refresh details")),
+            StatusCode::BAD_GATEWAY,
+            "egress request denied or upstream unavailable\n",
+        ),
+    ] {
+        let resolver = Arc::new(RefreshResolver {
+            value: Mutex::new("canary-v1".into()),
+            calls: AtomicUsize::new(0),
+            error: Mutex::new(Some(error)),
+        });
+        let (proxy, proxy_client) =
+            bound_proxy(&upstream, "refresh-error", resolver.clone()).await?;
+        let response = proxy_client
+            .post("https://api.test/refresh")
+            .bearer_auth(&proxy.environment()["TEST_API_KEY"])
+            .send()
+            .await?;
+        assert_eq!(response.status(), status);
+        assert_eq!(response.text().await?, message);
+        assert_eq!(resolver.calls.load(Ordering::SeqCst), 1);
+        assert!(resolver.error.lock().unwrap().is_none());
         proxy.shutdown().await?;
     }
     Ok(())
